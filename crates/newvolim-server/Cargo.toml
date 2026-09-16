@@ -1,0 +1,22 @@
+[package]
+name = "newvolim-server"
+version = "0.1.0"
+edition = "2021"
+license = "MPL-2.0"
+description = "Local allow-listed Palace frame service for newvolim"
+
+[dependencies]
+axum = { version = "0.8", features = ["json", "ws"] }
+base64 = "0.22"
+clap = { version = "4", features = ["derive"] }
+newvolim-io = { path = "../newvolim-io" }
+newvolim-render = { path = "../newvolim-render" }
+palace-frame = { path = "../../palace-dev/palace-frame" }
+palace-png = { path = "../../palace-dev/palace-png" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "sync"] }
+tower-http = { version = "0.6", features = ["cors"] }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }

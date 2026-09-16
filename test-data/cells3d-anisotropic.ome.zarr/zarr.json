@@ -1,0 +1,85 @@
+{
+  "zarr_format": 3,
+  "node_type": "group",
+  "attributes": {
+    "multiscales": [
+      {
+        "version": "0.4",
+        "name": "cells3d membrane crop",
+        "axes": [
+          {
+            "name": "z",
+            "type": "space",
+            "unit": "micrometer"
+          },
+          {
+            "name": "y",
+            "type": "space",
+            "unit": "micrometer"
+          },
+          {
+            "name": "x",
+            "type": "space",
+            "unit": "micrometer"
+          }
+        ],
+        "datasets": [
+          {
+            "path": "0",
+            "coordinateTransformations": [
+              {
+                "type": "scale",
+                "scale": [
+                  0.29,
+                  0.26,
+                  0.26
+                ]
+              }
+            ]
+          },
+          {
+            "path": "1",
+            "coordinateTransformations": [
+              {
+                "type": "scale",
+                "scale": [
+                  0.29,
+                  0.52,
+                  0.52
+                ]
+              }
+            ]
+          },
+          {
+            "path": "2",
+            "coordinateTransformations": [
+              {
+                "type": "scale",
+                "scale": [
+                  0.58,
+                  1.04,
+                  1.04
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "omero": {
+      "channels": [
+        {
+          "active": true,
+          "label": "cell membranes",
+          "color": "FF3355",
+          "window": {
+            "start": 0,
+            "end": 65535,
+            "min": 0,
+            "max": 65535
+          }
+        }
+      ]
+    }
+  }
+}

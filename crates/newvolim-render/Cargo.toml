@@ -1,0 +1,13 @@
+[package]
+name = "newvolim-render"
+version = "0.1.0"
+edition = "2021"
+license = "MPL-2.0"
+description = "Backend-neutral frame and render-request contract for newvolim"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+newvolim-scene = { path = "../newvolim-scene" }

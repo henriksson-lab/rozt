@@ -1,0 +1,27 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "newvolim",
+  "version": "0.1.0",
+  "identifier": "org.henrikssonlab.newvolim",
+  "build": {
+    "frontendDist": "../newvolim-ui/dist"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "title": "newvolim",
+        "width": 1440,
+        "height": 1000,
+        "minWidth": 960,
+        "minHeight": 640
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": false
+  }
+}

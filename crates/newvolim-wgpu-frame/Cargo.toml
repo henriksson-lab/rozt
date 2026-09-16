@@ -1,0 +1,13 @@
+[package]
+name = "newvolim-wgpu-frame"
+version = "0.1.0"
+edition = "2021"
+license = "MPL-2.0"
+description = "Native WGPU raw-OME-Zarr frame proof for newvolim"
+
+[dependencies]
+newvolim-io = { path = "../newvolim-io" }
+newvolim-render = { path = "../newvolim-render" }
+newvolim-scene = { path = "../newvolim-scene" }
+pollster = "1"
+wgpu = "30"

@@ -1,0 +1,13 @@
+[workspace]
+members = [
+    "crates/newvolim-io",
+    "crates/newvolim-desktop",
+    "crates/newvolim-render",
+    "crates/newvolim-scene",
+    "crates/newvolim-server",
+    "crates/newvolim-ui",
+    "crates/newvolim-decode-bench",
+    "crates/newvolim-wgpu-frame",
+]
+resolver = "2"
+exclude = ["palace-dev"]
