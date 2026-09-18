@@ -1541,6 +1541,132 @@ fn render_native_portable_camera_draw(
     }
 }
 
+/// Convert the already-admitted ordered scene and its one-authority world rays to Palace's
+/// bounded physical scene contract.  Page owners are global static binding slots, never channel
+/// ordinals, so a channel cannot accidentally read a neighbour's resident scalar range.
+fn palace_dvr_scene_from_native_camera(
+    input: &newvolim_render::NativePortableSceneCameraDrawInput,
+) -> Result<palace_core::gpu::PortableDvrSceneFrameInput, String> {
+    let scene = &input.draw.scene;
+    let pages = &scene.frame.page_submission.pages;
+    let mut layers = Vec::new();
+    for layer in &scene.layers {
+        let minimum = layer
+            .transform
+            .voxel_to_world(layer.voxel_origin_xyz.map(|value| value as f64))
+            .map(|value| value as f32);
+        let maximum = std::array::from_fn(|axis| {
+            (layer.transform.translation[axis]
+                + layer.transform.scale[axis]
+                    * (layer.voxel_origin_xyz[axis] + u64::from(layer.dimensions_xyz[axis])) as f64)
+                as f32
+        });
+        let mut channels = Vec::new();
+        for channel in &layer.channels {
+            let first = channel.page_offset as usize;
+            let end = first
+                .checked_add(channel.page_count as usize)
+                .ok_or("scene page range overflows")?;
+            let channel_pages = pages
+                .get(first..end)
+                .ok_or("scene page range is outside admission")?
+                .iter()
+                .enumerate()
+                .map(|(offset, words)| {
+                    palace_core::gpu::PortableTensorPage::new(
+                        (first + offset + 1) as u64,
+                        words.clone(),
+                    )
+                    .ok_or("scene page is not admitted")
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let volume = palace_core::gpu::PortableDvrVolumeLevel::new(
+                layer.dimensions_xyz,
+                minimum,
+                maximum,
+                channel_pages,
+            )
+            .ok_or("scene volume is invalid")?;
+            let transfer = channel.transfer;
+            let lo = transfer.window_start as f32;
+            let hi = transfer.window_end as f32;
+            if !lo.is_finite() || !hi.is_finite() || hi <= lo {
+                return Err("scene transfer window is invalid".into());
+            }
+            let lut = (0..256)
+                .map(|i| {
+                    [
+                        transfer.color_srgb[0],
+                        transfer.color_srgb[1],
+                        transfer.color_srgb[2],
+                        ((i as f32 / 255.0) * transfer.opacity * 255.0) as u8,
+                    ]
+                })
+                .collect();
+            let transfer = palace_core::gpu::PortableTransferFunction::new(lo, hi, lut)
+                .ok_or("scene transfer is invalid")?;
+            channels.push(palace_core::gpu::PortableDvrSceneChannel::new(
+                volume, transfer,
+            ));
+        }
+        layers.push(
+            palace_core::gpu::PortableDvrSceneLayer::new(channels)
+                .ok_or("scene channels exceed bound")?,
+        );
+    }
+    let scene_minimum = scene
+        .layers
+        .iter()
+        .fold([f32::INFINITY; 3], |minimum, layer| {
+            let origin = layer
+                .transform
+                .voxel_to_world(layer.voxel_origin_xyz.map(|value| value as f64));
+            std::array::from_fn(|axis| minimum[axis].min(origin[axis] as f32))
+        });
+    let scene_maximum = scene
+        .layers
+        .iter()
+        .fold([f32::NEG_INFINITY; 3], |maximum, layer| {
+            let end = std::array::from_fn(|axis| {
+                layer.voxel_origin_xyz[axis] + u64::from(layer.dimensions_xyz[axis])
+            });
+            let corner = layer
+                .transform
+                .voxel_to_world(end.map(|value| value as f64));
+            std::array::from_fn(|axis| maximum[axis].max(corner[axis] as f32))
+        });
+    let rays = input
+        .rays
+        .iter()
+        .map(|ray| {
+            let ray = palace_core::gpu::PortableRayInterval::new(
+                ray.origin_world.map(|v| v as f32),
+                ray.direction_world.map(|v| v as f32),
+                0.0,
+                f32::MAX,
+            )
+            .ok_or("scene world ray is invalid")?;
+            ray.clipped_to_aabb(scene_minimum, scene_maximum)
+                .ok_or("scene world ray misses admitted layers")
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let step = scene
+        .layers
+        .iter()
+        .flat_map(|layer| layer.transform.scale)
+        .map(|v| v.abs() as f32 * 0.5)
+        .filter(|v| v.is_finite() && *v > 0.0)
+        .fold(f32::INFINITY, f32::min);
+    palace_core::gpu::PortableDvrSceneFrameInput::new(
+        input.draw.extent_pixels[0],
+        input.draw.extent_pixels[1],
+        layers,
+        rays,
+        step,
+    )
+    .ok_or_else(|| "scene DVR packet is not admitted".into())
+}
+
 /// Render the trusted multi-layer scene packet and return the same bounded colour/depth payload
 /// as the direct recorder route.
 #[tauri::command]
@@ -1551,8 +1677,41 @@ fn render_native_portable_scene_camera_draw(
     let width = request.width;
     let height = request.height;
     let packet = native_portable_scene_camera_draw_admission(request, session)?;
+    if packet.draw.annotation_words.is_empty() {
+        if let Ok(scene) = palace_dvr_scene_from_native_camera(&packet) {
+            if let Ok(frame) = render_palace_portable_scene_camera_draw(&scene) {
+                return FramePayload::portable_frame_attachments(frame);
+            }
+        }
+    }
     let frame = newvolim_wgpu_frame::render_portable_scene_camera_draw(&packet, 0)?;
     FramePayload::native_wgpu_camera(width, height, frame)
+}
+
+/// Run the ordered Palace scene path on the local fixed-binding recorder when available.  The
+/// core oracle remains the exact fallback for hosts without an eligible WGPU adapter.
+fn render_palace_portable_scene_camera_draw(
+    scene: &palace_core::gpu::PortableDvrSceneFrameInput,
+) -> Result<palace_core::gpu::PortableFrameAttachments, String> {
+    let cpu = scene.render_cpu().ok_or_else(|| {
+        "portable Palace scene DVR CPU oracle rejected its admitted packet".to_owned()
+    })?;
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+    let Ok(adapter) =
+        pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
+    else {
+        return Ok(cpu);
+    };
+    let Ok((device, queue)) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+        required_features: wgpu::Features::empty(),
+        required_limits: wgpu::Limits::default(),
+        ..Default::default()
+    })) else {
+        return Ok(cpu);
+    };
+    Ok(palace_wgpu::WgpuOperatorRecorder::new(&device, &queue)
+        .record_dvr_scene_frame(scene)
+        .unwrap_or(cpu))
 }
 
 /// Render ordered scene layers as linked portable panes. The compositor nearest-samples each
