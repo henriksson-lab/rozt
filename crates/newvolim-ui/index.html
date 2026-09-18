@@ -1477,33 +1477,51 @@
 
       window.newvolimDrawOrthogonal = async function (args, command = "render_synthetic_orthogonal_preview") {
         const status = document.getElementById("newvolim-render-status");
-        window.newvolimCurrentOrthogonalCommand = command.startsWith("render_open_dataset")
-          ? "render_open_dataset_orthogonal_at"
-          : "render_synthetic_orthogonal_at";
+        window.newvolimCurrentOrthogonalCommand = command === "render_native_portable_orthogonal"
+          ? command : command.startsWith("render_open_dataset")
+            ? "render_open_dataset_orthogonal_at" : "render_synthetic_orthogonal_at";
         const generation = (window.newvolimOrthogonalGeneration || 0) + 1;
         window.newvolimOrthogonalGeneration = generation;
         try {
           const payloads = await window.__TAURI__.core.invoke(command, args);
-          for (const [id, payload] of Object.entries(payloads)) {
+          const aspectRatios = Array.isArray(payloads.aspectRatios) && payloads.aspectRatios.length === 3
+            ? payloads.aspectRatios : [1, 1, 1];
+          window.newvolimOrthogonalViewport = Array.isArray(payloads.viewportOriginXyz)
+            && Array.isArray(payloads.viewportDimensionsXyz)
+            && payloads.viewportOriginXyz.length === 3 && payloads.viewportDimensionsXyz.length === 3
+            ? { origin: payloads.viewportOriginXyz, dimensions: payloads.viewportDimensionsXyz }
+            : null;
+          for (const [index, id] of ["xy", "xz", "yz"].entries()) {
+            const payload = payloads[id];
+            if (!payload || !Number.isFinite(aspectRatios[index]) || aspectRatios[index] <= 0) {
+              throw new Error("Native orthogonal frame has invalid physical pane geometry");
+            }
             const canvas = document.getElementById(`newvolim-${id}`);
             const image = new Image();
             image.onload = () => {
               if (generation !== window.newvolimOrthogonalGeneration) return;
               canvas.width = payload.width;
               canvas.height = payload.height;
+              canvas.style.aspectRatio = String(aspectRatios[index]);
               const context = canvas.getContext("2d");
               context.drawImage(image, 0, 0);
               window.newvolimDrawCrosshair(context, id, canvas.width, canvas.height);
               window.newvolimDrawAnnotations(context, id, canvas.width, canvas.height);
-              const clickCommand = command.startsWith("render_open_dataset")
-                ? "render_open_dataset_orthogonal_at"
-                : "render_synthetic_orthogonal_at";
+              const clickCommand = window.newvolimCurrentOrthogonalCommand;
               canvas.onclick = (event) => window.newvolimMoveCrosshair(id, event, clickCommand);
             };
             image.src = payload.dataUrl;
           }
           status.textContent = "Native Palace 3D and orthogonal frames";
         } catch (error) {
+          if (command === "render_native_portable_orthogonal" && args?.request) {
+            window.newvolimNativePortableActive = false;
+            window.newvolimNativePortableSource = null;
+            return window.newvolimDrawOrthogonal({
+              width: args.request.width, height: args.request.height,
+              x: args.x, y: args.y, z: args.z,
+            }, "render_open_dataset_orthogonal_at");
+          }
           status.textContent = error.message || String(error);
         }
       };
@@ -1517,12 +1535,17 @@
         const [horizontal, vertical] = plane === "xy" ? [point.x, point.y]
           : plane === "xz" ? [point.x, point.z]
           : [point.y, point.z];
-        const dimensions = window.newvolimCrosshairDimensions || [64, 64, 64];
+        const viewport = window.newvolimOrthogonalViewport;
+        const origin = viewport?.origin || [0, 0, 0];
+        const dimensions = viewport?.dimensions || window.newvolimCrosshairDimensions || [64, 64, 64];
+        const local = [point.x - origin[0], point.y - origin[1], point.z - origin[2]];
         const [horizontalDimension, verticalDimension] = plane === "xy" ? [dimensions[0], dimensions[1]]
           : plane === "xz" ? [dimensions[0], dimensions[2]]
           : [dimensions[1], dimensions[2]];
-        const x = horizontal / horizontalDimension * width;
-        const y = vertical / verticalDimension * height;
+        const [localHorizontal, localVertical] = plane === "xy" ? [local[0], local[1]]
+          : plane === "xz" ? [local[0], local[2]] : [local[1], local[2]];
+        const x = localHorizontal / horizontalDimension * width;
+        const y = localVertical / verticalDimension * height;
         context.save();
         context.strokeStyle = "#53d8ff";
         context.lineWidth = Math.max(1, width / 512);
@@ -1533,7 +1556,9 @@
         context.restore();
       };
       window.newvolimDrawAnnotations = function (context, plane, width, height) {
-        const dimensions = window.newvolimCrosshairDimensions || [64, 64, 64];
+        const viewport = window.newvolimOrthogonalViewport;
+        const origin = viewport?.origin || [0, 0, 0];
+        const dimensions = viewport?.dimensions || window.newvolimCrosshairDimensions || [64, 64, 64];
         const point = window.newvolimCrosshair;
         for (const marker of window.newvolimAnnotationMarkers) {
           const points = marker.voxelPoints;
@@ -1546,8 +1571,9 @@
             ? [dimensions[0], dimensions[1]]
             : plane === "xz" ? [dimensions[0], dimensions[2]]
             : [dimensions[1], dimensions[2]];
-          const project = ([x, y, z]) => plane === "xy" ? [x, y]
-            : plane === "xz" ? [x, z] : [y, z];
+          const project = ([x, y, z]) => plane === "xy" ? [x - origin[0], y - origin[1]]
+            : plane === "xz" ? [x - origin[0], z - origin[2]]
+            : [y - origin[1], z - origin[2]];
           const color = marker.annotation.color_srgb || [255, 216, 72];
           context.save();
           context.strokeStyle = `rgb(${color[0]}, ${color[1]}, ${color[2]})`;
@@ -1582,7 +1608,9 @@
       window.newvolimMoveCrosshair = function (plane, event, command) {
         const canvas = event.currentTarget;
         const rect = canvas.getBoundingClientRect();
-        const dimensions = window.newvolimCrosshairDimensions || [64, 64, 64];
+        const viewport = window.newvolimOrthogonalViewport;
+        const origin = viewport?.origin || [0, 0, 0];
+        const dimensions = viewport?.dimensions || window.newvolimCrosshairDimensions || [64, 64, 64];
         const [horizontalDimension, verticalDimension] = plane === "xy" ? [dimensions[0], dimensions[1]]
           : plane === "xz" ? [dimensions[0], dimensions[2]]
           : [dimensions[1], dimensions[2]];
@@ -1601,9 +1629,9 @@
             `${draft.kind === "polygon" ? "Polygon" : draft.kind} ROI is limited to ${maximumDraftPoints} corners; finish or start a new ROI`;
           return;
         }
-        if (plane === "xy") { point.x = horizontal; point.y = vertical; }
-        if (plane === "xz") { point.x = horizontal; point.z = vertical; }
-        if (plane === "yz") { point.y = horizontal; point.z = vertical; }
+        if (plane === "xy") { point.x = origin[0] + horizontal; point.y = origin[1] + vertical; }
+        if (plane === "xz") { point.x = origin[0] + horizontal; point.z = origin[2] + vertical; }
+        if (plane === "yz") { point.y = origin[1] + horizontal; point.z = origin[2] + vertical; }
         if (draft) {
           if (!draft.plane) draft.plane = plane;
           draft.points.push([point.x, point.y, point.z]);
@@ -1613,6 +1641,14 @@
         }
         if (command === "remote") {
           window.newvolimRequestRemoteFrame(window.newvolimCamera, "orthogonal", point);
+          return;
+        }
+        if (command === "render_native_portable_orthogonal") {
+          const volumeCanvas = document.getElementById("newvolim-volume");
+          window.newvolimScheduleOrthogonal({
+            request: window.newvolimNativePortableDrawRequest(volumeCanvas, window.newvolimCamera),
+            x: point.x, y: point.y, z: point.z,
+          }, command);
           return;
         }
         window.newvolimScheduleOrthogonal({
@@ -1857,13 +1893,19 @@
             await window.newvolimDrawPayload("render_native_portable_camera_draw", {
               request: window.newvolimNativePortableDrawRequest(canvas, window.newvolimCamera),
             });
+            await window.newvolimDrawOrthogonal({
+              request: window.newvolimNativePortableDrawRequest(canvas, window.newvolimCamera),
+              x: window.newvolimCrosshair.x, y: window.newvolimCrosshair.y, z: window.newvolimCrosshair.z,
+            }, "render_native_portable_orthogonal");
           } catch (portableError) {
             window.newvolimNativePortableActive = false;
             window.newvolimNativePortableSource = null;
             await window.newvolimDrawPayload("render_open_dataset", args);
             status.textContent = `Native portable route unavailable; using Palace: ${portableError.message || String(portableError)}`;
           }
-          await window.newvolimDrawOrthogonal(args, "render_open_dataset_orthogonal");
+          if (!window.newvolimNativePortableActive) {
+            await window.newvolimDrawOrthogonal(args, "render_open_dataset_orthogonal");
+          }
         } catch (error) {
           status.textContent = error.message || String(error);
         }

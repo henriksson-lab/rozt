@@ -400,6 +400,39 @@ impl LocalSession {
         Ok([clamp_axis(0)?, clamp_axis(1)?, clamp_axis(2)?])
     }
 
+    /// Physical horizontal-to-vertical aspect ratios for the linked XY, XZ, and YZ panes.
+    /// A non-axis-aligned or incomplete NGFF transform deliberately falls back to square pixels:
+    /// the legacy Palace slice route remains usable while the portable route is restricted to
+    /// its explicitly axis-aligned admission contract.
+    pub fn orthogonal_physical_aspect_ratios(&self) -> [f64; 3] {
+        let Some(multiscale) = self
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.multiscales.first())
+        else {
+            return [1.0; 3];
+        };
+        let Ok(transform) = portable_axis_aligned_transform(multiscale) else {
+            return [1.0; 3];
+        };
+        let spacing = transform.scale.map(f64::abs);
+        let Some(shape) = self.voxel_shape_xyz else {
+            return [1.0; 3];
+        };
+        let ratio = |horizontal: usize, vertical: usize| {
+            let horizontal_extent = spacing[horizontal] * shape[horizontal] as f64;
+            let vertical_extent = spacing[vertical] * shape[vertical] as f64;
+            (horizontal_extent.is_finite()
+                && vertical_extent.is_finite()
+                && horizontal_extent > 0.0
+                && vertical_extent > 0.0)
+                .then_some(horizontal_extent / vertical_extent)
+                .filter(|value| value.is_finite() && *value > 0.0)
+                .unwrap_or(1.0)
+        };
+        [ratio(0, 1), ratio(0, 2), ratio(1, 2)]
+    }
+
     pub fn annotations(&self) -> &[Annotation] {
         self.scene.annotations()
     }
@@ -2513,5 +2546,18 @@ mod tests {
             session.clamp_crosshair_xyz([u32::MAX, 128, 32]).unwrap(),
             [127, 127, 31]
         );
+    }
+
+    #[test]
+    fn opened_fixture_reports_physical_aspect_ratios_for_linked_slice_panes() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../test-data/cells3d-anisotropic.ome.zarr");
+        let mut session = LocalSession::default();
+        session.open_local_omezarr(root).unwrap();
+
+        let [xy, xz, yz] = session.orthogonal_physical_aspect_ratios();
+        assert!((xy - 1.0).abs() < 1e-12);
+        assert!((xz - (128.0 * 0.26 / (32.0 * 0.29))).abs() < 1e-12);
+        assert!((yz - (128.0 * 0.26 / (32.0 * 0.29))).abs() < 1e-12);
     }
 }

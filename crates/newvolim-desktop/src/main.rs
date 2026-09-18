@@ -143,24 +143,18 @@ impl FramePayload {
     }
 
     fn palace_attachments(attachments: palace_png::FrameAttachments) -> Result<Self, String> {
-        let (color, ray_distance) = attachments.into_parts();
+        if let Some(portable) = attachments.portable_frame_attachments() {
+            return Self::portable_frame_attachments(portable);
+        }
+        let (color, _) = attachments.into_parts();
         let width = color.width();
         let height = color.height();
         let png = palace_png::encode_rgba(&color);
-        let ray_distance_pfm_base64 = ray_distance
-            .as_ref()
-            .map(palace_png::encode_ray_distance_pfm)
-            .map(|pfm| STANDARD.encode(pfm));
-        let depth = if ray_distance_pfm_base64.is_some() {
-            DepthAttachment::RayDistanceF32
-        } else {
-            DepthAttachment::None
-        };
         let target = RenderTarget::new(
             PhysicalExtent::new(width, height).map_err(|error| error.to_string())?,
             ColorFormat::Rgba8Unorm,
             ColorEncoding::Srgb,
-            depth,
+            DepthAttachment::None,
         )
         .map_err(|error| error.to_string())?;
         Ok(Self {
@@ -170,7 +164,38 @@ impl FramePayload {
             target,
             progress: FrameProgress::Final,
             data_url: format!("data:image/png;base64,{}", STANDARD.encode(png)),
-            ray_distance_pfm_base64,
+            ray_distance_pfm_base64: None,
+        })
+    }
+
+    /// Encode one renderer-owned portable colour/depth result without routing it through a
+    /// Vulkan-specific readback representation.
+    fn portable_frame_attachments(
+        attachments: palace_core::gpu::PortableFrameAttachments,
+    ) -> Result<Self, String> {
+        let width = attachments.width;
+        let height = attachments.height;
+        let (png, ray_distance_pfm) =
+            palace_png::encode_portable_frame_attachments(&attachments).into_parts();
+        let target = RenderTarget::new(
+            PhysicalExtent::new(width, height).map_err(|error| error.to_string())?,
+            ColorFormat::Rgba8Unorm,
+            ColorEncoding::Srgb,
+            DepthAttachment::RayDistanceF32,
+        )
+        .map_err(|error| error.to_string())?;
+        Ok(Self {
+            mime_type: "image/png",
+            width,
+            height,
+            target,
+            progress: FrameProgress::Final,
+            data_url: format!("data:image/png;base64,{}", STANDARD.encode(png)),
+            ray_distance_pfm_base64: Some(
+                STANDARD.encode(ray_distance_pfm.expect(
+                    "portable frame encoding always preserves its paired depth attachment",
+                )),
+            ),
         })
     }
 
@@ -179,23 +204,33 @@ impl FramePayload {
         height: u32,
         frame: newvolim_wgpu_frame::RenderedProjection,
     ) -> Result<Self, String> {
-        let pixels = frame.rgba.into_iter().flatten().collect();
-        let color =
-            palace_png::RgbaFrame::new(width, height, pixels).map_err(|error| error.to_string())?;
-        let depth = palace_png::RayDistanceFrame::new(width, height, frame.ray_distances)
-            .map_err(|error| error.to_string())?;
-        let attachments = palace_png::FrameAttachments::new(color, Some(depth))
-            .map_err(|error| error.to_string())?;
-        Self::palace_attachments(attachments)
+        let rgba = frame.rgba.into_iter().flatten().collect();
+        let attachments = palace_core::gpu::PortableFrameAttachments::new(
+            width,
+            height,
+            rgba,
+            frame.ray_distances,
+        )
+        .ok_or_else(|| "native WGPU renderer returned an invalid paired frame".to_owned())?;
+        Self::portable_frame_attachments(attachments)
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct OrthogonalPayload {
     xy: FramePayload,
     xz: FramePayload,
     yz: FramePayload,
+    /// Physical horizontal-to-vertical canvas ratios in XY, XZ, YZ order. Pixel buffers retain
+    /// their requested size; the webview applies this only to presentation and hit geometry.
+    aspect_ratios: [f64; 3],
+    /// Present only for the bounded portable route. Crosshair overlays use this local voxel box
+    /// instead of incorrectly treating a chunk-resident pane as the whole dataset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    viewport_origin_xyz: Option<[u64; 3]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    viewport_dimensions_xyz: Option<[u32; 3]>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -252,6 +287,24 @@ struct NativePortablePickRequest {
     draw: NativePortableDrawRequest,
     x: u32,
     y: u32,
+}
+
+/// Scene equivalent of [`NativePortablePickRequest`]. The host reconstructs the ordered scene,
+/// its physical world rays, and its paired depth before considering one webview pixel.
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NativePortableScenePickRequest {
+    draw: NativePortableDrawRequest,
+    x: u32,
+    y: u32,
+}
+
+/// Transformed portable scene slices deliberately use the same floor-nearest rule as the
+/// portable resample contract. Linear filtering is a separate future policy because it changes
+/// integer-label and transfer-function semantics at physical layer boundaries.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PortableSceneSliceSampling {
+    FloorNearest,
 }
 
 const ANNOTATION_PICK_STYLE: OverlayStyle = OverlayStyle {
@@ -718,6 +771,13 @@ fn native_portable_scene_camera_draw_admission(
     let session = session
         .lock()
         .map_err(|_| "desktop session lock was poisoned".to_owned())?;
+    native_portable_scene_camera_draw_for_session(request, &session)
+}
+
+fn native_portable_scene_camera_draw_for_session(
+    request: NativePortableDrawRequest,
+    session: &LocalSession,
+) -> Result<newvolim_render::NativePortableSceneCameraDrawInput, String> {
     let size = desktop_frame_size(request.width, request.height, 1)?;
     let controls = CameraControls {
         orbit_delta: [request.orbit_x, request.orbit_y],
@@ -852,8 +912,603 @@ fn native_portable_camera_draw_admission(
         zoom: draw.camera.zoom,
     };
     let rays = portable_camera_rays_xyz(&root, size, controls, voxel_origin_xyz)?;
-    newvolim_render::NativePortableCameraDrawInput::new(draw, rays)
-        .map_err(|error| error.to_string())
+    newvolim_render::NativePortableCameraDrawInput::new_with_voxel_origin(
+        draw,
+        voxel_origin_xyz,
+        rays,
+    )
+    .map_err(|error| error.to_string())
+}
+
+/// Adapt the already admitted direct-volume page submission and fitted local-XYZ camera rays to
+/// Palace's bounded page-DVR contract. Local fitted rays and the admitted page extent are
+/// converted through the layer's anisotropic physical transform before they reach the core.
+/// Multi-channel scene packets retain their existing renderer/Vulkan fallback.
+fn palace_dvr_packet_from_native_camera(
+    input: &newvolim_render::NativePortableCameraDrawInput,
+) -> Result<
+    (
+        palace_core::gpu::PortableDvrVolumeLevel,
+        Vec<palace_core::gpu::PortableRayInterval>,
+    ),
+    String,
+> {
+    let volume = &input.draw.volume;
+    let transform = volume
+        .frame
+        .descriptors
+        .first()
+        .ok_or_else(|| "portable Palace DVR has no layer descriptor".to_owned())?
+        .transform;
+    let [channel] = volume.channels.as_slice() else {
+        return Err("portable Palace DVR currently requires one admitted channel".into());
+    };
+    let first = usize::try_from(channel.page_offset)
+        .map_err(|_| "portable Palace DVR page offset overflows usize")?;
+    let end = first
+        .checked_add(channel.page_count as usize)
+        .ok_or_else(|| "portable Palace DVR page range overflows usize".to_owned())?;
+    let source_pages = volume
+        .frame
+        .page_submission
+        .pages
+        .get(first..end)
+        .ok_or_else(|| "portable Palace DVR page range is outside the submission".to_owned())?;
+    let pages = source_pages
+        .iter()
+        .enumerate()
+        .map(|(index, words)| {
+            palace_core::gpu::PortableTensorPage::new(
+                u64::try_from(index + 1).expect("four portable pages fit owner tags"),
+                words.clone(),
+            )
+            .ok_or_else(|| "portable Palace DVR page is not admitted".to_owned())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let minimum = transform
+        .voxel_to_world(input.voxel_origin_xyz.map(|value| value as f64))
+        .map(|value| value as f32);
+    let maximum = std::array::from_fn(|axis| {
+        (transform.translation[axis]
+            + transform.scale[axis]
+                * (input.voxel_origin_xyz[axis] + u64::from(volume.dimensions_xyz[axis])) as f64)
+            as f32
+    });
+    let level = palace_core::gpu::PortableDvrVolumeLevel::new(
+        volume.dimensions_xyz,
+        minimum,
+        maximum,
+        pages,
+    )
+    .ok_or_else(|| "portable Palace DVR volume level is invalid".to_owned())?;
+    let rays = input
+        .rays
+        .iter()
+        .map(|ray| {
+            let origin = std::array::from_fn(|axis| {
+                minimum[axis] + ray.origin_xyz[axis] * transform.scale[axis] as f32
+            });
+            let raw_direction =
+                std::array::from_fn(|axis| ray.direction_xyz[axis] * transform.scale[axis] as f32);
+            let length = raw_direction
+                .iter()
+                .map(|value| value * value)
+                .sum::<f32>()
+                .sqrt();
+            let direction = raw_direction.map(|value| value / length);
+            let far_squared: f32 = (0..3)
+                .map(|axis| {
+                    origin[axis]
+                        .abs()
+                        .max((origin[axis] - maximum[axis]).abs())
+                        .powi(2)
+                })
+                .sum();
+            palace_core::gpu::PortableRayInterval::new(
+                origin,
+                direction,
+                0.0,
+                far_squared.sqrt() + 1.0,
+            )
+            .ok_or_else(|| "fitted portable camera ray is invalid for Palace DVR".to_owned())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((level, rays))
+}
+
+/// Convert the admitted direct channel display policy to Palace's explicit DVR LUT.  The table
+/// retains the declared scalar window while making below-window samples transparent and scaling
+/// opacity linearly through the window.
+fn palace_transfer_from_native_camera(
+    input: &newvolim_render::NativePortableCameraDrawInput,
+) -> Result<palace_core::gpu::PortableTransferFunction, String> {
+    let [channel] = input.draw.volume.channels.as_slice() else {
+        return Err("portable Palace DVR currently requires one admitted channel".into());
+    };
+    let min = channel.transfer.window_start as f32;
+    let max = channel.transfer.window_end as f32;
+    if !min.is_finite() || !max.is_finite() || max <= min {
+        return Err("portable Palace DVR requires a finite non-empty transfer window".into());
+    }
+    let entries = (0..256)
+        .map(|index| {
+            let alpha = ((index as f32 / 255.0) * channel.transfer.opacity * 255.0) as u8;
+            [
+                channel.transfer.color_srgb[0],
+                channel.transfer.color_srgb[1],
+                channel.transfer.color_srgb[2],
+                alpha,
+            ]
+        })
+        .collect();
+    palace_core::gpu::PortableTransferFunction::new(min, max, entries)
+        .ok_or_else(|| "portable Palace DVR transfer is invalid".to_owned())
+}
+
+/// Execute the direct portable camera packet through Palace's bounded page-DVR contract. The
+/// pages remain owner-tagged until the recorder dispatch; a host without an eligible WGPU
+/// adapter uses the exact core CPU oracle rather than changing camera, transfer, or depth
+/// semantics. Palace does not yet own the projected-annotation overlay pass, so the caller keeps
+/// the existing scene-capable native recorder for packets which carry annotation words.
+fn render_palace_portable_camera_draw(
+    input: &newvolim_render::NativePortableCameraDrawInput,
+) -> Result<palace_core::gpu::PortableFrameAttachments, String> {
+    let (level, rays) = palace_dvr_packet_from_native_camera(input)?;
+    let transform = input
+        .draw
+        .volume
+        .frame
+        .descriptors
+        .first()
+        .ok_or_else(|| "portable Palace DVR has no layer descriptor".to_owned())?
+        .transform;
+    // Half the smallest physical voxel spacing is conservative for an anisotropic admitted
+    // level and matches the bounded scene recorder's no-skip sampling rule.
+    let step_size = transform
+        .scale
+        .into_iter()
+        .map(|value| value.abs() as f32 * 0.5)
+        .reduce(f32::min)
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .ok_or_else(|| "portable Palace DVR layer spacing is invalid".to_owned())?;
+    let page_input = level
+        .raymarch_input(
+            input.draw.extent_pixels[0],
+            input.draw.extent_pixels[1],
+            rays,
+            step_size,
+        )
+        .ok_or_else(|| "portable Palace DVR raymarch input is not admitted".to_owned())?;
+    let transfer = palace_transfer_from_native_camera(input)?;
+    let cpu = page_input
+        .render_cpu(&transfer)
+        .ok_or_else(|| "portable Palace DVR CPU oracle rejected its admitted packet".to_owned())?;
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+    let Ok(adapter) =
+        pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
+    else {
+        return Ok(cpu);
+    };
+    let Ok((device, queue)) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+        required_features: wgpu::Features::empty(),
+        required_limits: wgpu::Limits::default(),
+        ..Default::default()
+    })) else {
+        return Ok(cpu);
+    };
+    Ok(palace_wgpu::WgpuOperatorRecorder::new(&device, &queue)
+        .record_dvr_page_frame(&transfer, &page_input)
+        .unwrap_or(cpu))
+}
+
+fn palace_slice_words_from_admitted_volume(
+    volume: &newvolim_render::NativePortableVolumeInput,
+    axis: u32,
+    index: u32,
+) -> Result<Vec<u32>, String> {
+    let (layout, pages) = palace_slice_layout_and_pages(volume, axis, index)?;
+    layout
+        .slice_page_words(&pages)
+        .ok_or_else(|| "portable Palace slice extraction failed".to_owned())
+}
+
+fn palace_slice_layout_and_pages(
+    volume: &newvolim_render::NativePortableVolumeInput,
+    axis: u32,
+    index: u32,
+) -> Result<
+    (
+        palace_core::gpu::PortableOrthogonalSliceLayout,
+        Vec<palace_core::gpu::PortableTensorPage>,
+    ),
+    String,
+> {
+    palace_slice_layout_and_channel_pages(volume, 0, axis, index)
+}
+
+fn palace_slice_layout_and_channel_pages(
+    volume: &newvolim_render::NativePortableVolumeInput,
+    channel_index: usize,
+    axis: u32,
+    index: u32,
+) -> Result<
+    (
+        palace_core::gpu::PortableOrthogonalSliceLayout,
+        Vec<palace_core::gpu::PortableTensorPage>,
+    ),
+    String,
+> {
+    let channel = volume
+        .channels
+        .get(channel_index)
+        .ok_or_else(|| "portable Palace slice channel is outside the admission".to_owned())?;
+    if channel.page_count == 0 || channel.page_count > 4 {
+        return Err("portable Palace slice page range is not admitted".into());
+    }
+    let layout = palace_core::gpu::PortableOrthogonalSliceLayout::new(
+        volume.dimensions_xyz,
+        axis,
+        index,
+        match axis {
+            0 => [volume.dimensions_xyz[1], volume.dimensions_xyz[2]],
+            1 => [volume.dimensions_xyz[0], volume.dimensions_xyz[2]],
+            2 => [volume.dimensions_xyz[0], volume.dimensions_xyz[1]],
+            _ => return Err("portable Palace slice axis is outside XYZ".into()),
+        },
+    )
+    .ok_or_else(|| "portable Palace slice layout is not admitted".to_owned())?;
+    let first = channel.page_offset as usize;
+    let end = first
+        .checked_add(channel.page_count as usize)
+        .ok_or_else(|| "portable Palace slice page range overflows usize".to_owned())?;
+    let pages = volume
+        .frame
+        .page_submission
+        .pages
+        .get(first..end)
+        .ok_or_else(|| "portable Palace slice page range is outside the admission".to_owned())?
+        .iter()
+        .enumerate()
+        .map(|(index, words)| {
+            palace_core::gpu::PortableTensorPage::new(index as u64 + 1, words.clone())
+        })
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| "portable Palace slice page is not admitted".to_owned())?;
+    Ok((layout, pages))
+}
+
+/// Prefer the fixed-binding WGPU recorder for an already admitted pane. Device discovery and
+/// recording are intentionally best-effort here: the CPU oracle is the portable fallback for a
+/// headless host or an adapter that declines this small dispatch.
+fn palace_slice_words_from_admitted_volume_with_local_wgpu(
+    volume: &newvolim_render::NativePortableVolumeInput,
+    axis: u32,
+    index: u32,
+) -> Result<Vec<u32>, String> {
+    palace_slice_words_from_channel_with_local_wgpu(volume, 0, axis, index)
+}
+
+fn palace_slice_words_from_channel_with_local_wgpu(
+    volume: &newvolim_render::NativePortableVolumeInput,
+    channel_index: usize,
+    axis: u32,
+    index: u32,
+) -> Result<Vec<u32>, String> {
+    let (layout, pages) =
+        palace_slice_layout_and_channel_pages(volume, channel_index, axis, index)?;
+    let cpu = layout
+        .slice_page_words(&pages)
+        .ok_or_else(|| "portable Palace slice extraction failed".to_owned())?;
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+    let Ok(adapter) =
+        pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
+    else {
+        return Ok(cpu);
+    };
+    let Ok((device, queue)) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+        required_features: wgpu::Features::empty(),
+        required_limits: wgpu::Limits::default(),
+        ..Default::default()
+    })) else {
+        return Ok(cpu);
+    };
+    Ok(palace_wgpu::WgpuOperatorRecorder::new(&device, &queue)
+        .record_orthogonal_slice_pages(&layout, &pages)
+        .unwrap_or(cpu))
+}
+
+fn palace_slice_payload(
+    volume: &newvolim_render::NativePortableVolumeInput,
+    axis: u32,
+    index: u32,
+) -> Result<FramePayload, String> {
+    let [width, height] = match axis {
+        0 => [volume.dimensions_xyz[1], volume.dimensions_xyz[2]],
+        1 => [volume.dimensions_xyz[0], volume.dimensions_xyz[2]],
+        2 => [volume.dimensions_xyz[0], volume.dimensions_xyz[1]],
+        _ => return Err("portable Palace slice axis is outside XYZ".into()),
+    };
+    let rgba = if volume.channels.len() == 1 {
+        let words = palace_slice_words_from_admitted_volume_with_local_wgpu(volume, axis, index)?;
+        let transfer = palace_transfer_from_native_volume(volume)?;
+        words
+            .into_iter()
+            .flat_map(|word| transfer.classify(word as f32))
+            .collect::<Vec<_>>()
+    } else {
+        let channel_words = (0..volume.channels.len())
+            .map(|channel| {
+                palace_slice_words_from_channel_with_local_wgpu(volume, channel, axis, index)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let transfers = volume
+            .channels
+            .iter()
+            .map(|channel| channel.transfer)
+            .collect::<Vec<_>>();
+        (0..channel_words[0].len())
+            .flat_map(|pixel| {
+                let samples = channel_words
+                    .iter()
+                    .map(|words| words[pixel] as f64)
+                    .collect::<Vec<_>>();
+                let linear =
+                    newvolim_render::composite_portable_scene_samples(&[(&transfers, &samples)])
+                        .expect("matching channel slices");
+                portable_linear_premultiplied_to_srgb8(linear)
+            })
+            .collect::<Vec<_>>()
+    };
+    let frame =
+        palace_png::RgbaFrame::new(width, height, rgba).map_err(|error| error.to_string())?;
+    Ok(FramePayload::png(
+        width,
+        height,
+        palace_png::encode_rgba(&frame),
+    ))
+}
+
+fn portable_linear_premultiplied_to_srgb8(linear: [f32; 4]) -> [u8; 4] {
+    let alpha = linear[3].clamp(0.0, 1.0);
+    let encode = |component: f32| {
+        let straight = if alpha == 0.0 { 0.0 } else { component / alpha }.clamp(0.0, 1.0);
+        let srgb = if straight <= 0.003_130_8 {
+            straight * 12.92
+        } else {
+            1.055 * straight.powf(1.0 / 2.4) - 0.055
+        };
+        (srgb * 255.0).round() as u8
+    };
+    [
+        encode(linear[0]),
+        encode(linear[1]),
+        encode(linear[2]),
+        (alpha * 255.0).round() as u8,
+    ]
+}
+
+/// Compose one portable scene plane in the first layer's physical voxel-center plane. Every
+/// other axis-aligned layer is nearest-sampled at that same physical point; out-of-bounds points
+/// are transparent, never extrapolated.
+fn palace_scene_slice_rgba(
+    scene: &newvolim_render::NativePortableSceneInput,
+    axis: u32,
+    index: u32,
+) -> Result<(u32, u32, Vec<u8>), String> {
+    palace_scene_slice_rgba_with_sampling(
+        scene,
+        axis,
+        index,
+        PortableSceneSliceSampling::FloorNearest,
+    )
+}
+
+fn palace_scene_slice_rgba_with_sampling(
+    scene: &newvolim_render::NativePortableSceneInput,
+    axis: u32,
+    index: u32,
+    sampling: PortableSceneSliceSampling,
+) -> Result<(u32, u32, Vec<u8>), String> {
+    let first = scene
+        .layers
+        .first()
+        .ok_or_else(|| "portable Palace scene slice has no layers".to_owned())?;
+    let [width, height] = match axis {
+        0 => [first.dimensions_xyz[1], first.dimensions_xyz[2]],
+        1 => [first.dimensions_xyz[0], first.dimensions_xyz[2]],
+        2 => [first.dimensions_xyz[0], first.dimensions_xyz[1]],
+        _ => return Err("portable Palace scene slice axis is outside XYZ".into()),
+    };
+    let layers = scene
+        .layers
+        .iter()
+        .map(|layer| {
+            let volume = newvolim_render::NativePortableVolumeInput {
+                frame: scene.frame.clone(),
+                dimensions_xyz: layer.dimensions_xyz,
+                scalar_type: layer.scalar_type,
+                channels: layer.channels.clone(),
+            };
+            let pages = (0..layer.channels.len())
+                .map(|channel| {
+                    palace_slice_layout_and_channel_pages(&volume, channel, axis, index)
+                        .map(|(_, pages)| pages)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok((
+                layer
+                    .channels
+                    .iter()
+                    .map(|channel| channel.transfer)
+                    .collect::<Vec<_>>(),
+                pages,
+            ))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let pixels = usize::try_from(width)
+        .ok()
+        .and_then(|width| width.checked_mul(height as usize))
+        .ok_or_else(|| "portable Palace scene slice dimensions overflow".to_owned())?;
+    let rgba = (0..pixels)
+        .flat_map(|pixel| {
+            let horizontal = pixel % width as usize;
+            let vertical = pixel / width as usize;
+            let reference_coordinate = match axis {
+                0 => [index as usize, vertical, horizontal],
+                1 => [vertical, index as usize, horizontal],
+                2 => [horizontal, vertical, index as usize],
+                _ => unreachable!("validated slice axis"),
+            };
+            let physical: [f64; 3] = std::array::from_fn(|component| {
+                first.transform.translation[component]
+                    + (first.voxel_origin_xyz[component] as f64
+                        + reference_coordinate[component] as f64
+                        + 0.5)
+                        * first.transform.scale[component]
+            });
+            let samples = scene
+                .layers
+                .iter()
+                .zip(&layers)
+                .map(|(layer, (_, pages))| {
+                    let coordinate: [i64; 3] = std::array::from_fn(|component| match sampling {
+                        PortableSceneSliceSampling::FloorNearest => {
+                            ((physical[component] - layer.transform.translation[component])
+                                / layer.transform.scale[component])
+                                .floor() as i64
+                                - layer.voxel_origin_xyz[component] as i64
+                        }
+                    });
+                    pages
+                        .iter()
+                        .map(|pages| {
+                            let [x, y, z] = coordinate;
+                            if x < 0
+                                || y < 0
+                                || z < 0
+                                || x as u32 >= layer.dimensions_xyz[0]
+                                || y as u32 >= layer.dimensions_xyz[1]
+                                || z as u32 >= layer.dimensions_xyz[2]
+                            {
+                                return f64::NAN;
+                            }
+                            let source = (z as usize * layer.dimensions_xyz[1] as usize
+                                + y as usize)
+                                * layer.dimensions_xyz[0] as usize
+                                + x as usize;
+                            let mut remaining = source;
+                            for page in pages {
+                                if remaining < page.words().len() {
+                                    return page.words()[remaining] as f64;
+                                }
+                                remaining -= page.words().len();
+                            }
+                            f64::NAN
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+            let inputs = layers
+                .iter()
+                .zip(&samples)
+                .map(|((transfers, _), samples)| (transfers.as_slice(), samples.as_slice()))
+                .collect::<Vec<_>>();
+            portable_linear_premultiplied_to_srgb8(
+                newvolim_render::composite_portable_scene_samples(&inputs)
+                    .expect("matching scene channel samples"),
+            )
+        })
+        .collect();
+    Ok((width, height, rgba))
+}
+
+fn palace_transfer_from_native_volume(
+    volume: &newvolim_render::NativePortableVolumeInput,
+) -> Result<palace_core::gpu::PortableTransferFunction, String> {
+    let [channel] = volume.channels.as_slice() else {
+        return Err("portable Palace slice currently requires one admitted channel".into());
+    };
+    let min = channel.transfer.window_start as f32;
+    let max = channel.transfer.window_end as f32;
+    if !min.is_finite() || !max.is_finite() || max <= min {
+        return Err("portable Palace slice requires a finite non-empty transfer window".into());
+    }
+    let entries = (0..256)
+        .map(|index| {
+            let alpha = ((index as f32 / 255.0) * channel.transfer.opacity * 255.0) as u8;
+            [
+                channel.transfer.color_srgb[0],
+                channel.transfer.color_srgb[1],
+                channel.transfer.color_srgb[2],
+                alpha,
+            ]
+        })
+        .collect();
+    palace_core::gpu::PortableTransferFunction::new(min, max, entries)
+        .ok_or_else(|| "portable Palace slice transfer is invalid".to_owned())
+}
+
+fn palace_slice_aspect_ratios(volume: &newvolim_render::NativePortableVolumeInput) -> [f64; 3] {
+    let Some(descriptor) = volume.frame.descriptors.first() else {
+        return [1.0; 3];
+    };
+    let scale = descriptor.transform.scale.map(f64::abs);
+    let extent: [f64; 3] =
+        std::array::from_fn(|axis| scale[axis] * volume.dimensions_xyz[axis] as f64);
+    let ratio = |horizontal: usize, vertical: usize| {
+        (extent[horizontal].is_finite()
+            && extent[vertical].is_finite()
+            && extent[horizontal] > 0.0
+            && extent[vertical] > 0.0)
+            .then_some(extent[horizontal] / extent[vertical])
+            .filter(|value| value.is_finite() && *value > 0.0)
+            .unwrap_or(1.0)
+    };
+    [ratio(0, 1), ratio(0, 2), ratio(1, 2)]
+}
+
+/// Render the three linked panes directly from the crosshair-selected bounded portable page
+/// admission. Inputs outside the selected resident box return an error so the caller can retain
+/// the established full-volume Palace route instead of rendering a misleading slice.
+#[tauri::command]
+fn render_native_portable_orthogonal(
+    request: NativePortableDrawRequest,
+    x: u32,
+    y: u32,
+    z: u32,
+    session: tauri::State<'_, Mutex<LocalSession>>,
+) -> Result<OrthogonalPayload, String> {
+    let (draw, voxel_origin_xyz) = {
+        let session = session
+            .lock()
+            .map_err(|_| "desktop session lock was poisoned".to_owned())?;
+        let (draw, _, origin) = native_portable_draw_for_session(request, &session)?;
+        (draw, origin)
+    };
+    let local = std::array::from_fn(|axis| {
+        u64::from([x, y, z][axis])
+            .checked_sub(voxel_origin_xyz[axis])
+            .and_then(|value| u32::try_from(value).ok())
+            .ok_or_else(|| "crosshair is outside the admitted portable slice viewport".to_owned())
+    });
+    let [local_x, local_y, local_z] = local;
+    let local = [local_x?, local_y?, local_z?];
+    if local
+        .iter()
+        .zip(draw.volume.dimensions_xyz)
+        .any(|(&coordinate, dimension)| coordinate >= dimension)
+    {
+        return Err("crosshair is outside the admitted portable slice viewport".into());
+    }
+    let volume = &draw.volume;
+    Ok(OrthogonalPayload {
+        xy: palace_slice_payload(volume, 2, local[2])?,
+        xz: palace_slice_payload(volume, 1, local[1])?,
+        yz: palace_slice_payload(volume, 0, local[0])?,
+        aspect_ratios: palace_slice_aspect_ratios(volume),
+        viewport_origin_xyz: Some(voxel_origin_xyz),
+        viewport_dimensions_xyz: Some(volume.dimensions_xyz),
+    })
 }
 
 /// Render the admitted native portable packet. The webview receives an encoded frame and paired
@@ -866,8 +1521,24 @@ fn render_native_portable_camera_draw(
     let width = request.width;
     let height = request.height;
     let packet = native_portable_camera_draw_admission(request, session)?;
-    let frame = newvolim_wgpu_frame::render_portable_camera_draw(&packet, 0)?;
-    FramePayload::native_wgpu_camera(width, height, frame)
+    if packet.draw.annotation_words.is_empty() {
+        match render_palace_portable_camera_draw(&packet) {
+            Ok(frame) => FramePayload::portable_frame_attachments(frame),
+            // A fitted Palace camera can legitimately exceed the bounded page-DVR packet's
+            // current sample limit. Keep the established native route for that packet rather
+            // than silently truncating its depth or rejecting an otherwise valid frame.
+            Err(_) => {
+                let frame = newvolim_wgpu_frame::render_portable_camera_draw(&packet, 0)?;
+                FramePayload::native_wgpu_camera(width, height, frame)
+            }
+        }
+    } else {
+        // Palace's page-DVR owns the direct-volume colour/depth route. Until its overlay pass is
+        // migrated, retain the existing recorder only when it must composite trusted projected
+        // annotation records into the returned colour attachment.
+        let frame = newvolim_wgpu_frame::render_portable_camera_draw(&packet, 0)?;
+        FramePayload::native_wgpu_camera(width, height, frame)
+    }
 }
 
 /// Render the trusted multi-layer scene packet and return the same bounded colour/depth payload
@@ -882,6 +1553,78 @@ fn render_native_portable_scene_camera_draw(
     let packet = native_portable_scene_camera_draw_admission(request, session)?;
     let frame = newvolim_wgpu_frame::render_portable_scene_camera_draw(&packet, 0)?;
     FramePayload::native_wgpu_camera(width, height, frame)
+}
+
+/// Render ordered scene layers as linked portable panes. The compositor nearest-samples each
+/// axis-aligned layer at the reference layer's physical voxel centers; unrepresentable scene
+/// admissions still return an error so callers can retain the Palace slice route.
+#[tauri::command]
+fn render_native_portable_scene_orthogonal(
+    request: NativePortableDrawRequest,
+    x: u32,
+    y: u32,
+    z: u32,
+    session: tauri::State<'_, Mutex<LocalSession>>,
+) -> Result<OrthogonalPayload, String> {
+    let scene = {
+        let session = session
+            .lock()
+            .map_err(|_| "desktop session lock was poisoned".to_owned())?;
+        let limits = LayerRenderLimits::new(4, 4);
+        let (descriptors, _) = session
+            .native_layer_admission(limits)
+            .map_err(|error| error.to_string())?;
+        let plans = session
+            .local_layer_chunk_plan(
+                limits,
+                SpatialChunkRegion::new(request.origin_xyz, request.extent_xyz),
+                4_096,
+            )
+            .map_err(|error| error.to_string())?;
+        let loaded = session
+            .read_local_layer_chunks(&plans, 16 * 1024 * 1024, 64 * 1024 * 1024)
+            .map_err(|error| error.to_string())?;
+        session
+            .native_portable_scene_page_admission(descriptors, &plans, &loaded)
+            .map_err(|error| error.to_string())?
+    };
+    let first = scene
+        .layers
+        .first()
+        .ok_or_else(|| "portable Palace scene slice has no layers".to_owned())?;
+    let local = std::array::from_fn(|axis| {
+        u64::from([x, y, z][axis])
+            .checked_sub(first.voxel_origin_xyz[axis])
+            .and_then(|value| u32::try_from(value).ok())
+            .filter(|&value| value < first.dimensions_xyz[axis])
+            .ok_or_else(|| "crosshair is outside the admitted portable scene viewport".to_owned())
+    });
+    let [local_x, local_y, local_z] = local;
+    let local = [local_x?, local_y?, local_z?];
+    let encode = |axis, index| {
+        let (width, height, rgba) = palace_scene_slice_rgba(&scene, axis, index)?;
+        let frame =
+            palace_png::RgbaFrame::new(width, height, rgba).map_err(|error| error.to_string())?;
+        Ok::<FramePayload, String>(FramePayload::png(
+            width,
+            height,
+            palace_png::encode_rgba(&frame),
+        ))
+    };
+    let volume = newvolim_render::NativePortableVolumeInput {
+        frame: scene.frame.clone(),
+        dimensions_xyz: first.dimensions_xyz,
+        scalar_type: first.scalar_type,
+        channels: first.channels.clone(),
+    };
+    Ok(OrthogonalPayload {
+        xy: encode(2, local[2])?,
+        xz: encode(1, local[1])?,
+        yz: encode(0, local[0])?,
+        aspect_ratios: palace_slice_aspect_ratios(&volume),
+        viewport_origin_xyz: Some(first.voxel_origin_xyz),
+        viewport_dimensions_xyz: Some(first.dimensions_xyz),
+    })
 }
 
 /// Pick an annotation against a freshly recorded native-portable frame. Re-recording avoids
@@ -914,8 +1657,12 @@ fn pick_native_portable_annotation_for_session(
             zoom: draw.camera.zoom,
         };
         let rays = portable_camera_rays_xyz(&root, size, controls, voxel_origin_xyz)?;
-        let packet = newvolim_render::NativePortableCameraDrawInput::new(draw, rays)
-            .map_err(|error| error.to_string())?;
+        let packet = newvolim_render::NativePortableCameraDrawInput::new_with_voxel_origin(
+            draw,
+            voxel_origin_xyz,
+            rays,
+        )
+        .map_err(|error| error.to_string())?;
         let index = usize::try_from(request.y)
             .ok()
             .and_then(|row| row.checked_mul(packet.draw.extent_pixels[0] as usize))
@@ -933,16 +1680,72 @@ fn pick_native_portable_annotation_for_session(
             .map_err(|error| error.to_string())?;
         (packet, physical_ray, session.annotations().to_vec(), index)
     };
-    let frame = newvolim_wgpu_frame::render_portable_camera_draw(&packet, 0)?;
+    // Selection is volume-occluded by the same Palace page-DVR invocation that owns an admitted
+    // direct frame. Its distances are physical units. A packet outside the current bounded DVR
+    // sample limit takes the established native recorder fallback, whose local distance retains
+    // the host-owned physical conversion captured with this exact camera.
+    match render_palace_portable_camera_draw(&packet) {
+        Ok(frame) => {
+            let distance = *frame
+                .first_opacity_distance
+                .get(index)
+                .ok_or_else(|| "portable recorder omitted the requested depth pixel".to_owned())?;
+            depth_aware_annotation_pick(&annotations, physical_ray.ray, f64::from(distance))
+        }
+        Err(_) => {
+            let frame = newvolim_wgpu_frame::render_portable_camera_draw(&packet, 0)?;
+            let distance = *frame
+                .ray_distances
+                .get(index)
+                .ok_or_else(|| "portable recorder omitted the requested depth pixel".to_owned())?;
+            depth_aware_annotation_pick(
+                &annotations,
+                physical_ray.ray,
+                f64::from(distance) * physical_ray.physical_distance_per_palace_unit,
+            )
+        }
+    }
+}
+
+/// Pick an annotation against a newly rendered ordered portable scene. Scene DVR rays and
+/// first-opacity distances are physical world units, so no single-layer voxel conversion or
+/// browser-provided depth may enter this path.
+#[tauri::command]
+fn pick_native_portable_scene_annotation(
+    request: NativePortableScenePickRequest,
+    session: tauri::State<'_, Mutex<LocalSession>>,
+) -> Result<Option<AnnotationPickPayload>, String> {
+    let session = session
+        .lock()
+        .map_err(|_| "desktop session lock was poisoned".to_owned())?;
+    pick_native_portable_scene_annotation_for_session(request, &session)
+}
+
+fn pick_native_portable_scene_annotation_for_session(
+    request: NativePortableScenePickRequest,
+    session: &LocalSession,
+) -> Result<Option<AnnotationPickPayload>, String> {
+    let packet = native_portable_scene_camera_draw_for_session(request.draw, session)?;
+    if request.x >= packet.draw.extent_pixels[0] || request.y >= packet.draw.extent_pixels[1] {
+        return Err("portable scene annotation-pick pixel is outside the admitted extent".into());
+    }
+    let index = usize::try_from(request.y)
+        .ok()
+        .and_then(|row| row.checked_mul(packet.draw.extent_pixels[0] as usize))
+        .and_then(|row| row.checked_add(request.x as usize))
+        .ok_or_else(|| "portable scene annotation-pick pixel offset overflows usize".to_owned())?;
+    let ray = *packet
+        .rays
+        .get(index)
+        .ok_or_else(|| "portable scene camera packet omitted the requested pixel ray".to_owned())?;
+    let physical_ray = newvolim_render::PickRay::new(ray.origin_world, ray.direction_world)
+        .map_err(|error| error.to_string())?;
+    let frame = newvolim_wgpu_frame::render_portable_scene_camera_draw(&packet, 0)?;
     let distance = *frame
         .ray_distances
         .get(index)
-        .ok_or_else(|| "portable recorder omitted the requested depth pixel".to_owned())?;
-    depth_aware_annotation_pick(
-        &annotations,
-        physical_ray.ray,
-        f64::from(distance) * physical_ray.physical_distance_per_palace_unit,
-    )
+        .ok_or_else(|| "portable scene recorder omitted the requested depth pixel".to_owned())?;
+    depth_aware_annotation_pick(session.annotations(), physical_ray, f64::from(distance))
 }
 
 fn portable_camera_rays_xyz(
@@ -1003,9 +1806,15 @@ fn portable_scene_world_rays(
                 f64::from(ray.origin_xyz[axis]) + layer.voxel_origin_xyz[axis] as f64
             });
             let world_origin = layer.transform.voxel_to_world(global_origin);
-            let direction = std::array::from_fn(|axis| {
+            let raw_direction = std::array::from_fn(|axis| {
                 f64::from(ray.direction_xyz[axis]) * layer.transform.scale[axis]
             });
+            let length = raw_direction
+                .iter()
+                .map(|component| component * component)
+                .sum::<f64>()
+                .sqrt();
+            let direction = raw_direction.map(|component| component / length);
             newvolim_render::PortableWorldRay::new(world_origin, direction)
                 .map_err(|error| error.to_string())
         })
@@ -1078,6 +1887,9 @@ fn render_synthetic_orthogonal_preview(
         xy: FramePayload::png(width, height, xy),
         xz: FramePayload::png(width, height, xz),
         yz: FramePayload::png(width, height, yz),
+        aspect_ratios: [1.0; 3],
+        viewport_origin_xyz: None,
+        viewport_dimensions_xyz: None,
     })
 }
 
@@ -1096,6 +1908,9 @@ fn render_synthetic_orthogonal_at(
         xy: FramePayload::png(width, height, xy),
         xz: FramePayload::png(width, height, xz),
         yz: FramePayload::png(width, height, yz),
+        aspect_ratios: [1.0; 3],
+        viewport_origin_xyz: None,
+        viewport_dimensions_xyz: None,
     })
 }
 
@@ -1236,11 +2051,17 @@ fn render_open_dataset_orthogonal(
     height: u32,
     session: tauri::State<'_, Mutex<LocalSession>>,
 ) -> Result<OrthogonalPayload, String> {
-    let root = session
-        .lock()
-        .map_err(|_| "desktop session lock was poisoned".to_owned())?
-        .dataset_root()
-        .ok_or_else(|| "open a local OME-Zarr dataset before requesting slices".to_owned())?;
+    let (root, aspect_ratios) = {
+        let session = session
+            .lock()
+            .map_err(|_| "desktop session lock was poisoned".to_owned())?;
+        (
+            session.dataset_root().ok_or_else(|| {
+                "open a local OME-Zarr dataset before requesting slices".to_owned()
+            })?,
+            session.orthogonal_physical_aspect_ratios(),
+        )
+    };
     let size = desktop_frame_size(width, height, 3)?;
     let [xy, xz, yz] =
         render_local_zarr_orthogonal_png(root, size).map_err(|error| error.to_string())?;
@@ -1248,6 +2069,9 @@ fn render_open_dataset_orthogonal(
         xy: FramePayload::png(width, height, xy),
         xz: FramePayload::png(width, height, xz),
         yz: FramePayload::png(width, height, yz),
+        aspect_ratios,
+        viewport_origin_xyz: None,
+        viewport_dimensions_xyz: None,
     })
 }
 
@@ -1260,7 +2084,7 @@ fn render_open_dataset_orthogonal_at(
     z: u32,
     session: tauri::State<'_, Mutex<LocalSession>>,
 ) -> Result<OrthogonalPayload, String> {
-    let (root, crosshair_xyz) = {
+    let (root, crosshair_xyz, aspect_ratios) = {
         let session = session
             .lock()
             .map_err(|_| "desktop session lock was poisoned".to_owned())?;
@@ -1270,7 +2094,11 @@ fn render_open_dataset_orthogonal_at(
         let crosshair_xyz = session
             .clamp_crosshair_xyz([x, y, z])
             .map_err(|error| error.to_string())?;
-        (root, crosshair_xyz)
+        (
+            root,
+            crosshair_xyz,
+            session.orthogonal_physical_aspect_ratios(),
+        )
     };
     let size = desktop_frame_size(width, height, 3)?;
     let [xy, xz, yz] = render_local_zarr_orthogonal_at_png(
@@ -1283,6 +2111,9 @@ fn render_open_dataset_orthogonal_at(
         xy: FramePayload::png(width, height, xy),
         xz: FramePayload::png(width, height, xz),
         yz: FramePayload::png(width, height, yz),
+        aspect_ratios,
+        viewport_origin_xyz: None,
+        viewport_dimensions_xyz: None,
     })
 }
 
@@ -1381,8 +2212,11 @@ fn main() {
             native_portable_draw_admission,
             native_portable_camera_draw_admission,
             render_native_portable_camera_draw,
+            render_native_portable_orthogonal,
             render_native_portable_scene_camera_draw,
+            render_native_portable_scene_orthogonal,
             pick_native_portable_annotation,
+            pick_native_portable_scene_annotation,
             delete_annotation,
             export_annotations,
             import_annotations,
@@ -1457,6 +2291,36 @@ mod tests {
         let json = serde_json::to_value(payload).unwrap();
         assert_eq!(json["target"]["depth"], "rayDistanceF32");
         assert!(json["rayDistancePfmBase64"].as_str().is_some());
+    }
+
+    #[test]
+    fn synthetic_orthogonal_payload_keeps_square_physical_panes() {
+        let payload = render_synthetic_orthogonal_at(8, 8, 4, 4, 4).unwrap();
+        assert_eq!(payload.aspect_ratios, [1.0; 3]);
+        let json = serde_json::to_value(payload).unwrap();
+        assert_eq!(json["aspectRatios"], serde_json::json!([1.0, 1.0, 1.0]));
+    }
+
+    #[test]
+    fn portable_frame_payload_preserves_its_paired_depth_sidecar() {
+        let payload = FramePayload::portable_frame_attachments(
+            palace_core::gpu::PortableFrameAttachments::new(
+                2,
+                1,
+                vec![1, 2, 3, 255, 4, 5, 6, 255],
+                vec![0.25, f32::INFINITY],
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(payload.target.depth, DepthAttachment::RayDistanceF32);
+        assert_eq!(
+            STANDARD
+                .decode(payload.ray_distance_pfm_base64.unwrap())
+                .unwrap(),
+            b"Pf\n2 1\n-1.0\n\0\0\x80>\0\0\x80\x7f"
+        );
     }
 
     #[test]
@@ -1555,6 +2419,436 @@ mod tests {
     }
 
     #[test]
+    fn fitted_native_camera_and_page_submission_adapt_to_palace_dvr() {
+        let submission = newvolim_render::PortablePageSubmission::from_uploads([
+            newvolim_render::PortablePageUpload {
+                page: 0,
+                words: vec![0, 1],
+            },
+        ])
+        .unwrap();
+        let frame = newvolim_render::NativePortableFrameInput::new(
+            vec![newvolim_render::NativeLayerDescriptor {
+                layer_id: newvolim_scene::LayerId(1),
+                page_offset: 0,
+                page_count: 1,
+                transform: newvolim_scene::LayerTransform::IDENTITY,
+            }],
+            submission,
+        )
+        .unwrap();
+        let volume = newvolim_render::NativePortableVolumeInput::new(
+            frame,
+            [2, 1, 1],
+            newvolim_render::PortableScalarType::Uint16,
+            newvolim_render::PortableChannelTransfer {
+                color_srgb: [255, 0, 0],
+                window_start: 0.0,
+                window_end: 1.0,
+                opacity: 1.0,
+            },
+        )
+        .unwrap();
+        let draw = newvolim_render::NativePortableDrawInput::new(
+            volume,
+            [1, 1],
+            newvolim_render::PortableCameraControls::new([0, 0], 1.0).unwrap(),
+            vec![],
+        )
+        .unwrap();
+        let camera = newvolim_render::NativePortableCameraDrawInput::new(
+            draw,
+            vec![newvolim_render::PortableCameraRay {
+                origin_xyz: [-1.0, 0.5, 0.5],
+                direction_xyz: [1.0, 0.0, 0.0],
+            }],
+        )
+        .unwrap();
+        assert_eq!(
+            palace_slice_words_from_admitted_volume(&camera.draw.volume, 2, 0).unwrap(),
+            vec![0, 1]
+        );
+        let (level, rays) = palace_dvr_packet_from_native_camera(&camera).unwrap();
+        let input = level.raymarch_input(1, 1, rays, 1.0).unwrap();
+        let transfer = palace_transfer_from_native_camera(&camera).unwrap();
+        assert_eq!(transfer.classify(0.0), [255, 0, 0, 0]);
+        assert_eq!(transfer.classify(1.0), [255, 0, 0, 255]);
+        assert_eq!(
+            input.render_cpu(&transfer).unwrap().first_opacity_distance,
+            [2.0]
+        );
+        let resident_chunk_camera =
+            newvolim_render::NativePortableCameraDrawInput::new_with_voxel_origin(
+                camera.draw.clone(),
+                [7, 0, 0],
+                camera.rays.clone(),
+            )
+            .unwrap();
+        let (_, rays) = palace_dvr_packet_from_native_camera(&resident_chunk_camera).unwrap();
+        assert_eq!(rays[0].point_at(0.0), Some([6.0, 0.5, 0.5]));
+        let (level, rays) = palace_dvr_packet_from_native_camera(&resident_chunk_camera).unwrap();
+        let input = level.raymarch_input(1, 1, rays, 1.0).unwrap();
+        assert_eq!(
+            input.render_cpu(&transfer).unwrap().first_opacity_distance,
+            [2.0]
+        );
+        let mut transformed = camera.clone();
+        transformed.draw.volume.frame.descriptors[0].transform =
+            newvolim_scene::LayerTransform::new([2.0, 1.0, 1.0], [0.0; 3]).unwrap();
+        let (level, rays) = palace_dvr_packet_from_native_camera(&transformed).unwrap();
+        let input = level.raymarch_input(1, 1, rays, 1.0).unwrap();
+        assert_eq!(
+            input.render_cpu(&transfer).unwrap().first_opacity_distance,
+            [4.0]
+        );
+    }
+
+    #[test]
+    fn palace_slice_adapter_reads_an_admitted_four_page_channel_in_order() {
+        let transfer = newvolim_render::PortableChannelTransfer {
+            color_srgb: [255, 255, 255],
+            window_start: 0.0,
+            window_end: 1.0,
+            opacity: 1.0,
+        };
+        let volume = newvolim_render::NativePortableVolumeInput {
+            frame: newvolim_render::NativePortableFrameInput {
+                descriptors: vec![],
+                page_submission: newvolim_render::PortablePageSubmission {
+                    pages: [vec![0], vec![1], vec![2], vec![3]],
+                },
+            },
+            dimensions_xyz: [2, 2, 1],
+            scalar_type: newvolim_render::PortableScalarType::Uint16,
+            channels: vec![newvolim_render::PortableVolumeChannel {
+                page_offset: 0,
+                page_count: 4,
+                transfer,
+            }],
+        };
+
+        assert_eq!(
+            palace_slice_words_from_admitted_volume(&volume, 2, 0).unwrap(),
+            vec![0, 1, 2, 3]
+        );
+        assert_eq!(
+            palace_slice_words_from_admitted_volume_with_local_wgpu(&volume, 2, 0).unwrap(),
+            vec![0, 1, 2, 3]
+        );
+        let payload = palace_slice_payload(&volume, 2, 0).unwrap();
+        assert_eq!((payload.width, payload.height), (2, 2));
+        assert!(payload.data_url.starts_with("data:image/png;base64,"));
+    }
+
+    #[test]
+    fn portable_ball_fixture_matches_palaces_linked_orthogonal_panes() {
+        const EDGE: u32 = 32;
+        let words = (0..EDGE)
+            .flat_map(|z| {
+                (0..EDGE).flat_map(move |y| {
+                    (0..EDGE).map(move |x| {
+                        let centered =
+                            [x, y, z].map(|coordinate| coordinate as f32 / EDGE as f32 - 0.5);
+                        let distance = centered
+                            .iter()
+                            .map(|value| value * value)
+                            .sum::<f32>()
+                            .sqrt();
+                        (10.0 * (0.5 - distance))
+                            .clamp(0.0, 1.0)
+                            .mul_add(65535.0, 0.0) as u32
+                    })
+                })
+            })
+            .collect::<Vec<_>>();
+        let volume = newvolim_render::NativePortableVolumeInput {
+            frame: newvolim_render::NativePortableFrameInput {
+                descriptors: vec![],
+                page_submission: newvolim_render::PortablePageSubmission {
+                    pages: [words, vec![], vec![], vec![]],
+                },
+            },
+            dimensions_xyz: [EDGE, EDGE, EDGE],
+            scalar_type: newvolim_render::PortableScalarType::Uint16,
+            channels: vec![newvolim_render::PortableVolumeChannel {
+                page_offset: 0,
+                page_count: 1,
+                transfer: newvolim_render::PortableChannelTransfer {
+                    color_srgb: [255, 255, 255],
+                    window_start: 0.0,
+                    window_end: 65535.0,
+                    opacity: 1.0,
+                },
+            }],
+        };
+        let transfer = palace_core::gpu::PortableTransferFunction::new(
+            0.0,
+            65535.0,
+            // Palace's `grey_ramp` slice fixture uses the ramp intensity for both RGB and
+            // alpha, preserving transparent empty pixels without a separate compositing pass.
+            (0..=255)
+                .map(|value| [value, value, value, value])
+                .collect(),
+        )
+        .unwrap();
+        let portable = [0, 1, 2].map(|axis| {
+            palace_slice_words_from_admitted_volume(&volume, axis, EDGE / 2)
+                .unwrap()
+                .into_iter()
+                .flat_map(|word| transfer.classify(word as f32))
+                .collect::<Vec<_>>()
+        });
+        let palace = palace_frame::render_synthetic_orthogonal_at_rgba(
+            EDGE,
+            FrameSize::new(EDGE, EDGE).unwrap(),
+            [EDGE / 2; 3],
+        )
+        .unwrap();
+        for (portable, palace) in portable.into_iter().zip(palace) {
+            assert_eq!(portable.len(), palace.pixels().len());
+            let errors = portable
+                .iter()
+                .copied()
+                .zip(palace.pixels())
+                .enumerate()
+                .fold([0_u8; 4], |mut errors, (index, (left, right))| {
+                    errors[index % 4] = errors[index % 4].max(left.abs_diff(*right));
+                    errors
+                });
+            assert!(
+                errors.iter().all(|&error| error <= 2),
+                "portable/PALACE RGBA errors: {errors:?}; first portable {:?}, Palace {:?}",
+                &portable[..4],
+                &palace.pixels()[..4],
+            );
+        }
+
+        let red_transfer = palace_core::gpu::PortableTransferFunction::new(
+            0.0,
+            65535.0,
+            (0..=255).map(|value| [value, 0, 0, value]).collect(),
+        )
+        .unwrap();
+        let portable = [0, 1, 2].map(|axis| {
+            palace_slice_words_from_admitted_volume(&volume, axis, EDGE / 2)
+                .unwrap()
+                .into_iter()
+                .flat_map(|word| red_transfer.classify(word as f32))
+                .collect::<Vec<_>>()
+        });
+        let palace = palace_frame::render_synthetic_orthogonal_red_ramp_at_rgba(
+            EDGE,
+            FrameSize::new(EDGE, EDGE).unwrap(),
+            [EDGE / 2; 3],
+        )
+        .unwrap();
+        for (portable, palace) in portable.into_iter().zip(palace) {
+            let maximum_error = portable
+                .into_iter()
+                .zip(palace.pixels())
+                .map(|(left, right)| left.abs_diff(*right))
+                .max()
+                .unwrap();
+            assert!(
+                maximum_error <= 1,
+                "portable/Palace red-ramp fixture differed by {maximum_error}"
+            );
+        }
+
+        let mut anisotropic = volume.clone();
+        anisotropic.frame.descriptors = vec![newvolim_render::NativeLayerDescriptor {
+            layer_id: newvolim_scene::LayerId(1),
+            page_offset: 0,
+            page_count: 1,
+            transform: newvolim_scene::LayerTransform::new([0.26, 0.26, 0.29], [0.0; 3]).unwrap(),
+        }];
+        let [xy, xz, yz] = palace_slice_aspect_ratios(&anisotropic);
+        assert!((xy - 1.0).abs() < 1e-12);
+        assert!((xz - (0.26 / 0.29)).abs() < 1e-12);
+        assert!((yz - (0.26 / 0.29)).abs() < 1e-12);
+    }
+
+    #[test]
+    fn declared_channel_window_colour_and_opacity_map_to_the_portable_slice_lut() {
+        let volume = newvolim_render::NativePortableVolumeInput {
+            frame: newvolim_render::NativePortableFrameInput {
+                descriptors: vec![],
+                page_submission: newvolim_render::PortablePageSubmission {
+                    pages: [vec![10], vec![], vec![], vec![]],
+                },
+            },
+            dimensions_xyz: [1, 1, 1],
+            scalar_type: newvolim_render::PortableScalarType::Uint16,
+            channels: vec![newvolim_render::PortableVolumeChannel {
+                page_offset: 0,
+                page_count: 1,
+                transfer: newvolim_render::PortableChannelTransfer {
+                    color_srgb: [255, 32, 64],
+                    window_start: 10.0,
+                    window_end: 20.0,
+                    opacity: 0.5,
+                },
+            }],
+        };
+        let transfer = palace_transfer_from_native_volume(&volume).unwrap();
+        assert_eq!(transfer.classify(10.0), [255, 32, 64, 0]);
+        assert_eq!(transfer.classify(15.0), [255, 32, 64, 64]);
+        assert_eq!(transfer.classify(20.0), [255, 32, 64, 127]);
+    }
+
+    #[test]
+    fn ordered_multi_channel_slice_composites_its_distinct_page_ranges() {
+        let transfer = |color_srgb| newvolim_render::PortableChannelTransfer {
+            color_srgb,
+            window_start: 0.0,
+            window_end: 1.0,
+            opacity: 0.5,
+        };
+        let volume = newvolim_render::NativePortableVolumeInput {
+            frame: newvolim_render::NativePortableFrameInput {
+                descriptors: vec![],
+                page_submission: newvolim_render::PortablePageSubmission {
+                    pages: [vec![1], vec![1], vec![], vec![]],
+                },
+            },
+            dimensions_xyz: [1, 1, 1],
+            scalar_type: newvolim_render::PortableScalarType::Uint16,
+            channels: vec![
+                newvolim_render::PortableVolumeChannel {
+                    page_offset: 0,
+                    page_count: 1,
+                    transfer: transfer([255, 0, 0]),
+                },
+                newvolim_render::PortableVolumeChannel {
+                    page_offset: 1,
+                    page_count: 1,
+                    transfer: transfer([0, 255, 0]),
+                },
+            ],
+        };
+        assert_eq!(
+            palace_slice_words_from_channel_with_local_wgpu(&volume, 0, 2, 0).unwrap(),
+            vec![1]
+        );
+        assert_eq!(
+            palace_slice_words_from_channel_with_local_wgpu(&volume, 1, 2, 0).unwrap(),
+            vec![1]
+        );
+        let linear = newvolim_render::composite_portable_scene_samples(&[(
+            &[volume.channels[0].transfer, volume.channels[1].transfer],
+            &[1.0, 1.0],
+        )])
+        .unwrap();
+        assert_eq!(linear, [0.5, 0.5, 0.0, 1.0]);
+        assert_eq!(
+            portable_linear_premultiplied_to_srgb8(linear),
+            [188, 188, 0, 255]
+        );
+        assert!(palace_slice_payload(&volume, 2, 0)
+            .unwrap()
+            .data_url
+            .starts_with("data:image/png;base64,"));
+    }
+
+    #[test]
+    fn co_registered_portable_scene_slice_composites_layers_in_declared_order() {
+        let layer = |id, page, color_srgb| newvolim_render::PortableSceneLayerInput {
+            layer_id: newvolim_scene::LayerId(id),
+            transform: newvolim_scene::LayerTransform::IDENTITY,
+            voxel_origin_xyz: [0; 3],
+            dimensions_xyz: [1, 1, 1],
+            scalar_type: newvolim_render::PortableScalarType::Uint16,
+            channels: vec![newvolim_render::PortableVolumeChannel {
+                page_offset: page,
+                page_count: 1,
+                transfer: newvolim_render::PortableChannelTransfer {
+                    color_srgb,
+                    window_start: 0.0,
+                    window_end: 1.0,
+                    opacity: 0.5,
+                },
+            }],
+        };
+        let scene = newvolim_render::NativePortableSceneInput {
+            frame: newvolim_render::NativePortableFrameInput {
+                descriptors: vec![],
+                page_submission: newvolim_render::PortablePageSubmission {
+                    pages: [vec![1], vec![1], vec![], vec![]],
+                },
+            },
+            layers: vec![layer(1, 0, [255, 0, 0]), layer(2, 1, [0, 255, 0])],
+        };
+        assert_eq!(
+            palace_scene_slice_rgba(&scene, 2, 0).unwrap(),
+            // The shared oracle is premultiplied `[0.25, 0.5, 0.0, 0.75]`; PNG stores its
+            // RGB components straight, after un-premultiplication and sRGB encoding.
+            (1, 1, vec![156, 213, 0, 191])
+        );
+        let mut transformed = scene.clone();
+        transformed.layers[1].transform =
+            newvolim_scene::LayerTransform::new([2.0, 1.0, 1.0], [0.0; 3]).unwrap();
+        assert_eq!(
+            palace_scene_slice_rgba(&transformed, 2, 0).unwrap(),
+            (1, 1, vec![156, 213, 0, 191])
+        );
+        transformed.layers[1].transform =
+            newvolim_scene::LayerTransform::new([1.0; 3], [2.0, 0.0, 0.0]).unwrap();
+        assert_eq!(
+            palace_scene_slice_rgba(&transformed, 2, 0).unwrap(),
+            (1, 1, vec![255, 0, 0, 128])
+        );
+    }
+
+    #[test]
+    fn transformed_portable_scene_slice_uses_floor_nearest_physical_sampling() {
+        let layer = |id, page, color_srgb| newvolim_render::PortableSceneLayerInput {
+            layer_id: newvolim_scene::LayerId(id),
+            transform: newvolim_scene::LayerTransform::IDENTITY,
+            voxel_origin_xyz: [0; 3],
+            dimensions_xyz: [1, 1, 1],
+            scalar_type: newvolim_render::PortableScalarType::Uint16,
+            channels: vec![newvolim_render::PortableVolumeChannel {
+                page_offset: page,
+                page_count: 1,
+                transfer: newvolim_render::PortableChannelTransfer {
+                    color_srgb,
+                    window_start: 0.0,
+                    window_end: 1.0,
+                    opacity: 0.5,
+                },
+            }],
+        };
+        let mut scene = newvolim_render::NativePortableSceneInput {
+            frame: newvolim_render::NativePortableFrameInput {
+                descriptors: vec![],
+                // The second layer's first target voxel is green and its second is transparent.
+                // At physical x=0.5 with target scale=0.6, floor(0.5 / 0.6) selects voxel 0;
+                // a round-to-nearest implementation would incorrectly select voxel 1.
+                page_submission: newvolim_render::PortablePageSubmission {
+                    pages: [vec![1], vec![1, 0], vec![], vec![]],
+                },
+            },
+            layers: vec![layer(1, 0, [255, 0, 0]), layer(2, 1, [0, 255, 0])],
+        };
+        scene.layers[1].dimensions_xyz = [2, 1, 1];
+        scene.layers[1].transform =
+            newvolim_scene::LayerTransform::new([0.6, 1.0, 1.0], [0.0; 3]).unwrap();
+        assert_eq!(
+            palace_scene_slice_rgba(&scene, 2, 0).unwrap(),
+            (1, 1, vec![156, 213, 0, 191])
+        );
+
+        // Translating the target's voxel-0 boundary onto the reference centre still selects its
+        // first voxel. This fixes the convention at an exact transformed boundary.
+        scene.layers[1].transform =
+            newvolim_scene::LayerTransform::new([0.6, 1.0, 1.0], [0.5, 0.0, 0.0]).unwrap();
+        assert_eq!(
+            palace_scene_slice_rgba(&scene, 2, 0).unwrap(),
+            (1, 1, vec![156, 213, 0, 191])
+        );
+    }
+
+    #[test]
     #[ignore = "requires a local WGPU adapter"]
     fn native_portable_picker_uses_its_matching_camera_packet_and_depth() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -1593,6 +2887,45 @@ mod tests {
         // The exact fixture point can lie behind the first-opacity surface; success here proves
         // the portable renderer, paired depth, ray reconstruction, and annotation query share
         // one host-owned packet rather than requiring a browser depth input.
+        assert!(result.is_none() || result.as_ref().is_some_and(|hit| hit.annotation_id == 0));
+    }
+
+    #[test]
+    #[ignore = "requires a local WGPU adapter"]
+    fn native_portable_scene_picker_uses_ordered_scene_renderer_depth() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../test-data/cells3d-anisotropic.ome.zarr");
+        let mut session = LocalSession::default();
+        session.open_local_omezarr(&root).unwrap();
+        session.prepare_default_portable_image_layer().unwrap();
+        session
+            .add_point_annotation("front centre", [64, 64, 0])
+            .unwrap();
+        let size = FrameSize::new(64, 48).unwrap();
+        let projection =
+            project_point_for_local_zarr(&root, size, CameraControls::default(), [0.0, 64.0, 64.0])
+                .unwrap()
+                .unwrap();
+        let pixel = projection
+            .pixel
+            .map(|value| value.floor().clamp(0.0, 63.0) as u32);
+        let result = pick_native_portable_scene_annotation_for_session(
+            NativePortableScenePickRequest {
+                draw: NativePortableDrawRequest {
+                    origin_xyz: [2, 2, 0],
+                    extent_xyz: [1, 1, 1],
+                    width: 64,
+                    height: 48,
+                    orbit_x: 0,
+                    orbit_y: 0,
+                    zoom: 1.0,
+                },
+                x: pixel[0],
+                y: pixel[1],
+            },
+            &session,
+        )
+        .unwrap();
         assert!(result.is_none() || result.as_ref().is_some_and(|hit| hit.annotation_id == 0));
     }
 

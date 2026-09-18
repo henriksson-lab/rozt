@@ -915,6 +915,10 @@ impl NativePortableSceneCameraDrawInput {
 #[serde(rename_all = "camelCase")]
 pub struct NativePortableCameraDrawInput {
     pub draw: NativePortableDrawInput,
+    /// Global source-voxel origin of the bounded direct page. The ray table remains local to
+    /// that page for the fixed GPU layout; adapters use this origin when reconstructing physical
+    /// layer coordinates.
+    pub voxel_origin_xyz: [u64; 3],
     pub rays: Vec<PortableCameraRay>,
 }
 
@@ -925,6 +929,17 @@ impl NativePortableCameraDrawInput {
 
     pub fn new(
         draw: NativePortableDrawInput,
+        rays: Vec<PortableCameraRay>,
+    ) -> Result<Self, LayerRenderError> {
+        Self::new_with_voxel_origin(draw, [0; 3], rays)
+    }
+
+    /// Construct a camera packet for a resident subvolume whose local ray coordinates begin at
+    /// `voxel_origin_xyz` in the source layer. This keeps page-local GPU coordinates distinct
+    /// from physical transform reconstruction.
+    pub fn new_with_voxel_origin(
+        draw: NativePortableDrawInput,
+        voxel_origin_xyz: [u64; 3],
         rays: Vec<PortableCameraRay>,
     ) -> Result<Self, LayerRenderError> {
         let expected = usize::try_from(draw.extent_pixels[0])
@@ -951,7 +966,11 @@ impl NativePortableCameraDrawInput {
         }) {
             return Err(LayerRenderError::PortableCameraRay);
         }
-        Ok(Self { draw, rays })
+        Ok(Self {
+            draw,
+            voxel_origin_xyz,
+            rays,
+        })
     }
 }
 
@@ -2466,6 +2485,16 @@ mod tests {
                 .unwrap()
                 .rays,
             rays
+        );
+        assert_eq!(
+            NativePortableCameraDrawInput::new_with_voxel_origin(
+                draw.clone(),
+                [7, 8, 9],
+                rays.clone(),
+            )
+            .unwrap()
+            .voxel_origin_xyz,
+            [7, 8, 9]
         );
         assert!(matches!(
             NativePortableCameraDrawInput::new(draw.clone(), vec![]),

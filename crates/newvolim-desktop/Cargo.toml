@@ -16,10 +16,14 @@ newvolim-render = { path = "../newvolim-render" }
 newvolim-wgpu-frame = { path = "../newvolim-wgpu-frame" }
 newvolim-scene = { path = "../newvolim-scene" }
 palace-frame = { path = "../../palace-dev/palace-frame" }
+palace-core = { path = "../../palace-dev/palace-core" }
 palace-png = { path = "../../palace-dev/palace-png" }
+palace-wgpu = { path = "../../palace-dev/palace-wgpu" }
+pollster = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tauri = { version = "2.11.5", features = [] }
+wgpu = "30"
 
 [dev-dependencies]
 tempfile = "3"
