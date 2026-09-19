@@ -10,7 +10,7 @@ use std::{
     path::{Component, Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc,
+        Arc, Mutex,
     },
     time::Instant,
 };
@@ -18,7 +18,7 @@ use std::{
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
-        Path as AxumPath, State,
+        Path as AxumPath, Query, State,
     },
     http::{header, HeaderValue, StatusCode},
     response::IntoResponse,
@@ -28,6 +28,13 @@ use axum::{
 use base64::{engine::general_purpose::STANDARD, Engine};
 use clap::Parser;
 use newvolim_io::{read_array_info, read_dataset_metadata, LocalSourcePolicy};
+use newvolim_portable::{
+    routes::{
+        composite_palace_scene_annotations, demand_scene_levels, full_level_scene_inputs,
+        scene_route_frame, ChannelStateInput, NativePortableDrawRequest, RouteRenderer,
+    },
+    session::{LayerChannelSummary, LocalSession},
+};
 use newvolim_render::{ColorEncoding, ColorFormat, DepthAttachment, PhysicalExtent, RenderTarget};
 use palace_frame::{
     render_local_zarr_orthogonal_at_png, render_local_zarr_with_camera_attachments, CameraControls,
@@ -35,7 +42,7 @@ use palace_frame::{
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
-use tower_http::cors::CorsLayer;
+use tower_http::{cors::CorsLayer, services::ServeDir};
 
 /// Bounds a single unauthenticated loopback frame request before it reaches the renderer.
 const MAX_FRAME_PIXELS: u64 = 16 * 1024 * 1024;
@@ -66,12 +73,23 @@ struct Args {
     /// use; wildcard CORS is never enabled by this service.
     #[arg(long)]
     cors_origin: Vec<HeaderValue>,
+
+    /// Directory holding the built web page (the Trunk `dist/` of `newvolim-ui`). When given,
+    /// the page is served at `/` from the same origin as the API, so a browser needs one port
+    /// and no `--cors-origin`. API routes take precedence over files.
+    #[arg(long, value_name = "DIR")]
+    page_dir: Option<PathBuf>,
 }
 
 #[derive(Clone)]
 struct AppState {
     /// Browser clients receive only these stable names, never an arbitrary filesystem path.
     datasets: Arc<HashMap<String, PathBuf>>,
+    /// One portable-renderer session per configured dataset, opened on first use. It is the
+    /// same `LocalSession` the desktop runs, so a frame served here is the frame the desktop
+    /// would display, rendered by the same route, and channel edits sent to it persist across
+    /// requests from every client of that dataset.
+    sessions: SessionStore,
     /// Palace tasks are not yet cancellable. The dispatcher retains one active task and only
     /// the newest waiting request, preventing an unbounded stale-render backlog.
     render_queue: mpsc::Sender<FrameJob>,
@@ -81,8 +99,86 @@ struct AppState {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 struct SessionId(u64);
 
+/// Portable-renderer sessions keyed by configured dataset name.
+#[derive(Clone, Default)]
+struct SessionStore {
+    sessions: Arc<Mutex<HashMap<String, LocalSession>>>,
+}
+
+impl SessionStore {
+    /// A snapshot of the dataset's session, opening it on first use: the dataset is opened and
+    /// its default image layer prepared exactly as the desktop's open command does. The
+    /// snapshot is a clone; it shares the store's WGPU device and carries the channel state as
+    /// of now, so a render never holds the store's lock.
+    fn session_for(&self, dataset: &str, root: &Path) -> Result<LocalSession, String> {
+        let mut sessions = self
+            .sessions
+            .lock()
+            .map_err(|_| "portable session store lock was poisoned".to_owned())?;
+        if let Some(session) = sessions.get(dataset) {
+            return Ok(session.clone());
+        }
+        let mut session = LocalSession::default();
+        session
+            .open_local_omezarr(root)
+            .map_err(|error| error.to_string())?;
+        session
+            .prepare_default_portable_image_layer()
+            .map_err(|error| error.to_string())?;
+        sessions.insert(dataset.to_owned(), session.clone());
+        Ok(session)
+    }
+
+    /// Add a configured dataset as a further image layer of another dataset's session. Only
+    /// registry names are accepted, never paths: the registry stays the single authority.
+    fn add_layer(
+        &self,
+        dataset: &str,
+        root: &Path,
+        layer_root: &Path,
+    ) -> Result<Vec<LayerChannelSummary>, String> {
+        self.session_for(dataset, root)?;
+        let mut sessions = self
+            .sessions
+            .lock()
+            .map_err(|_| "portable session store lock was poisoned".to_owned())?;
+        let session = sessions
+            .get_mut(dataset)
+            .ok_or_else(|| "portable session vanished while adding a layer".to_owned())?;
+        session
+            .add_portable_image_layer(layer_root)
+            .map_err(|error| error.to_string())?;
+        Ok(session.layer_channels())
+    }
+
+    /// Apply one channel edit to the dataset's session and return every layer's channels.
+    fn set_channel_state(
+        &self,
+        dataset: &str,
+        root: &Path,
+        layer_id: u64,
+        channel: usize,
+        state: ChannelStateInput,
+    ) -> Result<Vec<LayerChannelSummary>, String> {
+        self.session_for(dataset, root)?;
+        let mut sessions = self
+            .sessions
+            .lock()
+            .map_err(|_| "portable session store lock was poisoned".to_owned())?;
+        let session = sessions
+            .get_mut(dataset)
+            .ok_or_else(|| "portable session vanished while editing".to_owned())?;
+        session
+            .set_channel_state(newvolim_scene::LayerId(layer_id), channel, state.into_state()?)
+            .map_err(|error| error.to_string())?;
+        Ok(session.layer_channels())
+    }
+}
+
 struct FrameJob {
     session_id: SessionId,
+    dataset: String,
+    sessions: SessionStore,
     root: PathBuf,
     size: FrameSize,
     controls: CameraControls,
@@ -95,6 +191,56 @@ struct RenderedFrame {
     png: Vec<u8>,
     ray_distance_pfm: Option<Vec<u8>>,
     render_ms: f64,
+    /// Which route produced the frame, for the `Server-Timing` header and the socket reply.
+    renderer: &'static str,
+}
+
+/// The volume frame for one request. With the dataset's portable session available this is
+/// `scene_route_frame` — the same function the desktop displays and picks against, in its own
+/// order of preference (demand-driven, static Palace scene, native recorder) — with the
+/// session's annotations composited over a Palace frame. Without a session (a dataset that
+/// cannot be opened as a portable layer, or a route error) it is Palace's Vulkan raycaster,
+/// which is what every server frame was before.
+fn render_volume_frame(
+    session: Option<&LocalSession>,
+    root: &Path,
+    size: FrameSize,
+    controls: CameraControls,
+) -> Result<(Vec<u8>, Option<Vec<u8>>, &'static str), String> {
+    if let Some(session) = session {
+        let request = NativePortableDrawRequest {
+            origin_xyz: [0; 3],
+            extent_xyz: [1; 3],
+            width: size.width,
+            height: size.height,
+            orbit_x: controls.orbit_delta[0],
+            orbit_y: controls.orbit_delta[1],
+            zoom: controls.zoom,
+        };
+        match scene_route_frame(session, request) {
+            Ok(frame) => {
+                let renderer = match frame.renderer {
+                    RouteRenderer::Demand => "portable-demand",
+                    RouteRenderer::Palace => "portable-palace",
+                    RouteRenderer::Native => "portable-native",
+                };
+                let attachments = match frame.renderer {
+                    RouteRenderer::Demand | RouteRenderer::Palace => {
+                        composite_palace_scene_annotations(session, request, frame.attachments)?
+                    }
+                    RouteRenderer::Native => frame.attachments,
+                };
+                let (png, pfm) =
+                    palace_png::encode_portable_frame_attachments(&attachments).into_parts();
+                return Ok((png, pfm, renderer));
+            }
+            Err(_) => {}
+        }
+    }
+    let attachments = render_local_zarr_with_camera_attachments(root, size, controls)
+        .map_err(|error| error.to_string())?;
+    let (png, pfm) = palace_png::encode_attachments(&attachments).into_parts();
+    Ok((png, pfm, "vulkan"))
 }
 
 struct RenderedOrthogonal {
@@ -253,22 +399,243 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         datasets: Arc::new(datasets),
         render_queue,
         next_session_id: Arc::new(AtomicU64::new(1)),
+        sessions: SessionStore::default(),
     };
-    let app = app_router(state, args.cors_origin);
+    let app = app_router(state, args.cors_origin, args.page_dir);
     let listener = tokio::net::TcpListener::bind(args.bind).await?;
     axum::serve(listener, app).await?;
     Ok(())
 }
 
-fn app_router(state: AppState, cors_origins: Vec<HeaderValue>) -> Router {
-    Router::new()
+fn app_router(
+    state: AppState,
+    cors_origins: Vec<HeaderValue>,
+    page_dir: Option<PathBuf>,
+) -> Router {
+    let router = Router::new()
         .route("/health", get(health))
         .route("/v1/frame", post(render_frame))
         .route("/v1/frames", get(frame_socket))
         .route("/v1/datasets", get(list_datasets))
         .route("/v1/datasets/{dataset}/zarr/{*asset}", get(read_zarr_asset))
+        .route(
+            "/v1/datasets/{dataset}/channels",
+            get(dataset_channels).post(set_dataset_channel),
+        )
+        .route("/v1/datasets/{dataset}/layers", post(add_dataset_layer))
+        .route("/v1/datasets/{dataset}/portable/scene", get(browser_scene))
         .with_state(state)
-        .layer(CorsLayer::new().allow_origin(cors_origins))
+        .layer(CorsLayer::new().allow_origin(cors_origins));
+    match page_dir {
+        // Static files only where no API route matched; `index.html` for directory requests.
+        Some(dir) => router.fallback_service(ServeDir::new(dir)),
+        None => router,
+    }
+}
+
+/// One channel edit for a dataset's portable session, over HTTP or the frame socket.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ChannelEdit {
+    layer_id: u64,
+    channel: usize,
+    state: ChannelStateInput,
+}
+
+/// A frame socket message: a channel edit (which carries `state`) or a frame request. The edit
+/// is tried first because a frame request never has a `state` field.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum SocketRequest {
+    Channel(ChannelRequest),
+    Frame(FrameRequest),
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ChannelRequest {
+    dataset: String,
+    #[serde(default)]
+    request_id: u64,
+    #[serde(flatten)]
+    edit: ChannelEdit,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SocketChannels {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    request_id: u64,
+    dataset: String,
+    layers: Vec<LayerChannelSummary>,
+}
+
+/// Every image layer's channels of a dataset's portable session, as the desktop's
+/// `layer_channels` command reports them.
+async fn dataset_channels(
+    State(state): State<AppState>,
+    AxumPath(dataset): AxumPath<String>,
+) -> Result<Json<Vec<LayerChannelSummary>>, (StatusCode, String)> {
+    let root = resolve_frame_dataset(&state.datasets, &dataset)?;
+    let session = tokio::task::spawn_blocking(move || state.sessions.session_for(&dataset, &root))
+        .await
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "session task failed".to_owned()))?
+        .map_err(|message| (StatusCode::BAD_REQUEST, message))?;
+    Ok(Json(session.layer_channels()))
+}
+
+/// The camera for a browser scene packet; the same controls a frame request carries.
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SceneQuery {
+    width: u32,
+    height: u32,
+    #[serde(default)]
+    orbit_x: i32,
+    #[serde(default)]
+    orbit_y: i32,
+    #[serde(default = "default_zoom")]
+    zoom: f32,
+}
+
+/// Everything a browser uploads to run the desktop's scene shader itself, byte for byte what
+/// the desktop's recorder would upload for the same session and camera: the WGSL, the four
+/// static pages (bindings 0–3), the metadata + LUT + residency words (4), the rays (5), the
+/// 16-word uniform (7), the request-table capacity whose buffer starts as all `0xFFFFFFFF` (8),
+/// and the output word count (6) with the workgroup count. Word arrays are little-endian `u32`,
+/// base64. Every chunk of each layer's level is resident, so one dispatch renders the whole
+/// scene; the levels are the ones the demand route would choose for this camera.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BrowserScenePacket {
+    shader: &'static str,
+    width: u32,
+    height: u32,
+    levels: Vec<u32>,
+    params: [u32; 16],
+    pages: [String; 4],
+    scene_data: String,
+    rays: String,
+    request_capacity: u32,
+    output_words: u32,
+    workgroups: u32,
+}
+
+fn words_base64(words: &[u32]) -> String {
+    STANDARD.encode(
+        words
+            .iter()
+            .flat_map(|word| word.to_le_bytes())
+            .collect::<Vec<_>>(),
+    )
+}
+
+fn browser_scene_packet(
+    session: &LocalSession,
+    size: FrameSize,
+    controls: CameraControls,
+) -> Result<BrowserScenePacket, String> {
+    let levels = demand_scene_levels(session, size, controls)?;
+    let request = NativePortableDrawRequest {
+        origin_xyz: [0; 3],
+        extent_xyz: [1; 3],
+        width: size.width,
+        height: size.height,
+        orbit_x: controls.orbit_delta[0],
+        orbit_y: controls.orbit_delta[1],
+        zoom: controls.zoom,
+    };
+    let (input, table, _) = full_level_scene_inputs(session, request, &levels)?;
+    let dispatch = palace_wgpu::scene_dvr_dispatch(&input, Some(&table), 4_096, 16)?;
+    Ok(BrowserScenePacket {
+        shader: palace_wgpu::SCENE_DVR_SHADER,
+        width: size.width,
+        height: size.height,
+        levels,
+        params: dispatch.params,
+        pages: std::array::from_fn(|index| words_base64(&dispatch.pages[index])),
+        scene_data: words_base64(&dispatch.scene_data),
+        rays: words_base64(&dispatch.rays),
+        request_capacity: u32::try_from(dispatch.request_capacity)
+            .map_err(|_| "request table is too large for the wire".to_owned())?,
+        output_words: u32::try_from(dispatch.output_words)
+            .map_err(|_| "output is too large for the wire".to_owned())?,
+        workgroups: dispatch.workgroups,
+    })
+}
+
+async fn browser_scene(
+    State(state): State<AppState>,
+    AxumPath(dataset): AxumPath<String>,
+    Query(query): Query<SceneQuery>,
+) -> Result<Json<BrowserScenePacket>, (StatusCode, String)> {
+    validate_render_extent(query.width, query.height, RenderView::Volume)
+        .map_err(|message| (StatusCode::BAD_REQUEST, message))?;
+    let size = FrameSize::new(query.width, query.height)
+        .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
+    let controls = CameraControls {
+        orbit_delta: [query.orbit_x, query.orbit_y],
+        zoom: query.zoom,
+    }
+    .validate()
+    .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
+    let root = resolve_frame_dataset(&state.datasets, &dataset)?;
+    let sessions = state.sessions.clone();
+    tokio::task::spawn_blocking(move || {
+        let session = sessions.session_for(&dataset, &root)?;
+        browser_scene_packet(&session, size, controls)
+    })
+    .await
+    .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "scene task failed".to_owned()))?
+    .map_err(|message| (StatusCode::BAD_REQUEST, message))
+    .map(Json)
+}
+
+/// A further image layer for a dataset's session, named by its own registry entry.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LayerRequest {
+    dataset: String,
+}
+
+async fn add_dataset_layer(
+    State(state): State<AppState>,
+    AxumPath(dataset): AxumPath<String>,
+    Json(layer): Json<LayerRequest>,
+) -> Result<Json<Vec<LayerChannelSummary>>, (StatusCode, String)> {
+    let root = resolve_frame_dataset(&state.datasets, &dataset)?;
+    let layer_root = resolve_frame_dataset(&state.datasets, &layer.dataset)?;
+    let sessions = state.sessions.clone();
+    tokio::task::spawn_blocking(move || sessions.add_layer(&dataset, &root, &layer_root))
+        .await
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "session task failed".to_owned()))?
+        .map_err(|message| (StatusCode::BAD_REQUEST, message))
+        .map(Json)
+}
+
+/// Replace one channel's transfer state; every later frame of the dataset renders it.
+async fn set_dataset_channel(
+    State(state): State<AppState>,
+    AxumPath(dataset): AxumPath<String>,
+    Json(edit): Json<ChannelEdit>,
+) -> Result<Json<Vec<LayerChannelSummary>>, (StatusCode, String)> {
+    apply_channel_edit(&state, dataset, edit).await.map(Json)
+}
+
+async fn apply_channel_edit(
+    state: &AppState,
+    dataset: String,
+    edit: ChannelEdit,
+) -> Result<Vec<LayerChannelSummary>, (StatusCode, String)> {
+    let root = resolve_frame_dataset(&state.datasets, &dataset)?;
+    let sessions = state.sessions.clone();
+    tokio::task::spawn_blocking(move || {
+        sessions.set_channel_state(&dataset, &root, edit.layer_id, edit.channel, edit.state)
+    })
+    .await
+    .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "session task failed".to_owned()))?
+    .map_err(|message| (StatusCode::BAD_REQUEST, message))
 }
 
 async fn health() -> Json<Health> {
@@ -395,7 +762,11 @@ async fn render_frame(
     let RenderOutput::Volume(rendered) = rendered else {
         unreachable!("volume HTTP request cannot produce slices")
     };
-    let server_timing = HeaderValue::try_from(format!("render;dur={:.3}", rendered.render_ms))
+    // Two Server-Timing metrics: the renderer's wall time, and which route produced the frame.
+    let server_timing = HeaderValue::try_from(format!(
+        "render;dur={:.3}, route;desc=\"{}\"",
+        rendered.render_ms, rendered.renderer
+    ))
         .map_err(|_| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -440,6 +811,8 @@ async fn enqueue_render(
         .render_queue
         .try_send(FrameJob {
             session_id,
+            dataset: request.dataset.clone(),
+            sessions: state.sessions.clone(),
             root,
             size,
             controls,
@@ -563,8 +936,34 @@ async fn serve_frame_socket(mut socket: WebSocket, state: AppState, session_id: 
             }
             Err(_) => break,
         };
-        let request = match serde_json::from_str::<FrameRequest>(&message) {
-            Ok(request) => request,
+        let request = match serde_json::from_str::<SocketRequest>(&message) {
+            Ok(SocketRequest::Channel(edit)) => {
+                let request_id = edit.request_id;
+                let dataset = edit.dataset.clone();
+                let reply = match apply_channel_edit(&state, edit.dataset, edit.edit).await {
+                    Ok(layers) => serde_json::to_string(&SocketChannels {
+                        kind: "channels",
+                        request_id,
+                        dataset,
+                        layers,
+                    })
+                    .expect("SocketChannels is serializable"),
+                    Err((status, message)) => {
+                        if send_socket_error(&mut socket, Some(request_id), status, &message)
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                        continue;
+                    }
+                };
+                if socket.send(Message::Text(reply.into())).await.is_err() {
+                    break;
+                }
+                continue;
+            }
+            Ok(SocketRequest::Frame(request)) => request,
             Err(error) => {
                 if send_socket_error(
                     &mut socket,
@@ -705,17 +1104,17 @@ fn start_render(job: FrameJob, completed_tx: &mpsc::UnboundedSender<RenderComple
         let started = Instant::now();
         let result = match job.view {
             RenderView::Volume => {
-                render_local_zarr_with_camera_attachments(job.root, job.size, job.controls)
-                    .map(|attachments| {
-                        let (png, ray_distance_pfm) =
-                            palace_png::encode_attachments(&attachments).into_parts();
+                let session = job.sessions.session_for(&job.dataset, &job.root).ok();
+                render_volume_frame(session.as_ref(), &job.root, job.size, job.controls).map(
+                    |(png, ray_distance_pfm, renderer)| {
                         RenderOutput::Volume(RenderedFrame {
                             png,
                             ray_distance_pfm,
                             render_ms: started.elapsed().as_secs_f64() * 1_000.0,
+                            renderer,
                         })
-                    })
-                    .map_err(|error| error.to_string())
+                    },
+                )
             }
             RenderView::Orthogonal => dataset_xyz_extent(&job.root).and_then(|shape| {
                 let requested = job
@@ -851,6 +1250,8 @@ mod tests {
     fn test_job(session_id: u64, response: oneshot::Sender<RenderResult>) -> FrameJob {
         FrameJob {
             session_id: SessionId(session_id),
+            dataset: "test".to_owned(),
+            sessions: SessionStore::default(),
             root: PathBuf::from("/tmp/test.ome.zarr"),
             size: FrameSize::new(1, 1).unwrap(),
             controls: CameraControls::default(),
@@ -882,6 +1283,373 @@ mod tests {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../test-data/cells3d-anisotropic.ome.zarr");
         assert_eq!(dataset_xyz_extent(&root).unwrap(), [128, 128, 32]);
+    }
+
+    #[test]
+    fn socket_requests_parse_frames_and_channel_edits() {
+        let frame = serde_json::from_str::<SocketRequest>(
+            r#"{"dataset":"cells3d","width":32,"height":24,"requestId":7,"zoom":1.5}"#,
+        )
+        .unwrap();
+        assert!(matches!(frame, SocketRequest::Frame(request) if request.request_id == 7 && request.zoom == 1.5));
+        let edit = serde_json::from_str::<SocketRequest>(
+            r#"{"dataset":"cells3d","requestId":9,"layerId":1,"channel":0,"state":{"enabled":true,"colorSrgb":[255,0,0],"windowStart":100,"windowEnd":4000,"opacity":0.5}}"#,
+        )
+        .unwrap();
+        match edit {
+            SocketRequest::Channel(request) => {
+                assert_eq!((request.request_id, request.edit.layer_id, request.edit.channel), (9, 1, 0));
+                assert_eq!(request.edit.state.into_state().unwrap().opacity, 0.5);
+            }
+            SocketRequest::Frame(_) => panic!("a message carrying `state` is a channel edit"),
+        }
+    }
+
+    /// The store opens a dataset once, and a channel edit reaches the session every later frame
+    /// snapshot is taken from.
+    #[test]
+    fn channel_edits_persist_in_the_dataset_session() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../test-data/cells3d-anisotropic.ome.zarr");
+        let store = SessionStore::default();
+        let first = store.session_for("cells3d", &root).unwrap();
+        let layers = first.layer_channels();
+        assert_eq!(layers.len(), 1);
+        assert_eq!(layers[0].channels[0].opacity, 1.0);
+        let edited = store
+            .set_channel_state(
+                "cells3d",
+                &root,
+                layers[0].layer_id,
+                0,
+                ChannelStateInput {
+                    enabled: true,
+                    color_srgb: [1, 2, 3],
+                    window_start: 100.0,
+                    window_end: 4000.0,
+                    opacity: 0.25,
+                },
+            )
+            .unwrap();
+        assert_eq!(edited[0].channels[0].opacity, 0.25);
+        assert_eq!(edited[0].channels[0].color_srgb, [1, 2, 3]);
+        // The earlier snapshot is unchanged; a new snapshot carries the edit.
+        assert_eq!(first.layer_channels()[0].channels[0].opacity, 1.0);
+        let again = store.session_for("cells3d", &root).unwrap();
+        assert_eq!(again.layer_channels()[0].channels[0].opacity, 0.25);
+        assert_eq!(store.sessions.lock().unwrap().len(), 1);
+        assert!(store
+            .set_channel_state(
+                "cells3d",
+                &root,
+                layers[0].layer_id,
+                5,
+                ChannelStateInput {
+                    enabled: true,
+                    color_srgb: [0; 3],
+                    window_start: 0.0,
+                    window_end: 1.0,
+                    opacity: 1.0
+                }
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn a_registry_dataset_can_join_another_dataset_session_as_a_layer() {
+        let cells = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../test-data/cells3d-anisotropic.ome.zarr");
+        let gradient = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../test-data/two-channel-gradient.ome.zarr");
+        let store = SessionStore::default();
+        let layers = store.add_layer("cells3d", &cells, &gradient).unwrap();
+        assert_eq!(layers.len(), 2);
+        assert_eq!(layers[1].channels.len(), 2);
+        assert_eq!(store.session_for("cells3d", &cells).unwrap().layer_channels().len(), 2);
+    }
+
+    /// The browser packet, consumed exactly as the page consumes it — decoded from base64,
+    /// nine bindings in the documented order, the packet's own WGSL, the packet's workgroup
+    /// count, the output decoded as colour words then depth bits — renders the frame the
+    /// desktop displays for the same session and camera, pixel for pixel.
+    #[test]
+    #[ignore = "requires a local WGPU adapter"]
+    fn browser_scene_packet_reproduces_the_desktop_frame_on_the_local_adapter() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../test-data/cells3d-anisotropic.ome.zarr");
+        let store = SessionStore::default();
+        let session = store.session_for("cells3d", &root).unwrap();
+        let size = FrameSize::new(96, 64).unwrap();
+        let controls = CameraControls {
+            orbit_delta: [12, -7],
+            zoom: 1.3,
+        }
+        .validate()
+        .unwrap();
+        let packet = browser_scene_packet(&session, size, controls).unwrap();
+        assert_eq!((packet.width, packet.height), (96, 64));
+        assert_eq!(packet.output_words, 96 * 64 * 2 + palace_wgpu::SCENE_TRACE_WORDS as u32);
+        let words = |encoded: &str| -> Vec<u32> {
+            STANDARD
+                .decode(encoded)
+                .unwrap()
+                .chunks_exact(4)
+                .map(|word| u32::from_le_bytes([word[0], word[1], word[2], word[3]]))
+                .collect()
+        };
+
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let adapter =
+            pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
+                .unwrap();
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            required_features: wgpu::Features::empty(),
+            required_limits: wgpu::Limits::default(),
+            ..Default::default()
+        }))
+        .unwrap();
+        let storage = |label: &str, words: &[u32], writable: bool| {
+            let bytes = words.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<_>>();
+            let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(label),
+                size: bytes.len().max(4) as u64,
+                usage: wgpu::BufferUsages::STORAGE
+                    | wgpu::BufferUsages::COPY_DST
+                    | if writable { wgpu::BufferUsages::COPY_SRC } else { wgpu::BufferUsages::empty() },
+                mapped_at_creation: false,
+            });
+            if !bytes.is_empty() {
+                queue.write_buffer(&buffer, 0, &bytes);
+            }
+            buffer
+        };
+        let pages: Vec<_> = packet
+            .pages
+            .iter()
+            .enumerate()
+            .map(|(index, page)| storage(&format!("page {index}"), &words(page), false))
+            .collect();
+        let scene_data = storage("scene data", &words(&packet.scene_data), false);
+        let rays = storage("rays", &words(&packet.rays), false);
+        let output = storage("output", &vec![0; packet.output_words as usize], true);
+        let uniform = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("params"),
+            size: 64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        queue.write_buffer(
+            &uniform,
+            0,
+            &packet.params.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<_>>(),
+        );
+        let requests = storage("requests", &vec![u32::MAX; packet.request_capacity as usize], true);
+        let entry = |binding: u32, read_only: bool| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Storage { read_only },
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        };
+        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("browser scene layout"),
+            entries: &[
+                entry(0, true),
+                entry(1, true),
+                entry(2, true),
+                entry(3, true),
+                entry(4, true),
+                entry(5, true),
+                entry(6, false),
+                wgpu::BindGroupLayoutEntry {
+                    binding: 7,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                entry(8, false),
+            ],
+        });
+        fn bind(binding: u32, buffer: &wgpu::Buffer) -> wgpu::BindGroupEntry<'_> {
+            wgpu::BindGroupEntry {
+                binding,
+                resource: buffer.as_entire_binding(),
+            }
+        }
+        let group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("browser scene group"),
+            layout: &layout,
+            entries: &[
+                bind(0, &pages[0]),
+                bind(1, &pages[1]),
+                bind(2, &pages[2]),
+                bind(3, &pages[3]),
+                bind(4, &scene_data),
+                bind(5, &rays),
+                bind(6, &output),
+                bind(7, &uniform),
+                bind(8, &requests),
+            ],
+        });
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("browser scene shader"),
+            source: wgpu::ShaderSource::Wgsl(packet.shader.into()),
+        });
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: None,
+            bind_group_layouts: &[Some(&layout)],
+            immediate_size: 0,
+        });
+        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: None,
+            layout: Some(&pipeline_layout),
+            module: &module,
+            entry_point: Some("main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        let readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("readback"),
+            size: u64::from(packet.output_words) * 4,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        {
+            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &group, &[]);
+            pass.dispatch_workgroups(packet.workgroups, 1, 1);
+        }
+        encoder.copy_buffer_to_buffer(&output, 0, &readback, 0, u64::from(packet.output_words) * 4);
+        queue.submit([encoder.finish()]);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        readback
+            .slice(..)
+            .map_async(wgpu::MapMode::Read, move |result| {
+                let _ = sender.send(result);
+            });
+        device.poll(wgpu::PollType::wait_indefinitely()).unwrap();
+        receiver.recv().unwrap().unwrap();
+        let output_words = {
+            let mapped = readback.slice(..).get_mapped_range().unwrap();
+            mapped
+                .chunks_exact(4)
+                .map(|word| u32::from_le_bytes([word[0], word[1], word[2], word[3]]))
+                .collect::<Vec<_>>()
+        };
+        readback.unmap();
+        let (frame, _) = palace_wgpu::scene_frame_from_output(96, 64, &output_words).unwrap();
+
+        let desktop = scene_route_frame(
+            &session,
+            NativePortableDrawRequest {
+                origin_xyz: [0; 3],
+                extent_xyz: [1; 3],
+                width: 96,
+                height: 64,
+                orbit_x: 12,
+                orbit_y: -7,
+                zoom: 1.3,
+            },
+        )
+        .unwrap();
+        assert_eq!(desktop.renderer, RouteRenderer::Demand);
+        assert_eq!(frame.first_opacity_distance, desktop.attachments.first_opacity_distance);
+        assert_eq!(frame.rgba, desktop.attachments.rgba);
+        assert!(frame.first_opacity_distance.iter().any(|d| d.is_finite()));
+    }
+
+    /// The page dispatches the packet exactly as the test above does: the endpoint path, and
+    /// the nine bindings in order.
+    #[test]
+    fn webview_dispatches_the_browser_scene_packet_with_the_documented_bindings() {
+        let source = std::fs::read_to_string(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../newvolim-ui/index.html"),
+        )
+        .unwrap();
+        assert!(source.contains("/portable/scene?"));
+        let start = source.find("newvolimRenderServerScene = async function").unwrap();
+        let body = &source[start..];
+        let body = &body[..body.find("window.newvolimSetChannelState = ").unwrap_or(body.len())];
+        let mut last = 0;
+        for (binding, resource) in [
+            (0, "pages[0]"),
+            (1, "pages[1]"),
+            (2, "pages[2]"),
+            (3, "pages[3]"),
+            (4, "sceneData"),
+            (5, "rays"),
+            (6, "output"),
+            (7, "uniform"),
+            (8, "requests"),
+        ] {
+            let needle = format!("{{ binding: {binding}, resource: {{ buffer: {resource} }} }}");
+            let at = body.find(&needle).unwrap_or_else(|| panic!("missing {needle}"));
+            assert!(at > last, "binding {binding} is out of order");
+            last = at;
+        }
+        assert!(body.contains("dispatchWorkgroups(packet.workgroups)"));
+        assert!(body.contains("packet.shader"));
+    }
+
+    /// A server volume frame is the portable route frame: its PFM decodes to exactly the depth
+    /// `scene_route_frame` produces for the same session and camera, and the route is named.
+    #[test]
+    #[ignore = "requires a local WGPU adapter"]
+    fn server_volume_frame_is_the_portable_route_frame() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../test-data/cells3d-anisotropic.ome.zarr");
+        let store = SessionStore::default();
+        let session = store.session_for("cells3d", &root).unwrap();
+        let size = FrameSize::new(48, 32).unwrap();
+        let controls = CameraControls {
+            orbit_delta: [3, -2],
+            zoom: 1.2,
+        }
+        .validate()
+        .unwrap();
+        let (png, pfm, renderer) =
+            render_volume_frame(Some(&session), &root, size, controls).unwrap();
+        assert_eq!(renderer, "portable-demand");
+        assert_eq!(png_dimensions(&png), [48, 32]);
+        let pfm = pfm.expect("portable frames carry the paired depth");
+        let header = b"Pf\n48 32\n-1.0\n";
+        assert!(pfm.starts_with(header));
+        let distances = pfm[header.len()..]
+            .chunks_exact(4)
+            .map(|word| f32::from_le_bytes([word[0], word[1], word[2], word[3]]))
+            .collect::<Vec<_>>()
+            .chunks_exact(48)
+            .rev()
+            .flat_map(|row| row.to_vec())
+            .collect::<Vec<_>>();
+        let frame = scene_route_frame(
+            &session,
+            NativePortableDrawRequest {
+                origin_xyz: [0; 3],
+                extent_xyz: [1; 3],
+                width: 48,
+                height: 32,
+                orbit_x: 3,
+                orbit_y: -2,
+                zoom: 1.2,
+            },
+        )
+        .unwrap();
+        assert_eq!(distances, frame.attachments.first_opacity_distance);
+        assert!(distances.iter().any(|distance| distance.is_finite()));
+        // Without a session the same request is Palace's Vulkan frame, as before.
+        let (_, pfm, renderer) = render_volume_frame(None, &root, size, controls).unwrap();
+        assert_eq!(renderer, "vulkan");
+        assert!(pfm.is_some());
     }
 
     #[test]
@@ -1211,10 +1979,12 @@ mod tests {
             )])),
             render_queue,
             next_session_id: Arc::new(AtomicU64::new(1)),
+            sessions: SessionStore::default(),
         };
         let app = app_router(
             state,
             vec![HeaderValue::from_static("https://viewer.example")],
+            None,
         );
         let allowed = app
             .clone()
@@ -1283,8 +2053,10 @@ mod tests {
                 datasets: Arc::new(HashMap::from([("cells3d".to_owned(), root)])),
                 render_queue,
                 next_session_id: Arc::new(AtomicU64::new(1)),
+                sessions: SessionStore::default(),
             },
             vec![],
+            None,
         );
 
         let discovery = app
@@ -1340,6 +2112,80 @@ mod tests {
         }
     }
 
+    /// With `--page-dir` the built page is served from the API's own origin: `/` is the
+    /// directory's `index.html`, its assets resolve beside it, API routes still win, unknown
+    /// paths are 404, and without the option `/` is 404 as before.
+    #[tokio::test]
+    async fn page_dir_serves_the_built_page_beside_the_api() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../test-data/cells3d-anisotropic.ome.zarr")
+            .canonicalize()
+            .unwrap();
+        let page = tempfile::tempdir().unwrap();
+        std::fs::write(page.path().join("index.html"), "<title>newvolim page</title>").unwrap();
+        std::fs::write(page.path().join("app.js"), "window.newvolim = 1;").unwrap();
+        let state = || {
+            let (render_queue, _receiver) = mpsc::channel(1);
+            AppState {
+                datasets: Arc::new(HashMap::from([("cells3d".to_owned(), root.clone())])),
+                render_queue,
+                next_session_id: Arc::new(AtomicU64::new(1)),
+                sessions: SessionStore::default(),
+            }
+        };
+        let get = |app: Router, uri: &str| {
+            let request = Request::builder().uri(uri).body(Body::empty()).unwrap();
+            async move {
+                let response = app.oneshot(request).await.unwrap();
+                let status = response.status();
+                let content_type = response
+                    .headers()
+                    .get(header::CONTENT_TYPE)
+                    .map(|value| value.to_str().unwrap().to_owned());
+                let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+                    .await
+                    .unwrap();
+                (status, content_type, String::from_utf8_lossy(&body).into_owned())
+            }
+        };
+
+        let app = app_router(state(), vec![], Some(page.path().to_path_buf()));
+        let (status, content_type, body) = get(app.clone(), "/").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(content_type.as_deref(), Some("text/html"));
+        assert_eq!(body, "<title>newvolim page</title>");
+        let (status, content_type, body) = get(app.clone(), "/app.js").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(content_type.as_deref().unwrap().starts_with("text/javascript"), "{content_type:?}");
+        assert_eq!(body, "window.newvolim = 1;");
+        let (status, _, body) = get(app.clone(), "/v1/datasets").await;
+        assert_eq!(status, StatusCode::OK, "API routes take precedence over files");
+        assert!(body.contains("cells3d"));
+        let (status, _, _) = get(app.clone(), "/missing.js").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, _, _) = get(app, "/../Cargo.toml").await;
+        assert_ne!(status, StatusCode::OK, "no path escapes the page directory");
+
+        let bare = app_router(state(), vec![], None);
+        let (status, _, _) = get(bare, "/").await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "no page without --page-dir");
+    }
+
+    /// The page reaches the API on its own origin when the chunk-server box is empty, so the
+    /// single-port deployment (`--page-dir`) needs no configuration in the browser.
+    #[test]
+    fn webview_defaults_the_chunk_server_to_its_own_origin() {
+        let source = std::fs::read_to_string(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../newvolim-ui/index.html"),
+        )
+        .unwrap();
+        let start = source.find("newvolimChunkServerOrigin = function").unwrap();
+        let body = &source[start..];
+        let body = &body[..body.find("window.newvolimDiscoverBrowserDatasets").unwrap()];
+        assert!(body.contains("window.location.origin"), "empty box falls back to the page's origin");
+        assert!(body.contains("raw === \"\""), "only when the box is empty");
+    }
+
     #[tokio::test]
     async fn named_local_frame_route_renders_a_real_palace_png_without_a_tcp_listener() {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -1352,8 +2198,9 @@ mod tests {
             datasets: Arc::new(HashMap::from([("cells3d".to_owned(), root)])),
             render_queue,
             next_session_id: Arc::new(AtomicU64::new(1)),
+            sessions: SessionStore::default(),
         };
-        let app = app_router(state.clone(), vec![]);
+        let app = app_router(state.clone(), vec![], None);
 
         let invalid_controls = app
             .clone()
@@ -1398,9 +2245,18 @@ mod tests {
         assert!(
             timing
                 .strip_prefix("render;dur=")
-                .and_then(|value| value.parse::<f64>().ok())
+                .and_then(|value| value.split(',').next())
+                .and_then(|value| value.trim().parse::<f64>().ok())
                 .is_some_and(|value| value.is_finite() && value >= 0.0),
             "frame route returned an invalid Server-Timing value: {timing:?}"
+        );
+        // The second metric names the route; on a host with a WGPU adapter that is the portable
+        // demand route, otherwise Palace's Vulkan raycaster.
+        assert!(
+            ["portable-demand", "portable-palace", "portable-native", "vulkan"]
+                .iter()
+                .any(|route| timing.contains(&format!("route;desc=\"{route}\""))),
+            "frame route did not name its renderer: {timing:?}"
         );
         let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
         assert!(body.starts_with(b"\x89PNG\r\n\x1a\n"));

@@ -362,6 +362,9 @@ impl Scene {
     pub fn layer(&self, id: LayerId) -> Option<&Layer> {
         self.layers.iter().find(|layer| layer.id == id)
     }
+    pub fn layer_mut(&mut self, id: LayerId) -> Option<&mut Layer> {
+        self.layers.iter_mut().find(|layer| layer.id == id)
+    }
 
     pub fn annotations(&self) -> &[Annotation] {
         &self.annotations

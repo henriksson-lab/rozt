@@ -12,6 +12,7 @@ url = "2"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 opendal = { version = "0.58", features = ["services-s3"] }
 pollster = "1"
+zarrs = { version = "0.18", features = ["filesystem"] }
 
 [dev-dependencies]
 tempfile = "3"

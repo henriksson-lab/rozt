@@ -98,6 +98,10 @@ pub struct ArrayInfo {
     pub order: Option<String>,
     #[serde(default)]
     pub compressor: Option<serde_json::Value>,
+    /// Zarr v2 `dimension_separator` (`"."` when absent); `None` for a v3 array, whose chunk
+    /// key encoding is `default` with a `/` separator as far as this reader is concerned.
+    #[serde(default)]
+    pub dimension_separator: Option<String>,
 }
 
 /// Largest accepted root metadata document. Metadata is untrusted input when a store is remote;
@@ -377,7 +381,7 @@ pub fn read_remote_dataset_metadata(
         Ok(bytes) => {
             let document: ZarrV3Root =
                 serde_json::from_slice(&bytes).map_err(RemoteMetadataError::Json)?;
-            Ok(document.attributes)
+            Ok(document.attributes.into_dataset_metadata())
         }
         Err(RemoteFetchError::NotFound) => {
             let v2 = root.join(".zattrs").map_err(RemoteMetadataError::Url)?;
@@ -1279,6 +1283,38 @@ pub fn read_array_info(
     }
 }
 
+/// Read one logical region of a local Zarr array, decoded.
+///
+/// This goes through `zarrs`, which interprets whatever the array declares — Zarr v2 or v3, the
+/// `bytes` codec at either endianness, blosc, zstd, gzip, crc32c, transpose, sharding — and
+/// returns the region's elements in C order, in the array's native little-endian byte layout,
+/// exactly `shape` elements per axis (an edge region is its logical extent, never a padded
+/// chunk). The raw asset reader below stays as it is: it serves stored bytes verbatim to a
+/// browser that decodes nothing, and is not a way to read data.
+pub fn read_array_region(
+    root: impl AsRef<Path>,
+    array_path: &str,
+    start: &[u64],
+    shape: &[u64],
+) -> Result<Vec<u8>, String> {
+    let store = std::sync::Arc::new(
+        zarrs::filesystem::FilesystemStore::new(root.as_ref())
+            .map_err(|error| format!("opening the Zarr store: {error}"))?,
+    );
+    let node = format!("/{}", array_path.trim_matches('/'));
+    let array = zarrs::array::Array::open(store, &node)
+        .map_err(|error| format!("opening array {node}: {error}"))?;
+    let subset =
+        zarrs::array_subset::ArraySubset::new_with_start_shape(start.to_vec(), shape.to_vec())
+            .map_err(|error| format!("array region {start:?}+{shape:?}: {error}"))?;
+    let bytes = array
+        .retrieve_array_subset(&subset)
+        .map_err(|error| format!("reading array {node} region {start:?}+{shape:?}: {error}"))?
+        .into_fixed()
+        .map_err(|error| format!("array {node} is not a fixed-size element array: {error}"))?;
+    Ok(bytes.into_owned())
+}
+
 /// Read one raw Zarr asset below a local root under a caller-selected byte cap. The asset must
 /// consist entirely of normal path components; absolute paths, traversal, query-like characters,
 /// and percent escapes are rejected before filesystem access.
@@ -1374,7 +1410,27 @@ impl std::error::Error for LocalAssetError {
 #[derive(Deserialize)]
 struct ZarrV3Root {
     #[serde(default)]
-    attributes: DatasetMetadata,
+    attributes: ZarrV3RootAttributes,
+}
+
+/// NGFF 0.5 nests everything under `attributes.ome`; 0.4-style stores written as Zarr v3 put
+/// `multiscales`/`omero` directly in `attributes`. Both are accepted; `ome` wins when it
+/// declares multiscales.
+#[derive(Default, Deserialize)]
+struct ZarrV3RootAttributes {
+    #[serde(default)]
+    ome: Option<DatasetMetadata>,
+    #[serde(flatten)]
+    legacy: DatasetMetadata,
+}
+
+impl ZarrV3RootAttributes {
+    fn into_dataset_metadata(self) -> DatasetMetadata {
+        match self.ome {
+            Some(ome) if !ome.multiscales.is_empty() => ome,
+            _ => self.legacy,
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -1435,7 +1491,7 @@ struct ZarrV3ChunkGridConfiguration {
 /// therefore agree on the exact supported Zarr v3 metadata subset.
 fn parse_v3_root_metadata(bytes: &[u8]) -> Result<DatasetMetadata, serde_json::Error> {
     let document: ZarrV3Root = serde_json::from_slice(bytes)?;
-    Ok(document.attributes)
+    Ok(document.attributes.into_dataset_metadata())
 }
 
 fn parse_v3_array_info(bytes: &[u8]) -> Result<ArrayInfo, serde_json::Error> {
@@ -1446,6 +1502,7 @@ fn parse_v3_array_info(bytes: &[u8]) -> Result<ArrayInfo, serde_json::Error> {
         dtype: document.data_type,
         order: None,
         compressor: None,
+        dimension_separator: None,
     })
 }
 
@@ -2336,6 +2393,33 @@ mod tests {
         assert!(metadata.omero.unwrap().channels[0].active);
     }
 
+    /// NGFF 0.5 (`attributes.ome`), as written by the ome-zarr-scivis stores: multiscales and
+    /// omero both live under `ome`. A 0.4-in-v3 root keeps working, and an `ome` key without
+    /// multiscales does not hide legacy attributes.
+    #[test]
+    fn reads_ngff_0_5_root_metadata_under_the_ome_key() {
+        let root = parse_v3_root_metadata(
+            br#"{"zarr_format":3,"node_type":"group","attributes":{"ome":{"version":"0.5","multiscales":[{"axes":[{"name":"z","type":"space"},{"name":"y","type":"space"},{"name":"x","type":"space"}],"datasets":[{"path":"scale0/backpack","coordinateTransformations":[{"scale":[1.25,0.9766,0.9766],"type":"scale"},{"translation":[-233.125,-250.0096,-250.0096],"type":"translation"}]}]}],"omero":{"channels":[{"active":true,"color":"FFFFFF","window":{"start":0,"end":255,"min":0,"max":65535}}]}}}}"#,
+        )
+        .unwrap();
+        assert_eq!(root.multiscales.len(), 1);
+        assert_eq!(root.multiscales[0].datasets[0].path, "scale0/backpack");
+        assert_eq!(root.multiscales[0].axes[2].name, "x");
+        assert_eq!(root.omero.as_ref().unwrap().channels.len(), 1);
+
+        let legacy = parse_v3_root_metadata(
+            br#"{"zarr_format":3,"attributes":{"multiscales":[{"axes":[{"name":"x"}],"datasets":[{"path":"0"}]}]}}"#,
+        )
+        .unwrap();
+        assert_eq!(legacy.multiscales[0].datasets[0].path, "0");
+
+        let empty_ome = parse_v3_root_metadata(
+            br#"{"zarr_format":3,"attributes":{"ome":{"version":"0.5"},"multiscales":[{"axes":[{"name":"x"}],"datasets":[{"path":"0"}]}]}}"#,
+        )
+        .unwrap();
+        assert_eq!(empty_ome.multiscales[0].datasets[0].path, "0");
+    }
+
     #[test]
     fn reads_v3_and_v2_root_metadata() {
         let v3 = tempfile::tempdir().unwrap();
@@ -2439,6 +2523,7 @@ mod tests {
                 dtype: "uint16".into(),
                 order: None,
                 compressor: None,
+                dimension_separator: None,
             }
         );
         assert_eq!(
@@ -2550,7 +2635,8 @@ mod tests {
                 chunks: vec![2, 3, 5],
                 dtype: "uint16".into(),
                 order: None,
-                compressor: None
+                compressor: None,
+                dimension_separator: None,
             }
         );
         assert!(matches!(

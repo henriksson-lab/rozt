@@ -1218,6 +1218,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "crc32c"
+version = "0.6.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3a47af21622d091a8f0fb295b88bc886ac74efcc613efc19f5d0b21de5c89e47"
+dependencies = [
+ "rustc_version",
+]
+
+[[package]]
 name = "crc32fast"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2694,6 +2703,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "http-range-header"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9171a2ea8a68358193d15dd5d70c1c10a2afc3e7e4c5bc92bc9f025cebd7359c"
+
+[[package]]
 name = "httparse"
 version = "1.10.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3788,6 +3803,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6877bb514081ee2a7ff5ef9de3281f14a4dd4bceac4c09388074a6b5df8a139a"
 
 [[package]]
+name = "mime_guess"
+version = "2.0.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f7c44f8e672c00fe5308fa235f821cb4198414e1c77935c1ab6948d3fd78550e"
+dependencies = [
+ "mime",
+ "unicase",
+]
+
+[[package]]
 name = "miniz_oxide"
 version = "0.8.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4012,6 +4037,7 @@ version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
  "newvolim-io",
+ "newvolim-portable",
  "newvolim-render",
  "newvolim-scene",
  "newvolim-wgpu-frame",
@@ -4039,6 +4065,28 @@ dependencies = [
  "serde_json",
  "tempfile",
  "url",
+ "zarrs 0.18.3",
+]
+
+[[package]]
+name = "newvolim-portable"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "newvolim-io",
+ "newvolim-render",
+ "newvolim-scene",
+ "newvolim-wgpu-frame",
+ "palace-core",
+ "palace-frame",
+ "palace-png",
+ "palace-wgpu",
+ "pollster",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "wgpu",
+ "zarrs 0.18.3",
 ]
 
 [[package]]
@@ -4064,14 +4112,20 @@ dependencies = [
  "base64 0.22.1",
  "clap",
  "newvolim-io",
+ "newvolim-portable",
  "newvolim-render",
+ "newvolim-scene",
  "palace-frame",
  "palace-png",
+ "palace-wgpu",
+ "pollster",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tower",
  "tower-http",
+ "wgpu",
 ]
 
 [[package]]
@@ -7742,10 +7796,19 @@ checksum = "4cfcf7e2740e6fc6d4d688b4ef00650406bb94adf4731e43c096c3a19fe40840"
 dependencies = [
  "bitflags 2.13.2",
  "bytes",
+ "futures-core",
  "futures-util",
  "http",
  "http-body",
+ "http-body-util",
+ "http-range-header",
+ "httpdate",
+ "mime",
+ "mime_guess",
+ "percent-encoding",
  "pin-project-lite",
+ "tokio",
+ "tokio-util",
  "tower",
  "tower-layer",
  "tower-service",
@@ -7918,6 +7981,12 @@ checksum = "96bd2f2237fe450fcd0a1d2f5f4e91711124f7857ba2e964247776ebeeb7b0c4"
 dependencies = [
  "unic-common",
 ]
+
+[[package]]
+name = "unicase"
+version = "2.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dbc4bc3a9f746d862c45cb89d705aa10f187bb96c76001afab07a0d35ce60142"
 
 [[package]]
 name = "unicode-ident"
@@ -9361,6 +9430,39 @@ dependencies = [
 
 [[package]]
 name = "zarrs"
+version = "0.18.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "034960c4e798700b0a1a69db63721a299dfc463c8dd27a3d247b214720a4c929"
+dependencies = [
+ "blosc-src",
+ "bytemuck",
+ "bytes",
+ "crc32c",
+ "derive_more 1.0.0",
+ "flate2",
+ "half",
+ "inventory",
+ "itertools 0.13.0",
+ "lru 0.12.5",
+ "moka",
+ "ndarray",
+ "num",
+ "num-complex",
+ "rayon",
+ "rayon_iter_concurrent_limit",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "thread_local",
+ "unsafe_cell_slice",
+ "zarrs_filesystem",
+ "zarrs_metadata 0.2.0",
+ "zarrs_storage 0.3.4",
+ "zstd",
+]
+
+[[package]]
+name = "zarrs"
 version = "0.19.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b93e0ba1b5bd7ffeb95bb9a050312319483de95febf5d0c558f373eb3435f5c5"
@@ -9517,6 +9619,22 @@ dependencies = [
  "thiserror 2.0.20",
  "walkdir",
  "zarrs_storage 0.3.4",
+]
+
+[[package]]
+name = "zarrs_metadata"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "902f67415f15036895770fab4dd3b274fb4a6cd44390d68feaa21b3f0dfabba4"
+dependencies = [
+ "derive_more 1.0.0",
+ "half",
+ "monostate 0.1.18",
+ "num",
+ "serde",
+ "serde_json",
+ "serde_repr",
+ "thiserror 2.0.20",
 ]
 
 [[package]]

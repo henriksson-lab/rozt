@@ -5117,3 +5117,257 @@ the fixture came back at ratios like `[206, 28, 60]`. Both overloads now round
   `palace-frame` 13, `palace-wgpu` 16 and `palace-wgpu-spike` 27 (both `--include-ignored`),
   workspace green (desktop 47 default + 15 adapter, render 25, server 17); `git diff --check`
   clean. No palace-core test pins raycast bytes, so the rounding change broke nothing there.
+
+## Transfer-function control (2026-09-19)
+
+The scene's `ChannelState` (enabled, sRGB colour, window, opacity) was read-only from the
+`omero` metadata: nothing could change it. Now:
+
+- `Scene::layer_mut` (newvolim-scene); `LocalSession::layer_channels` and
+  `LocalSession::set_channel_state(layer, channel, state)`, which validates the window and
+  opacity and refuses to disable a layer's last enabled channel — a layer with none is dropped
+  from the render plan, and the one-layer demand route would then fall back to a Vulkan frame
+  that ignores the state altogether.
+- Desktop commands `layer_channels` and `set_channel_state`, the latter taking a camelCase
+  `ChannelStateInput` (the scene's own type serializes snake_case; the page had been reading
+  `colorSrgb` off it, which is a separate bug in the browser chunk path, noted in TODO2).
+- The page: a transfer panel (`#newvolim-channels`) with enabled, colour, window start/end and
+  opacity per channel; a change goes through `set_channel_state`, then the volume and the
+  orthogonal views re-render. `dist/` rebuilt.
+
+Evidence (`--test-threads=1`, debug): session test — an edit reaches `layer_render_plan`,
+invalid window/opacity/addresses are refused, the last channel cannot be disabled; CPU LUT test —
+window `[1000, 3000]` at opacity 0.5 classifies below the window to alpha 0, at the end to 127,
+the colour throughout; adapter test — opacity 0 empties the demand frame and its depth surface,
+a window starting at 20000 finds less volume than `[0, 65535]`; page wiring pinned.
+**Mutation:** the setter made a no-op fails the session and adapter tests.
+
+## The portable host is a library, and the server renders through it (2026-09-19)
+
+`crates/newvolim-portable` now holds `session` (moved from the desktop) and `routes` (every
+non-command item of the desktop's `main.rs`: the route frames, demand route, picks, payloads,
+transfers, with their tests). The desktop keeps its Tauri commands, `main`, and the tests that
+read `main.rs` itself. Nothing was rewritten in the move; the split was scripted by item, and
+the suites carry over whole: `newvolim-portable` 47 default + 16 adapter, desktop 3 (from 50 +
+16 and 3 before). `py`-style rename traps aside, the only edits were visibility and imports.
+
+The server (`newvolim-server`) then gains a `SessionStore`: one `LocalSession` per configured
+dataset, opened on first use exactly as the desktop's open command does. A volume `FrameJob`
+renders through `render_volume_frame`, which is `scene_route_frame` — the same function the
+desktop displays and picks against, in the same order of preference — with the session's
+annotations composited, and falls back to Palace's Vulkan raycaster only without a session. The
+`Server-Timing` header now carries `route;desc="portable-demand"` (or `-palace`, `-native`,
+`vulkan`). Channel edits reach the server too: `GET/POST /v1/datasets/{dataset}/channels` and
+a frame-socket message carrying `layerId, channel, state` (parsed ahead of frame requests as an
+untagged enum), replied to with a `channels` message.
+
+Evidence: `socket_requests_parse_frames_and_channel_edits`;
+`channel_edits_persist_in_the_dataset_session` (opened once, edit visible to the next snapshot,
+earlier snapshot unchanged, bad channel refused); adapter test
+`server_volume_frame_is_the_portable_route_frame` — the served PFM decodes to exactly the
+`scene_route_frame` depth for the same camera and the route is `portable-demand`; without a
+session the Vulkan frame as before. Server suite 19 passed. **Mutations:** the route ignoring
+its session fails (`"vulkan"` against `"portable-demand"`); the store dropping the edit fails
+(`1.0` against `0.25`).
+
+Not done here: the orthogonal socket view still renders through Vulkan, and the page's remote
+frame client does not yet send channel edits or read the route name.
+
+## Multi-layer scenes (2026-09-19)
+
+The session could hold one image layer, bound to the one opened dataset, and the demand route
+admitted exactly one. Now:
+
+- **Per-layer datasets.** `LocalSession` keeps `layer_datasets: LayerId → (root, metadata)`;
+  the first layer reads the opened dataset, layers added with
+  `add_portable_image_layer(root)` read their own OME-Zarr (level zero, `omero` channels and
+  windows, built by the same `image_layer_for_dataset` as the default layer). Every per-layer
+  resolution goes through that map: `local_layer_render_requests_at_levels` (one level per
+  layer), `layer_chunk_plan_for_chunks_at_level`, `portable_layer_level_transform`,
+  `portable_layer_level_spacings`, and `read_local_layer_chunks` checks each plan against its own
+  layer's root. The four static page bindings are shared by every enabled channel of every layer,
+  so a layer that would take the scene past four is refused before it enters the scene.
+- **The demand route renders every visible image layer.** Each layer gets its own camera-chosen
+  level (`demand_scene_levels`; the camera is fitted to the first layer, the scene's reference,
+  and each layer's footprint is measured where the centre ray enters *that* layer's box), its
+  own grid, transform and voxel-centred box; the rays are clipped to the union of the boxes; the
+  step is the finest layer's; residency loops are numbered by a scene-wide (layer, channel)
+  ordinal that keys the shared page and request tables and spaces the page owners; layers are
+  composited in scene order by the existing scene shader. `render_demand_driven_scene_camera_draw_at_level`
+  applies one level to every layer, which keeps the Vulkan comparison as it was.
+- Desktop command `add_portable_image_layer(root)` with a page control ("Add layer from
+  OME-Zarr"); the channel panel lists every layer. Server `POST /v1/datasets/{dataset}/layers`
+  with `{"dataset": name}` adds a *registry* dataset as a layer of another dataset's session —
+  names only, never paths.
+
+### Evidence
+
+- `a_second_image_layer_is_bound_to_its_own_dataset` (session, CPU): two requests with distinct
+  roots and per-layer levels; the second layer's transform `[0.25, 0.25, 0.5]` and two pyramid
+  levels come from its own metadata; a chunk plan and read for it alone; the panel lists both;
+  a third layer that would enable five channels is refused.
+- `demand_scene_renders_a_second_layer_from_its_own_dataset_in_its_own_box` (adapter): with
+  the cells layer silenced (opacity 0), the demand frame's surface exists exactly on the 50 rays
+  that cross the gradient fixture's 4 µm corner box (every hit's ray crosses it; hits are at
+  least half the crossings, since the gradient is zero along its first row and column), its
+  colour carries no blue (the gradient channels are red and green), and the frame is the scene
+  route's frame. **Mutation:** the route truncated to its first layer gives 0 hits on those 50
+  rays. A byte comparison against the one-layer frame was tried first and is the wrong test:
+  adding a layer changes the scene-wide step and the union box, so every ray's samples move.
+- `a_registry_dataset_can_join_another_dataset_session_as_a_layer` (server, CPU); the desktop's
+  wiring pin covers the command and the page control.
+- The one-layer suites are unchanged: `newvolim-portable` 48 default + 17 adapter, server 20,
+  desktop 3; sweep recorded in the handover.
+
+What this does not do: a labels layer (the scene model has the kind; the demand route renders
+image layers only), and per-layer visibility toggles in the page.
+
+## The browser renders the whole scene itself (2026-09-19)
+
+Until now the web client marched one chunk region per layer with its own shader and camera.
+It now renders the whole scene — every layer at its camera-chosen level — with the **desktop's
+own scene shader** over **byte-identical inputs**, in one dispatch:
+
+- `palace-wgpu`: the recorder's host-side packing is factored into `scene_dvr_dispatch`
+  (`SceneDvrDispatch`: four pages, scene data, rays, 16-word uniform, request capacity, output
+  words, workgroups) and `scene_frame_from_output`; `SCENE_DVR_SHADER` is public. The recorder
+  itself now uses both, so what the desktop uploads and what is served cannot drift.
+- `newvolim-portable`: the demand route is split into `prepare_demand_scene` and
+  `assemble_demand_scene`; `full_level_scene_inputs` feeds every chunk of each layer's level to
+  the residency loops up front — no feedback iteration — and assembles the same shader input the
+  converged demand loop would. A level past the four-page budget is refused, not partially
+  resident.
+- `newvolim-server`: `GET /v1/datasets/{dataset}/portable/scene?width&height&orbitX&orbitY&zoom`
+  returns `BrowserScenePacket`: the WGSL, the levels (the demand route's choice for this camera),
+  and the dispatch words as little-endian `u32` base64, for the dataset's session — so channel
+  edits and added layers apply to the browser's frame too.
+- The page: `newvolimRenderServerScene` fetches the packet, creates the nine bindings in the
+  recorder's order, dispatches `packet.workgroups` of `packet.shader`, reads the output back
+  (colour words then depth bits), blits the colour to the canvas and keeps the depth; camera
+  moves re-fetch through the existing debounced path. A button "Render server dataset here
+  (WebGPU)" next to the chunk-server controls. `dist/` rebuilt.
+
+Client-side planning (the residency feedback loop in the page, fetching only missed chunks) is
+not done: the server plans the full level and the page renders it. That is client-side rendering
+of the whole volume with the shared contract; it is not yet client-side residency.
+
+### Evidence
+
+- `browser_scene_packet_reproduces_the_desktop_frame_on_the_local_adapter` (server, adapter):
+  the packet is consumed exactly as the page consumes it — base64 decoded, nine bindings in the
+  documented order with a bind-group layout the page's `layout: "auto"` derives, the packet's
+  own WGSL and workgroup count, output decoded as colour then depth — and the frame equals
+  `scene_route_frame`'s for the same session and camera (96x64, orbit 12/−7, zoom 1.3),
+  **pixel for pixel in both colour and depth**, with the route `Demand`. This is the strongest
+  check available without a browser on this host.
+- `webview_dispatches_the_browser_scene_packet_with_the_documented_bindings` (server, CPU): the
+  page's dispatch names the endpoint, binds 0–8 in order, dispatches `packet.workgroups` of
+  `packet.shader`.
+- **Mutations:** the served step doubled — the reproduction test fails; full-level planning
+  emptied — it fails; the page binding rays before scene data — the pin fails. (Swapping width
+  and height in the uniform is a no-op by the shader's contract — it uses only their product and
+  the pre-indexed rays — and so was not used as a mutation.)
+- `palace-wgpu` 16 adapter and `palace-wgpu-spike` 27 pass unchanged after the refactor;
+  `newvolim-portable` 48 default + 17 adapter; server 21 default.
+- Sweep after all four TODO2 items, all `--test-threads=1`, debug, relocated target: workspace
+  green (portable 48, server 21, render 25, io 24, desktop 3, wgpu-frame 3, ui 3); adapter
+  suites portable 17, server 2, wgpu-frame 5; `palace-wgpu` 16 and spike 27
+  (`--include-ignored`); `trunk build` succeeds; `git diff --check` clean. One catch on the way:
+  the page's two new wrapper functions lacked the file's `#[cfg(target_arch = "wasm32")]`
+  gate and broke the native workspace build until gated.
+
+## Compressed and NGFF 0.5 stores read through `zarrs` (2026-09-19)
+
+The reader accepted only the raw little-endian `bytes` codec, so every real store the user
+pointed at (the public IDR and ome-zarr-scivis images referenced by `omezarr_viewers-rs`) was
+unreadable by the portable route and the browser packet. Instead of hand-rolling codecs, chunk
+reads now go through `zarrs` 0.18 (already in the offline registry, used by `palace-zarr`):
+
+- `newvolim_io::read_array_region(root, array_path, start, shape)` opens the array with
+  `zarrs::array::Array::open` and retrieves exactly the logical region — Zarr v2 or v3, `bytes`
+  at either endianness, blosc, zstd, gzip, crc32c, transpose, sharding — returning C-order
+  little-endian element bytes. An edge region comes back at its logical extent, never padded.
+- `LocalSession::read_local_layer_chunks` computes each chunk's origin as `coordinates ×
+  chunk_shape` and reads the region; the edge-aware length check stays. The raw asset reader
+  `read_local_asset` remains only for the browser's one-chunk preview and the
+  `/zarr/{asset}` route, which decode nothing.
+- Zarr v2 `dimension_separator` is honoured: `ArrayInfo.dimension_separator` from `.zarray`,
+  `LocalChunkKeyEncoding::V2Slash` for `"/"` (the IDR/bioformats2raw layout), so asset paths
+  and error messages name the file that exists.
+- NGFF 0.5 roots: `attributes.ome.{multiscales,omero}` (ome-zarr-scivis) are read; 0.4-in-v3
+  roots (`attributes.multiscales`) keep working; an `ome` key without multiscales does not hide
+  legacy attributes. Shared by the local, remote and S3 metadata readers.
+- Nested dataset paths (`scale0/backpack`) work unchanged.
+
+Two test fixtures had carried truncated v3 array metadata (no `zarr_format`, codecs or fill
+value) that only the old reader tolerated; they now carry valid metadata. The truncated-chunk
+guard is kept: a 153-byte chunk is rejected by the codec pipeline, never padded.
+
+### Evidence
+
+- `compressed_chunks_are_decoded_through_zarrs` (portable, CPU): an NGFF 0.5 store in the
+  ome-zarr-scivis layout (`attributes.ome`, array at `scale0/image`), 2×4×6×10 uint16 with
+  1×2×4×4 chunks (edges on y and x), written with `zarrs` under three codec chains — zstd 5;
+  blosc zstd 5 with byte shuffle; gzip 6 + crc32c — each chunk on disk verified not raw; five
+  spatial chunks × two channels read back equal to the analytic value `c·1000+z·100+y·10+x`
+  at every element.
+- `zarr_v2_blosc_chunks_are_decoded_through_zarrs` (portable, CPU): the IDR layout key for
+  key (`.zarray`, `<u2`, blosc lz4 level 5 shuffle 1, `dimension_separator: "/"`, one chunk
+  per z slice), chunks written by `zarrs`; every planned chunk decodes to the analytic value,
+  the encoding is `V2Slash`, and each address's asset path names an existing file.
+- `reads_ngff_0_5_root_metadata_under_the_ome_key` (io, CPU): the backpack root verbatim
+  (multiscales and omero under `ome`, translation transforms, nested paths); a 0.4-in-v3 root;
+  an `ome` key without multiscales.
+- **Mutation:** session reads switched back to the raw asset reader — both codec tests fail
+  (`chunk scale0/image/c/0/0/0/0 has 62 bytes, expected edge-aware 64`; the v2 test at the
+  file lookup). A `zarrs` quirk found on the way: its `store_metadata` writes a `node_type`
+  key into `.zarray` that its own v2 parser rejects, so the v2 test writes the `.zarray`
+  itself, as real stores have it.
+- Fixed a first-pass mistake of my own: the mutant's `u64::MAX` byte budget overflowed inside
+  the raw reader, so the first mutant run failed for the wrong reason; rerun with a finite
+  budget it fails at the length check.
+- Suites after the change, all `--test-threads=1`, debug, relocated target: io 25 (+1),
+  portable 50 default (+2) + 17 adapter, server 21 default, desktop 3; `git diff --check`
+  clean. Release server rebuilt.
+- **Real data, release profile, `POST /v1/frame` 256×192, route `portable-demand`, on the
+  local adapter, timings including PNG encoding and HTTP:** the IDR image
+  `idr0062A/6001240.zarr` (v2, blosc lz4, 2 channels × 236 × 275 × 271 uint16) mirrored to
+  `/big/henriksson/omezarr-public/` renders in 0.42 s cold, 0.12–0.26 s warm, showing the
+  blue nuclei and yellow cytoplasm channels; `v0.5/96x2/backpack.ome.zarr` (v3, zstd,
+  373 × 512 × 512 uint16, `scale0/backpack`) renders in 0.39 s cold, 0.09 s warm. Before the
+  NGFF 0.5 fix the backpack request failed on both routes ("array metadata is missing"). The
+  server now serves both alongside the fixtures (`--allow-root /big/henriksson/omezarr-public`).
+- A false alarm, recorded so nobody chases it: frames looked orbit-invariant over HTTP because
+  the probe sent `orbit_x`; the API is camelCase (`orbitX`), and with that the frames differ.
+
+Not done: the stores were mirrored with a script (`scratchpad/mirror.py`, 1416 + 176 keys,
+no errors); opening `http(s)://` or `s3://` directly is still TODO2 item 1. The browser's
+one-chunk raw preview and the `/zarr/{asset}` route still serve stored bytes verbatim.
+
+## One port: the server serves the page (2026-09-19)
+
+The page had been served by a Python `http.server` on a second port, with the API on its own
+and a CORS allow-list between them. The user wants a Rust deployment on a single port.
+
+- `newvolim-server --page-dir <dir>` serves the Trunk `dist/` of `newvolim-ui` at `/` through
+  `tower_http::services::ServeDir` as the router's fallback: API routes take precedence,
+  directory requests get `index.html`, unknown paths are 404, nothing escapes the directory.
+  Without the option `/` is 404 as before.
+- The page's `newvolimChunkServerOrigin` falls back to `window.location.origin` when the box
+  is empty and the page is on `http(s):`, so the single-port deployment needs no configuration
+  in the browser; a `file:`/`tauri:` page must still name the server. `dist/` rebuilt.
+- `--cors-origin` remains for the split deployment (page on one host, renderer on another).
+
+### Evidence
+
+- `page_dir_serves_the_built_page_beside_the_api` (server, CPU): `/` returns the directory's
+  `index.html` as `text/html`, `/app.js` as JavaScript, `/v1/datasets` still answers, a missing
+  file is 404, `/../Cargo.toml` is not 200, and a router without the option returns 404 at `/`.
+- `webview_defaults_the_chunk_server_to_its_own_origin` (server, CPU): pins the fallback in
+  the page's origin helper and that it applies only to an empty box.
+- Server 23 default (+2), 2 adapter (`--ignored`), all `--test-threads=1`, debug; release
+  build and `trunk build` succeed; `git diff --check` clean. No rendering code changed, so no
+  new adapter test.
+- Live: one process on `0.0.0.0:9876` serves `/` (130 KB HTML), the 34 KB JS, the 15.9 MB
+  wasm as `application/wasm`, and `/v1/datasets`, checked from the host address; the Python
+  server is stopped and port 8080 is closed.

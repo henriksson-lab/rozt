@@ -1,18 +1,13 @@
 [package]
-name = "newvolim-desktop"
+name = "newvolim-portable"
 version = "0.1.0"
 edition = "2021"
 license = "MPL-2.0"
-description = "Tauri desktop host for the newvolim CSR UI"
-build = "build.rs"
-
-[build-dependencies]
-tauri-build = "2.6.3"
+description = "Portable-renderer session and routes shared by the newvolim desktop and server"
 
 [dependencies]
 base64 = "0.22"
 newvolim-io = { path = "../newvolim-io" }
-newvolim-portable = { path = "../newvolim-portable" }
 newvolim-render = { path = "../newvolim-render" }
 newvolim-wgpu-frame = { path = "../newvolim-wgpu-frame" }
 newvolim-scene = { path = "../newvolim-scene" }
@@ -23,8 +18,8 @@ palace-wgpu = { path = "../../palace-dev/palace-wgpu" }
 pollster = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tauri = { version = "2.11.5", features = [] }
 wgpu = "30"
 
 [dev-dependencies]
 tempfile = "3"
+zarrs = { version = "0.18", features = ["filesystem"] }

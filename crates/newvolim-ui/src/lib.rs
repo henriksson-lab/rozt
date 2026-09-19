@@ -120,10 +120,11 @@ fn App() -> impl IntoView {
                 <button on:click=move |_| window_newvolim_open_browser_omezarr()>"Preview browser OME-Zarr chunk"</button>
             </section>
             <section class="source-controls remote-controls" aria-label="Browser chunk server source">
-                <input id="newvolim-browser-chunk-server-url" type="url" placeholder="http://host:port/" aria-label="Browser chunk server URL"/>
+                <input id="newvolim-browser-chunk-server-url" type="url" placeholder="server URL (empty = this page's origin)" aria-label="Browser chunk server URL"/>
                 <input id="newvolim-browser-chunk-server-dataset" type="text" placeholder="configured dataset name" aria-label="Browser chunk server dataset name"/>
                 <button on:click=move |_| window_newvolim_discover_browser_datasets()>"Discover server datasets"</button>
                 <button on:click=move |_| window_newvolim_open_browser_server_dataset()>"Preview server dataset"</button>
+                <button on:click=move |_| window_newvolim_render_server_scene()>"Render server dataset here (WebGPU)"</button>
             </section>
             <section class="annotation-list" aria-label="Annotations">
                 <h2>"Annotations"</h2>
@@ -131,6 +132,11 @@ fn App() -> impl IntoView {
                 <button on:click=move |_| window_newvolim_export_annotations()>"Export annotations"</button>
                 <button on:click=move |_| window_newvolim_import_annotations()>"Import annotations"</button>
                 <ul id="newvolim-annotations"></ul>
+            </section>
+            <section class="channels" aria-label="Channel transfer functions">
+                <input id="newvolim-layer-path" type="text" placeholder="/path/to/another.ome.zarr" aria-label="Additional OME-Zarr layer path"/>
+                <button on:click=move |_| window_newvolim_add_layer()>"Add layer from OME-Zarr"</button>
+                <div id="newvolim-channels" class="channel-panel"></div>
             </section>
             <section class="viewport-grid" aria-label="Volume views">
                 <canvas id="newvolim-xy" aria-label="XY view"></canvas>
@@ -190,6 +196,16 @@ fn window_newvolim_finish_ellipse_annotation() {
 #[cfg(target_arch = "wasm32")]
 fn window_newvolim_refresh_annotations() {
     invoke_page_function("newvolimRefreshAnnotations");
+}
+
+#[cfg(target_arch = "wasm32")]
+fn window_newvolim_add_layer() {
+    invoke_page_function("newvolimAddLayer");
+}
+
+#[cfg(target_arch = "wasm32")]
+fn window_newvolim_render_server_scene() {
+    invoke_page_function("newvolimRenderServerScene");
 }
 
 #[cfg(target_arch = "wasm32")]

@@ -1,0 +1,5 @@
+
+# shaderc-sys 0.9.1 ships a CMake project older than the policy floor of current CMake (>= 4);
+# CMake honours this as an environment variable and configures it anyway.
+[env]
+CMAKE_POLICY_VERSION_MINIMUM = "3.5"

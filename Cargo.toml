@@ -2,6 +2,7 @@
 members = [
     "crates/newvolim-io",
     "crates/newvolim-desktop",
+    "crates/newvolim-portable",
     "crates/newvolim-render",
     "crates/newvolim-scene",
     "crates/newvolim-server",

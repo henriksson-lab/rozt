@@ -11,7 +11,7 @@ use std::{
 };
 
 use newvolim_io::{
-    level_transform, read_array_info, read_dataset_metadata, read_local_asset,
+    level_transform, read_array_info, read_array_region, read_dataset_metadata,
     CoordinateTransformation, DatasetMetadata, MetadataError, Multiscale,
 };
 use newvolim_render::{
@@ -37,8 +37,20 @@ pub struct LocalSession {
     voxel_shape_xyz: Option<[u64; 3]>,
     scene: Scene,
     layer_sources: HashMap<LayerId, LocalOmeZarrSource>,
+    /// The dataset each image layer reads. The first layer reads the opened dataset; layers
+    /// added with [`LocalSession::add_portable_image_layer`] read their own. Every per-layer
+    /// resolution — level sources, transforms, spacings, chunk reads — goes through this map,
+    /// so a layer never silently reads the opened dataset's arrays.
+    layer_datasets: HashMap<LayerId, LayerDataset>,
     next_annotation_id: u64,
     portable_device: Arc<OnceLock<Option<(wgpu::Device, wgpu::Queue)>>>,
+}
+
+/// One image layer's canonical dataset root and parsed NGFF metadata.
+#[derive(Clone, Debug)]
+struct LayerDataset {
+    root: PathBuf,
+    metadata: DatasetMetadata,
 }
 
 /// Number of times a WGPU device has actually been acquired in this process.
@@ -105,6 +117,28 @@ pub struct PalacePhysicalRay {
     pub physical_distance_per_palace_unit: f64,
 }
 
+/// One image layer's channels as the UI shows and edits them.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LayerChannelSummary {
+    pub layer_id: u64,
+    pub name: String,
+    pub visible: bool,
+    pub channels: Vec<ChannelSummary>,
+}
+
+/// One channel's transfer state: the source channel index it reads and its display intent.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChannelSummary {
+    pub source_index: usize,
+    pub enabled: bool,
+    pub color_srgb: [u8; 3],
+    pub window_start: f64,
+    pub window_end: f64,
+    pub opacity: f32,
+}
+
 /// A local, canonicalized OME-Zarr address for one image layer.  The layer plan selects display
 /// channels; this source states exactly which array axis and timepoint those indices address.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -128,7 +162,11 @@ pub struct LocalOmeZarrSource {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum LocalChunkKeyEncoding {
+    /// Zarr v2 with the default `.` dimension separator: `0/1.2.3.4`.
     V2Dot,
+    /// Zarr v2 with `"dimension_separator": "/"` (the IDR/bioformats2raw layout): `0/1/2/3/4`.
+    V2Slash,
+    /// Zarr v3 `default` chunk key encoding with a `/` separator: `0/c/1/2/3/4`.
     V3Slash,
 }
 
@@ -179,14 +217,16 @@ fn chunk_address(
             .map(u64::to_string)
             .collect::<Vec<_>>()
             .join("."),
-        LocalChunkKeyEncoding::V3Slash => coordinates
+        LocalChunkKeyEncoding::V2Slash | LocalChunkKeyEncoding::V3Slash => coordinates
             .iter()
             .map(u64::to_string)
             .collect::<Vec<_>>()
             .join("/"),
     };
     let asset_path = match source.chunk_key_encoding {
-        LocalChunkKeyEncoding::V2Dot => format!("{}/{}", source.array_path, coordinate_key),
+        LocalChunkKeyEncoding::V2Dot | LocalChunkKeyEncoding::V2Slash => {
+            format!("{}/{}", source.array_path, coordinate_key)
+        }
         LocalChunkKeyEncoding::V3Slash => format!("{}/c/{}", source.array_path, coordinate_key),
     };
     let logical_extent = coordinates
@@ -332,104 +372,100 @@ impl LocalSession {
                 "default portable layer can only be prepared for an empty scene".into(),
             ));
         }
+        let root = self
+            .dataset_root
+            .clone()
+            .ok_or_else(|| {
+                SessionError::LayerSource(
+                    "open a local OME-Zarr dataset before preparing a layer".into(),
+                )
+            })?;
+        let metadata = self.metadata.clone().ok_or_else(|| {
+            SessionError::LayerSource("opened dataset has no parsed metadata".into())
+        })?;
+        let layer_id = LayerId(0);
+        let (layer, source) =
+            image_layer_for_dataset(layer_id, "OME-Zarr level 0", &root, &metadata, level)?;
+        self.scene
+            .insert_layer(layer)
+            .map_err(|error| SessionError::LayerSource(error.to_string()))?;
+        self.layer_sources.insert(layer_id, source.clone());
+        self.layer_datasets
+            .insert(layer_id, LayerDataset { root, metadata });
+        Ok(source)
+    }
+
+    /// Add a second (or later) image layer that reads its **own** OME-Zarr dataset, composited
+    /// in scene order over the layers before it. The layer is built exactly as the default
+    /// layer is — level zero, `omero` channels and windows — and bound to its own root and
+    /// metadata, so the demand route plans, reads and renders it from that dataset. The four
+    /// static page bindings are shared by every enabled channel of every layer, so a layer that
+    /// would take the scene past four is refused before it enters the scene.
+    pub fn add_portable_image_layer(
+        &mut self,
+        root: impl AsRef<Path>,
+    ) -> Result<LayerId, SessionError> {
+        if self.dataset_root.is_none() {
+            return Err(SessionError::LayerSource(
+                "open a local OME-Zarr dataset before adding a layer".into(),
+            ));
+        }
+        let root = root
+            .as_ref()
+            .canonicalize()
+            .map_err(|error| SessionError::Metadata(MetadataError::Io(error)))?;
+        if !root.is_dir() {
+            return Err(SessionError::NotDirectory(root));
+        }
+        let metadata = read_dataset_metadata(&root)?;
+        let layer_id = LayerId(
+            self.scene
+                .layers()
+                .iter()
+                .map(|layer| layer.id.0 + 1)
+                .max()
+                .unwrap_or(0),
+        );
+        let name = root
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "OME-Zarr layer".to_owned());
+        let (layer, source) = image_layer_for_dataset(layer_id, name, &root, &metadata, 0)?;
+        let enabled_channels = self
+            .scene
+            .layers()
+            .iter()
+            .flat_map(|layer| layer.channels.iter())
+            .chain(layer.channels.iter())
+            .filter(|channel| channel.enabled)
+            .count();
+        if enabled_channels > 4 {
+            return Err(SessionError::LayerSource(format!(
+                "the scene would enable {enabled_channels} channels but the portable pool has four page bindings"
+            )));
+        }
+        self.scene
+            .insert_layer(layer)
+            .map_err(|error| SessionError::LayerSource(error.to_string()))?;
+        self.layer_sources.insert(layer_id, source);
+        self.layer_datasets
+            .insert(layer_id, LayerDataset { root, metadata });
+        Ok(layer_id)
+    }
+
+    /// The dataset an image layer reads: its own when it was added with its own root, else the
+    /// opened dataset.
+    fn layer_dataset(&self, layer_id: LayerId) -> Result<(&Path, &DatasetMetadata), SessionError> {
+        if let Some(dataset) = self.layer_datasets.get(&layer_id) {
+            return Ok((&dataset.root, &dataset.metadata));
+        }
         let root = self.dataset_root.as_ref().ok_or_else(|| {
-            SessionError::LayerSource(
-                "open a local OME-Zarr dataset before preparing a layer".into(),
-            )
+            SessionError::LayerSource("open a local OME-Zarr dataset before rendering".into())
         })?;
         let metadata = self.metadata.as_ref().ok_or_else(|| {
             SessionError::LayerSource("opened dataset has no parsed metadata".into())
         })?;
-        let source = LocalOmeZarrSource::for_level(root, metadata, level)?;
-        let multiscale = metadata.multiscales.first().ok_or_else(|| {
-            SessionError::LayerSource("dataset has no multiscale metadata".into())
-        })?;
-        let transform = portable_axis_aligned_transform(multiscale, level as usize)?;
-        let channel_count = source
-            .channel_axis
-            .map(|axis| source.shape[axis as usize])
-            .unwrap_or(1);
-        if channel_count == 0 {
-            return Err(SessionError::LayerSource(
-                "source has zero display channels".into(),
-            ));
-        }
-        let mut active_channels = metadata
-            .omero
-            .as_ref()
-            .map(|omero| {
-                omero
-                    .channels
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(index, channel)| channel.active.then_some(index))
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-        if active_channels.is_empty() {
-            active_channels.push(0);
-        }
-        let channel_count = usize::try_from(channel_count).map_err(|_| {
-            SessionError::LayerSource("source channel count does not fit this platform".into())
-        })?;
-        if active_channels.iter().any(|&index| index >= channel_count) {
-            return Err(SessionError::LayerSource(format!(
-                "an OME display channel exceeds source channel count {channel_count}"
-            )));
-        }
-        if active_channels.len() > 4 {
-            return Err(SessionError::LayerSource(format!(
-                "OME selects {} display channels but the portable pool has four page bindings",
-                active_channels.len()
-            )));
-        }
-        // This vector's position is the source C address. Preserve a disabled prefix rather
-        // than collapsing the selected OME channel to slot zero.
-        let disabled_window = ChannelWindow::new(0.0, 65_535.0)
-            .map_err(|error| SessionError::LayerSource(error.to_string()))?;
-        let channels = (0..channel_count)
-            .map(|index| {
-                let display = metadata
-                    .omero
-                    .as_ref()
-                    .and_then(|omero| omero.channels.get(index));
-                let enabled = active_channels.contains(&index);
-                let color_srgb = display
-                    .and_then(|channel| channel.color.as_deref())
-                    .and_then(parse_srgb_hex)
-                    .unwrap_or([255, 255, 255]);
-                let window = display
-                    .and_then(|channel| channel.window)
-                    .map(|window| [window.start, window.end])
-                    .unwrap_or([0.0, 65_535.0]);
-                let selected_window =
-                    ChannelWindow::new(window[0], window[1]).map_err(|error| {
-                        SessionError::LayerSource(format!("invalid OME display window: {error}"))
-                    })?;
-                ChannelState::new(
-                    enabled,
-                    if enabled { color_srgb } else { [255, 255, 255] },
-                    if enabled {
-                        selected_window
-                    } else {
-                        disabled_window
-                    },
-                    1.0,
-                )
-                .map_err(|error| SessionError::LayerSource(error.to_string()))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let layer_id = LayerId(0);
-        self.scene
-            .insert_layer(Layer::image(
-                layer_id,
-                "OME-Zarr level 0",
-                transform,
-                channels,
-            ))
-            .map_err(|error| SessionError::LayerSource(error.to_string()))?;
-        self.layer_sources.insert(layer_id, source.clone());
-        Ok(source)
+        Ok((root, metadata))
     }
     pub fn open_local_omezarr(
         &mut self,
@@ -506,6 +542,86 @@ impl LocalSession {
 
     pub fn dataset_root(&self) -> Option<PathBuf> {
         self.dataset_root.clone()
+    }
+
+    /// Every image layer's channels, in scene order, for the transfer-function panel.
+    pub fn layer_channels(&self) -> Vec<LayerChannelSummary> {
+        self.scene
+            .layers()
+            .iter()
+            .filter(|layer| layer.kind == newvolim_scene::LayerKind::Image)
+            .map(|layer| LayerChannelSummary {
+                layer_id: layer.id.0,
+                name: layer.name.clone(),
+                visible: layer.visible,
+                channels: layer
+                    .channels
+                    .iter()
+                    .enumerate()
+                    .map(|(source_index, state)| ChannelSummary {
+                        source_index,
+                        enabled: state.enabled,
+                        color_srgb: state.color_srgb,
+                        window_start: state.window.start,
+                        window_end: state.window.end,
+                        opacity: state.opacity,
+                    })
+                    .collect(),
+            })
+            .collect()
+    }
+
+    /// Replace one channel's transfer state. The next render plan reads the scene, so every
+    /// route — demand-driven, static, orthogonal — picks the change up on its next frame.
+    ///
+    /// The last enabled channel of a layer cannot be disabled: a layer with no enabled channel
+    /// is dropped from the render plan, and the one-layer demand route would then refuse the
+    /// scene and fall back to a Vulkan render that ignores this state entirely. Hiding a layer
+    /// is a layer-level decision, not something to reach by switching off its channels.
+    pub fn set_channel_state(
+        &mut self,
+        layer_id: LayerId,
+        channel: usize,
+        state: ChannelState,
+    ) -> Result<(), SessionError> {
+        ChannelWindow::new(state.window.start, state.window.end)
+            .map_err(|error| SessionError::LayerSource(format!("channel window: {error:?}")))?;
+        if !state.opacity.is_finite() || !(0.0..=1.0).contains(&state.opacity) {
+            return Err(SessionError::LayerSource(format!(
+                "channel opacity {} is outside [0, 1]",
+                state.opacity
+            )));
+        }
+        let layer = self.scene.layer_mut(layer_id).ok_or_else(|| {
+            SessionError::LayerSource(format!("scene has no layer {}", layer_id.0))
+        })?;
+        if layer.kind != newvolim_scene::LayerKind::Image {
+            return Err(SessionError::LayerSource(format!(
+                "layer {} is not an image layer",
+                layer_id.0
+            )));
+        }
+        if channel >= layer.channels.len() {
+            return Err(SessionError::LayerSource(format!(
+                "layer {} has {} channels, so channel {channel} does not exist",
+                layer_id.0,
+                layer.channels.len()
+            )));
+        }
+        if !state.enabled
+            && !layer
+                .channels
+                .iter()
+                .enumerate()
+                .any(|(index, other)| index != channel && other.enabled)
+        {
+            return Err(SessionError::LayerSource(format!(
+                "channel {channel} is the last enabled channel of layer {}; hide the layer instead",
+                layer_id.0
+            )));
+        }
+        layer.channels[channel] = state;
+        Ok(())
     }
 
     /// Clamp an untrusted UI/IPC crosshair to the opened level-zero array. This keeps the
@@ -651,16 +767,11 @@ impl LocalSession {
         limits: LayerRenderLimits,
         level: u32,
     ) -> Result<Vec<LocalLayerRenderRequest>, SessionError> {
-        let root = self.dataset_root.as_ref().ok_or_else(|| {
-            SessionError::LayerSource("open a local OME-Zarr dataset before rendering".into())
-        })?;
-        let metadata = self.metadata.as_ref().ok_or_else(|| {
-            SessionError::LayerSource("opened dataset has no parsed metadata".into())
-        })?;
-        let source = LocalOmeZarrSource::for_level(root, metadata, level)?;
         self.local_layer_render_requests(limits)?
             .into_iter()
             .map(|request| {
+                let (root, metadata) = self.layer_dataset(request.layer.layer_id)?;
+                let source = LocalOmeZarrSource::for_level(root, metadata, level)?;
                 let channel_count = source
                     .channel_axis
                     .map(|axis| source.shape[axis as usize])
@@ -675,10 +786,78 @@ impl LocalSession {
                 }
                 Ok(LocalLayerRenderRequest {
                     layer: request.layer,
-                    source: source.clone(),
+                    source,
                 })
             })
             .collect()
+    }
+
+    /// Render requests with one level per image layer, in plan order. A scene of layers at
+    /// different spacings selects a different pyramid level per layer.
+    pub fn local_layer_render_requests_at_levels(
+        &self,
+        limits: LayerRenderLimits,
+        levels: &[u32],
+    ) -> Result<Vec<LocalLayerRenderRequest>, SessionError> {
+        let requests = self.local_layer_render_requests(limits)?;
+        if requests.len() != levels.len() {
+            return Err(SessionError::LayerSource(format!(
+                "{} levels were given for {} image layers",
+                levels.len(),
+                requests.len()
+            )));
+        }
+        requests
+            .into_iter()
+            .zip(levels)
+            .map(|(request, &level)| {
+                let (root, metadata) = self.layer_dataset(request.layer.layer_id)?;
+                let source = LocalOmeZarrSource::for_level(root, metadata, level)?;
+                let channel_count = source
+                    .channel_axis
+                    .map(|axis| source.shape[axis as usize])
+                    .unwrap_or(1);
+                for channel in &request.layer.channels {
+                    if u64::from(channel.source_index) >= channel_count {
+                        return Err(SessionError::LayerSource(format!(
+                            "image layer {} selected C={} but level {level} has {channel_count} channel(s)",
+                            request.layer.layer_id.0, channel.source_index
+                        )));
+                    }
+                }
+                Ok(LocalLayerRenderRequest {
+                    layer: request.layer,
+                    source,
+                })
+            })
+            .collect()
+    }
+
+    /// One layer's chunk plan at its own level for the chunks its residency demanded.
+    pub fn layer_chunk_plan_for_chunks_at_level(
+        &self,
+        limits: LayerRenderLimits,
+        layer_id: LayerId,
+        level: u32,
+        chunks_xyz: &[[u64; 3]],
+        max_chunk_addresses: usize,
+    ) -> Result<LocalLayerChunkPlan, SessionError> {
+        let requests = self.local_layer_render_requests(limits)?;
+        let levels = requests
+            .iter()
+            .map(|request| if request.layer.layer_id == layer_id { level } else { 0 })
+            .collect::<Vec<_>>();
+        let request = self
+            .local_layer_render_requests_at_levels(limits, &levels)?
+            .into_iter()
+            .find(|request| request.layer.layer_id == layer_id)
+            .ok_or_else(|| {
+                SessionError::LayerSource(format!("layer {} is not in the render plan", layer_id.0))
+            })?;
+        let mut plans = self.chunk_plan_for_chunks(vec![request], chunks_xyz, max_chunk_addresses)?;
+        plans.pop().ok_or_else(|| {
+            SessionError::LayerSource("layer chunk planning produced no plan".into())
+        })
     }
 
     /// Plan an explicit chunk set against a chosen pyramid level.
@@ -705,6 +884,36 @@ impl LocalSession {
             SessionError::LayerSource("dataset has no multiscale metadata".into())
         })?;
         portable_axis_aligned_transform(multiscale, level as usize)
+    }
+
+    /// One image layer's transform at a pyramid level, from the dataset that layer reads.
+    pub fn portable_layer_level_transform(
+        &self,
+        layer_id: LayerId,
+        level: u32,
+    ) -> Result<LayerTransform, SessionError> {
+        let (_, metadata) = self.layer_dataset(layer_id)?;
+        let multiscale = metadata.multiscales.first().ok_or_else(|| {
+            SessionError::LayerSource("dataset has no multiscale metadata".into())
+        })?;
+        portable_axis_aligned_transform(multiscale, level as usize)
+    }
+
+    /// One image layer's voxel spacings per pyramid level, from the dataset that layer reads.
+    pub fn portable_layer_level_spacings(
+        &self,
+        layer_id: LayerId,
+    ) -> Result<Vec<[f32; 3]>, SessionError> {
+        let (_, metadata) = self.layer_dataset(layer_id)?;
+        let multiscale = metadata.multiscales.first().ok_or_else(|| {
+            SessionError::LayerSource("dataset has no multiscale metadata".into())
+        })?;
+        (0..multiscale.datasets.len())
+            .map(|level| {
+                let transform = portable_axis_aligned_transform(multiscale, level)?;
+                Ok(transform.scale.map(|value| value.abs() as f32))
+            })
+            .collect()
     }
 
     /// Native portable-renderer admission: descriptors and local source bindings are derived
@@ -1381,15 +1590,13 @@ impl LocalSession {
                 "chunk byte budgets must be non-zero".into(),
             ));
         }
-        let root = self.dataset_root.as_ref().ok_or_else(|| {
-            SessionError::LayerSource("open a local OME-Zarr dataset before reading chunks".into())
-        })?;
         let mut remaining = max_total_bytes;
         let mut loaded = Vec::new();
         for plan in plans {
+            let (root, _) = self.layer_dataset(plan.request.layer.layer_id)?;
             if plan.request.source.root != root.display().to_string() {
                 return Err(SessionError::LayerSource(
-                    "chunk plan source does not match the opened canonical dataset root".into(),
+                    "chunk plan source does not match its layer's canonical dataset root".into(),
                 ));
             }
             let bytes_per_element = match plan.request.source.dtype.as_str() {
@@ -1418,8 +1625,27 @@ impl LocalSession {
                         address.asset_path, remaining
                     )));
                 }
-                let bytes = read_local_asset(root, &address.asset_path, expected)
-                    .map_err(|error| SessionError::LayerSource(error.to_string()))?;
+                // Decoded through `zarrs`: the array's own codec chain, whatever it is, and
+                // exactly the chunk's logical region — so compressed stores read like raw ones.
+                let start = address
+                    .coordinates
+                    .iter()
+                    .zip(&plan.request.source.chunk_shape)
+                    .map(|(coordinate, extent)| {
+                        coordinate.checked_mul(*extent).ok_or_else(|| {
+                            SessionError::LayerSource("chunk origin overflows u64".into())
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let bytes = read_array_region(
+                    root,
+                    &plan.request.source.array_path,
+                    &start,
+                    &address.logical_extent,
+                )
+                .map_err(|error| {
+                    SessionError::LayerSource(format!("chunk {}: {error}", address.asset_path))
+                })?;
                 if bytes.len() as u64 != expected {
                     return Err(SessionError::LayerSource(format!(
                         "chunk {} has {} bytes, expected edge-aware {expected}",
@@ -2020,7 +2246,16 @@ impl LocalOmeZarrSource {
         let chunk_key_encoding = if array_directory.join("zarr.json").is_file() {
             LocalChunkKeyEncoding::V3Slash
         } else if array_directory.join(".zarray").is_file() {
-            LocalChunkKeyEncoding::V2Dot
+            match array.dimension_separator.as_deref() {
+                None | Some(".") => LocalChunkKeyEncoding::V2Dot,
+                Some("/") => LocalChunkKeyEncoding::V2Slash,
+                Some(other) => {
+                    return Err(SessionError::LayerSource(format!(
+                        "array {} declares dimension_separator {other:?}; only \".\" and \"/\" exist",
+                        dataset.path
+                    )));
+                }
+            }
         } else {
             return Err(SessionError::LayerSource(format!(
                 "array {} has neither zarr.json nor .zarray metadata",
@@ -2118,6 +2353,98 @@ impl LocalOmeZarrSource {
 /// NGFF declares coordinate transformations **per dataset**, composed with the multiscale's shared
 /// ones, which `level_transform` already does. This previously hard-coded level zero, so admitting
 /// a coarser level would have rendered it with the finest level's physical extent.
+/// Build an image layer from a dataset's NGFF metadata at one level: the level's source, an
+/// axis-aligned transform, and one channel state per source channel with `omero`'s active
+/// channels enabled and their colours and windows applied.
+fn image_layer_for_dataset(
+    layer_id: LayerId,
+    name: impl Into<String>,
+    root: &Path,
+    metadata: &DatasetMetadata,
+    level: u32,
+) -> Result<(Layer, LocalOmeZarrSource), SessionError> {
+    let source = LocalOmeZarrSource::for_level(root, metadata, level)?;
+    let multiscale = metadata.multiscales.first().ok_or_else(|| {
+        SessionError::LayerSource("dataset has no multiscale metadata".into())
+    })?;
+    let transform = portable_axis_aligned_transform(multiscale, level as usize)?;
+    let channel_count = source
+        .channel_axis
+        .map(|axis| source.shape[axis as usize])
+        .unwrap_or(1);
+    if channel_count == 0 {
+        return Err(SessionError::LayerSource(
+            "source has zero display channels".into(),
+        ));
+    }
+    let mut active_channels = metadata
+        .omero
+        .as_ref()
+        .map(|omero| {
+            omero
+                .channels
+                .iter()
+                .enumerate()
+                .filter_map(|(index, channel)| channel.active.then_some(index))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if active_channels.is_empty() {
+        active_channels.push(0);
+    }
+    let channel_count = usize::try_from(channel_count).map_err(|_| {
+        SessionError::LayerSource("source channel count does not fit this platform".into())
+    })?;
+    if active_channels.iter().any(|&index| index >= channel_count) {
+        return Err(SessionError::LayerSource(format!(
+            "an OME display channel exceeds source channel count {channel_count}"
+        )));
+    }
+    if active_channels.len() > 4 {
+        return Err(SessionError::LayerSource(format!(
+            "OME selects {} display channels but the portable pool has four page bindings",
+            active_channels.len()
+        )));
+    }
+    // This vector's position is the source C address. Preserve a disabled prefix rather
+    // than collapsing the selected OME channel to slot zero.
+    let disabled_window = ChannelWindow::new(0.0, 65_535.0)
+        .map_err(|error| SessionError::LayerSource(error.to_string()))?;
+    let channels = (0..channel_count)
+        .map(|index| {
+            let display = metadata
+                .omero
+                .as_ref()
+                .and_then(|omero| omero.channels.get(index));
+            let enabled = active_channels.contains(&index);
+            let color_srgb = display
+                .and_then(|channel| channel.color.as_deref())
+                .and_then(parse_srgb_hex)
+                .unwrap_or([255, 255, 255]);
+            let window = display
+                .and_then(|channel| channel.window)
+                .map(|window| [window.start, window.end])
+                .unwrap_or([0.0, 65_535.0]);
+            let selected_window =
+                ChannelWindow::new(window[0], window[1]).map_err(|error| {
+                    SessionError::LayerSource(format!("invalid OME display window: {error}"))
+                })?;
+            ChannelState::new(
+                enabled,
+                if enabled { color_srgb } else { [255, 255, 255] },
+                if enabled {
+                    selected_window
+                } else {
+                    disabled_window
+                },
+                1.0,
+            )
+            .map_err(|error| SessionError::LayerSource(error.to_string()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((Layer::image(layer_id, name, transform, channels), source))
+}
+
 fn portable_axis_aligned_transform(
     multiscale: &Multiscale,
     level: usize,
@@ -2364,6 +2691,317 @@ mod tests {
     use std::fs;
 
     use super::*;
+
+    /// A Zarr v2 store in the IDR layout (`.zarray`, blosc lz4 with byte shuffle, `/` key
+    /// separator, one chunk per z slice, `<u2`) is decoded through the same path. The chunk
+    /// on disk is a blosc frame, not raw bytes.
+    #[test]
+    fn zarr_v2_blosc_chunks_are_decoded_through_zarrs() {
+        use std::sync::Arc;
+        use zarrs::{
+            array::{Array, ArrayMetadata},
+            array_subset::ArraySubset,
+            filesystem::FilesystemStore,
+        };
+        let shape = [2_u64, 3, 5, 7];
+        let chunk = [1_u64, 1, 5, 7];
+        let value = |c: u64, z: u64, y: u64, x: u64| (c * 1000 + z * 100 + y * 10 + x) as u16;
+        let mut values = Vec::new();
+        for c in 0..shape[0] {
+            for z in 0..shape[1] {
+                for y in 0..shape[2] {
+                    for x in 0..shape[3] {
+                        values.push(value(c, z, y, x));
+                    }
+                }
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("6001240.zarr");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join(".zgroup"), r#"{"zarr_format":2}"#).unwrap();
+        std::fs::write(
+            root.join(".zattrs"),
+            r#"{"multiscales":[{"axes":[{"name":"c","type":"channel"},{"name":"z","type":"space","unit":"micrometer"},{"name":"y","type":"space","unit":"micrometer"},{"name":"x","type":"space","unit":"micrometer"}],"datasets":[{"path":"0","coordinateTransformations":[{"type":"scale","scale":[1.0,0.5,0.36,0.36]}]}],"version":"0.4"}],"omero":{"channels":[{"active":true,"color":"0000FF","window":{"start":0,"end":1500,"min":0,"max":65535}},{"active":true,"color":"FFFF00","window":{"start":0,"end":1500,"min":0,"max":65535}}]}}"#,
+        )
+        .unwrap();
+        // The `.zarray` is the IDR one, key for key. `zarrs` writes the chunks; its own
+        // `store_metadata` would add a `node_type` key that real v2 stores never carry.
+        let zarray = r#"{"zarr_format":2,"shape":[2,3,5,7],"chunks":[1,1,5,7],"dtype":"<u2","compressor":{"id":"blosc","cname":"lz4","clevel":5,"shuffle":1,"blocksize":0},"fill_value":0,"order":"C","filters":null,"dimension_separator":"/"}"#;
+        let metadata = ArrayMetadata::V2(serde_json::from_str(zarray).unwrap());
+        let store = Arc::new(FilesystemStore::new(&root).unwrap());
+        let array = Array::new_with_metadata(store, "/0", metadata).unwrap();
+        array
+            .store_array_subset_elements::<u16>(&ArraySubset::new_with_shape(shape.to_vec()), &values)
+            .unwrap();
+        std::fs::write(root.join("0/.zarray"), zarray).unwrap();
+        assert!(root.join("0/.zarray").is_file(), "v2 array metadata must be written");
+        let chunk_file = root.join("0/1/2/0/0");
+        assert!(chunk_file.is_file(), "v2 slash-separated chunk key");
+        assert_ne!(
+            std::fs::metadata(&chunk_file).unwrap().len(),
+            2 * chunk.iter().product::<u64>(),
+            "the chunk on disk must not be raw"
+        );
+
+        let mut session = LocalSession::default();
+        session.open_local_omezarr(&root).unwrap();
+        session.prepare_default_portable_image_layer().unwrap();
+        let limits = LayerRenderLimits::new(4, 4);
+        let chunks = [[0_u64, 0, 0], [0, 0, 1], [0, 0, 2]];
+        let plans = session
+            .local_layer_chunk_plan_for_chunks_at_level(limits, 0, &chunks, 64)
+            .unwrap();
+        let loaded = session
+            .read_local_layer_chunks(&plans, 1 << 20, 1 << 24)
+            .unwrap();
+        assert_eq!(loaded.len(), chunks.len() * 2);
+        assert_eq!(plans[0].request.source.chunk_key_encoding, LocalChunkKeyEncoding::V2Slash);
+        for chunk_read in &loaded {
+            let address = &chunk_read.address;
+            let (c, z) = (address.coordinates[0], address.coordinates[1]);
+            assert_eq!(address.logical_extent, vec![1, 1, 5, 7]);
+            assert_eq!(address.asset_path, format!("0/{c}/{z}/0/0"), "v2 slash-separated key");
+            assert!(root.join(&address.asset_path).is_file(), "asset path names the chunk file");
+            let mut expected = Vec::new();
+            for y in 0..5 {
+                for x in 0..7 {
+                    expected.extend_from_slice(&value(c, z, y, x).to_le_bytes());
+                }
+            }
+            assert_eq!(chunk_read.bytes, expected, "chunk {:?}", address.coordinates);
+        }
+    }
+
+    /// Compressed stores read like raw ones. A small NGFF 0.5 store in the ome-zarr-scivis
+    /// layout (`attributes.ome`, arrays nested under `scale0/<name>`) is written with `zarrs`
+    /// under three codec chains — zstd, blosc (shuffled, zstd inside) and gzip + crc32c — and
+    /// the session's chunk reads must return the analytic values for every planned chunk, edge
+    /// chunks included. The raw asset reader would have returned the compressed bytes, which
+    /// fail the length check.
+    #[test]
+    fn compressed_chunks_are_decoded_through_zarrs() {
+        use std::sync::Arc;
+        use zarrs::{
+            array::{codec, ArrayBuilder, DataType, FillValue},
+            array_subset::ArraySubset,
+            filesystem::FilesystemStore,
+        };
+        let shape = [2_u64, 4, 6, 10]; // c, z, y, x
+        let chunk = [1_u64, 2, 4, 4]; // edge chunks along y and x
+        let value = |c: u64, z: u64, y: u64, x: u64| (c * 1000 + z * 100 + y * 10 + x) as u16;
+        let mut values = Vec::new();
+        for c in 0..shape[0] {
+            for z in 0..shape[1] {
+                for y in 0..shape[2] {
+                    for x in 0..shape[3] {
+                        values.push(value(c, z, y, x));
+                    }
+                }
+            }
+        }
+        type Chain = Vec<Arc<dyn codec::BytesToBytesCodecTraits>>;
+        let chains: Vec<(&str, Chain)> = vec![
+            ("zstd", vec![Arc::new(codec::ZstdCodec::new(5, false))]),
+            (
+                "blosc",
+                vec![Arc::new(
+                    codec::BloscCodec::new(
+                        zarrs::metadata::v3::array::codec::blosc::BloscCompressor::Zstd,
+                        5.try_into().unwrap(),
+                        None,
+                        zarrs::metadata::v3::array::codec::blosc::BloscShuffleMode::Shuffle,
+                        Some(2),
+                    )
+                    .unwrap(),
+                )],
+            ),
+            (
+                "gzip+crc32c",
+                vec![
+                    Arc::new(codec::GzipCodec::new(6).unwrap()),
+                    Arc::new(codec::Crc32cCodec::new()),
+                ],
+            ),
+        ];
+        for (name, chain) in chains {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().join(format!("{name}.ome.zarr"));
+            std::fs::create_dir_all(&root).unwrap();
+            std::fs::write(
+                root.join("zarr.json"),
+                r#"{"zarr_format":3,"node_type":"group","attributes":{"ome":{"version":"0.5","multiscales":[{"axes":[{"name":"c","type":"channel"},{"name":"z","type":"space","unit":"micrometer"},{"name":"y","type":"space","unit":"micrometer"},{"name":"x","type":"space","unit":"micrometer"}],"datasets":[{"path":"scale0/image","coordinateTransformations":[{"type":"scale","scale":[1.0,1.0,1.0,1.0]}]}]}],"omero":{"channels":[{"active":true,"color":"FF0000","window":{"start":0,"end":4000,"min":0,"max":65535}},{"active":true,"color":"00FF00","window":{"start":0,"end":4000,"min":0,"max":65535}}]}}}}"#,
+            )
+            .unwrap();
+            std::fs::create_dir_all(root.join("scale0")).unwrap();
+            std::fs::write(
+                root.join("scale0/zarr.json"),
+                r#"{"zarr_format":3,"node_type":"group","attributes":{}}"#,
+            )
+            .unwrap();
+            let store = Arc::new(FilesystemStore::new(&root).unwrap());
+            let mut builder = ArrayBuilder::new(
+                shape.to_vec(),
+                DataType::UInt16,
+                chunk.to_vec().try_into().unwrap(),
+                FillValue::from(0_u16),
+            );
+            builder.bytes_to_bytes_codecs(chain);
+            let array = builder.build(store, "/scale0/image").unwrap();
+            array.store_metadata().unwrap();
+            array
+                .store_array_subset_elements::<u16>(&ArraySubset::new_with_shape(shape.to_vec()), &values)
+                .unwrap();
+            // The stored chunks are not the raw bytes.
+            let chunk_file = root.join("scale0/image/c/0/0/0/0");
+            assert!(chunk_file.is_file(), "{name}: chunk file missing");
+            assert_ne!(
+                std::fs::metadata(&chunk_file).unwrap().len(),
+                2 * chunk.iter().product::<u64>(),
+                "{name}: the chunk on disk must not be raw"
+            );
+
+            let mut session = LocalSession::default();
+            session.open_local_omezarr(&root).unwrap();
+            session.prepare_default_portable_image_layer().unwrap();
+            let limits = LayerRenderLimits::new(4, 4);
+            // Every spatial chunk, including the y and x edges.
+            let chunks = [[0_u64, 0, 0], [1, 0, 0], [2, 0, 0], [2, 1, 1], [1, 1, 0]];
+            let plans = session
+                .local_layer_chunk_plan_for_chunks_at_level(limits, 0, &chunks, 64)
+                .unwrap();
+            let loaded = session
+                .read_local_layer_chunks(&plans, 1 << 20, 1 << 24)
+                .unwrap();
+            assert_eq!(loaded.len(), chunks.len() * 2, "{name}: one read per chunk per channel");
+            for chunk_read in &loaded {
+                let address = &chunk_read.address;
+                let c = address.coordinates[0];
+                let extent = &address.logical_extent;
+                let start: Vec<u64> = address
+                    .coordinates
+                    .iter()
+                    .zip(&chunk)
+                    .map(|(coordinate, extent)| coordinate * extent)
+                    .collect();
+                let mut expected = Vec::new();
+                for z in start[1]..start[1] + extent[1] {
+                    for y in start[2]..start[2] + extent[2] {
+                        for x in start[3]..start[3] + extent[3] {
+                            expected.extend_from_slice(&value(c, z, y, x).to_le_bytes());
+                        }
+                    }
+                }
+                assert_eq!(
+                    chunk_read.bytes, expected,
+                    "{name}: chunk {:?} decoded wrongly",
+                    address.coordinates
+                );
+            }
+        }
+    }
+
+    /// A second layer reads its own dataset: the render plan carries two requests with distinct
+    /// roots, chunk plans and reads resolve per layer, and the page budget is enforced across the
+    /// scene.
+    #[test]
+    fn a_second_image_layer_is_bound_to_its_own_dataset() {
+        let cells = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../test-data/cells3d-anisotropic.ome.zarr");
+        let gradient = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../test-data/two-channel-gradient.ome.zarr");
+        let mut session = LocalSession::default();
+        assert!(session.add_portable_image_layer(&gradient).is_err(), "open first");
+        session.open_local_omezarr(&cells).unwrap();
+        session.prepare_default_portable_image_layer().unwrap();
+        let second = session.add_portable_image_layer(&gradient).unwrap();
+        assert_eq!(second, LayerId(1));
+        let limits = LayerRenderLimits::new(4, 4);
+        let requests = session.local_layer_render_requests_at_levels(limits, &[0, 1]).unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].source.root.ends_with("cells3d-anisotropic.ome.zarr"));
+        assert!(requests[1].source.root.ends_with("two-channel-gradient.ome.zarr"));
+        assert_eq!(requests[1].source.level, 1);
+        assert_eq!(requests[1].layer.channels.len(), 2, "both gradient channels are active");
+        assert!(session.local_layer_render_requests_at_levels(limits, &[0]).is_err());
+        // Per-layer geometry comes from the layer's dataset.
+        assert_eq!(
+            session.portable_layer_level_transform(second, 0).unwrap().scale,
+            [0.25, 0.25, 0.5]
+        );
+        assert_eq!(session.portable_layer_level_spacings(second).unwrap().len(), 2);
+        assert_eq!(session.portable_layer_level_spacings(LayerId(0)).unwrap().len(), 3);
+        // A chunk plan and read for the second layer alone, at its own level.
+        let plan = session
+            .layer_chunk_plan_for_chunks_at_level(limits, second, 0, &[[0, 0, 0]], 8)
+            .unwrap();
+        assert_eq!(plan.request.layer.layer_id, second);
+        let loaded = session
+            .read_local_layer_chunks(std::slice::from_ref(&plan), 1 << 20, 1 << 24)
+            .unwrap();
+        assert_eq!(loaded.len(), 2, "one chunk per enabled channel");
+        // The channel panel lists both layers.
+        assert_eq!(session.layer_channels().len(), 2);
+        // Four page bindings: cells (1 channel) + gradient (2) is three; a second gradient layer
+        // would make five and is refused before it enters the scene.
+        assert!(session.add_portable_image_layer(&gradient).is_err());
+        assert_eq!(session.layer_channels().len(), 2);
+    }
+
+    #[test]
+    fn channel_state_edits_reach_the_render_plan_and_refuse_an_unrenderable_layer() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../test-data/cells3d-anisotropic.ome.zarr");
+        let mut session = LocalSession::default();
+        session.open_local_omezarr(&root).unwrap();
+        session.prepare_default_portable_image_layer().unwrap();
+        let before = session.layer_channels();
+        assert_eq!(before.len(), 1);
+        let layer = LayerId(before[0].layer_id);
+        assert_eq!(before[0].channels.len(), 1);
+        assert_eq!(
+            (before[0].channels[0].window_start, before[0].channels[0].window_end),
+            (0.0, 65535.0)
+        );
+
+        let state = ChannelState {
+            enabled: true,
+            color_srgb: [10, 200, 30],
+            window: ChannelWindow::new(1000.0, 4000.0).unwrap(),
+            opacity: 0.25,
+        };
+        session.set_channel_state(layer, 0, state.clone()).unwrap();
+        let after = session.layer_channels();
+        assert_eq!(after[0].channels[0].color_srgb, [10, 200, 30]);
+        assert_eq!(
+            (after[0].channels[0].window_start, after[0].channels[0].window_end),
+            (1000.0, 4000.0)
+        );
+        assert_eq!(after[0].channels[0].opacity, 0.25);
+        // The render plan is derived from the scene, so the edit is what every route renders.
+        let plan = session.layer_render_plan(LayerRenderLimits::new(4, 4)).unwrap();
+        assert_eq!(plan.image_layers[0].channels[0].state, state);
+
+        // Invalid states and addresses are refused without touching the scene.
+        let mut bad_window = state.clone();
+        bad_window.window = ChannelWindow { start: 5.0, end: 1.0 };
+        assert!(session.set_channel_state(layer, 0, bad_window).is_err());
+        let mut bad_opacity = state.clone();
+        bad_opacity.opacity = 1.5;
+        assert!(session.set_channel_state(layer, 0, bad_opacity).is_err());
+        assert!(session.set_channel_state(layer, 1, state.clone()).is_err());
+        assert!(session.set_channel_state(LayerId(999), 0, state.clone()).is_err());
+        // The only enabled channel cannot be switched off.
+        let mut disabled = state.clone();
+        disabled.enabled = false;
+        assert!(session.set_channel_state(layer, 0, disabled).is_err());
+        assert_eq!(
+            session.layer_render_plan(LayerRenderLimits::new(4, 4)).unwrap().image_layers[0]
+                .channels[0]
+                .state,
+            state
+        );
+    }
 
     #[test]
     fn local_open_reports_metadata_without_claiming_a_renderer() {
@@ -2687,7 +3325,7 @@ mod tests {
         fs::create_dir(root.path().join("0")).unwrap();
         fs::write(
             root.path().join("0/zarr.json"),
-            r#"{"shape":[2,5,7,11],"data_type":"uint16","chunk_grid":{"configuration":{"chunk_shape":[1,1,7,11]}}}"#,
+            r#"{"zarr_format":3,"node_type":"array","shape":[2,5,7,11],"data_type":"uint16","chunk_grid":{"name":"regular","configuration":{"chunk_shape":[1,1,7,11]}},"chunk_key_encoding":{"name":"default","configuration":{"separator":"/"}},"fill_value":0,"codecs":[{"name":"bytes","configuration":{"endian":"little"}}]}"#,
         )
         .unwrap();
         let mut session = LocalSession::default();
@@ -2773,10 +3411,11 @@ mod tests {
             session.read_local_layer_chunks(&plans, 153, 154),
             Err(SessionError::LayerSource(message)) if message.contains("per-asset budget")
         ));
+        // A truncated chunk file is rejected by the codec pipeline (zarrs), never padded.
         fs::write(root.path().join("0/c/1/0/0/0"), vec![9_u8; 153]).unwrap();
         assert!(matches!(
             session.read_local_layer_chunks(&plans, 154, 154),
-            Err(SessionError::LayerSource(message)) if message.contains("has 153 bytes")
+            Err(SessionError::LayerSource(message)) if message.starts_with("chunk 0/c/1/0/0/0:")
         ));
         assert!(matches!(
             session.local_layer_chunk_plan(
@@ -2879,7 +3518,7 @@ mod tests {
         fs::create_dir(root.path().join("0")).unwrap();
         fs::write(
             root.path().join("0/zarr.json"),
-            r#"{"shape":[2,1,2,2],"data_type":"uint16","chunk_grid":{"configuration":{"chunk_shape":[1,1,2,2]}}}"#,
+            r#"{"zarr_format":3,"node_type":"array","shape":[2,1,2,2],"data_type":"uint16","chunk_grid":{"name":"regular","configuration":{"chunk_shape":[1,1,2,2]}},"chunk_key_encoding":{"name":"default","configuration":{"separator":"/"}},"fill_value":0,"codecs":[{"name":"bytes","configuration":{"endian":"little"}}]}"#,
         )
         .unwrap();
         for (channel, value) in [(0, 1_u8), (1, 2_u8)] {

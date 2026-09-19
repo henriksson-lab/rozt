@@ -28,6 +28,26 @@ re-derived on the corrected camera. The legacy pick bridge had been right all al
 and the webview's volume canvas is wired to the scene route, so the demand-driven frame is what
 users see and click against.
 
+**Later on 2026-09-19 (TODO2 items):** transfer-function control (session, desktop, page,
+server); the portable host extracted into `crates/newvolim-portable` and the server rendering
+volume frames through `scene_route_frame`; multi-layer scenes (`add_portable_image_layer`,
+per-layer datasets and levels in the demand route); and the browser rendering the whole scene
+itself from a server-packed `/portable/scene` packet with the desktop's shader. STAGE0 entries
+from "Transfer-function control" onward.
+
+**Latest (2026-09-19, evening): real compressed stores render.** Chunk reads go through
+`zarrs` (`newvolim_io::read_array_region`), so blosc/zstd/gzip/crc32c, Zarr v2 with either
+separator, NGFF 0.5 `attributes.ome` roots and nested array paths all work; two public images
+referenced by `omezarr_viewers-rs` (IDR `6001240.zarr`, ome-zarr-scivis `backpack.ome.zarr`)
+are mirrored under `/big/henriksson/omezarr-public/` and render through `portable-demand` in
+under half a second at 256×192 (release). STAGE0 "Compressed and NGFF 0.5 stores read through
+`zarrs`". The frame API is camelCase (`orbitX`, `orbitY`); snake_case keys are silently
+ignored. Remote (`http`/`s3`) opening is still not built.
+
+**Single port:** `newvolim-server --page-dir crates/newvolim-ui/dist` serves the page beside
+the API; the page defaults its server URL to its own origin. No Python anywhere in the
+deployment. STAGE0 "One port: the server serves the page".
+
 **The comparison now runs as a pinned test**, `compare_desktop_portable_and_server_renderers`
 (desktop, `--ignored`): matched transfer, unshaded, level zero on both sides. Identical hit set;
 depth agrees at every pixel to a constant `−0.224` explained by Palace skipping its on-face
@@ -41,6 +61,12 @@ resample with explicit rounding, affine and border, held to Vulkan's `resample_t
 ### Immediate next action
 
 Nothing is blocked. Ordered by value:
+
+0. **Remote stores** (TODO2 item 1). The read path is `zarrs` now, so `zarrs_opendal` or
+   `zarrs_object_store` behind a feature gives `http(s)://` and `s3://` without touching the
+   session; the metadata readers for remote and S3 already exist in `newvolim-io`. Until then
+   the mirror script in the session scratchpad (`mirror.py <store-url> <dir>`) is how a public
+   store gets onto disk.
 
 1. ~~**Decide the pick-versus-display surface.**~~ **Done.** Each route now has one function
    that decides its frame (`direct_route_frame`, `scene_route_frame`) and both the render
@@ -217,12 +243,10 @@ strides, `PortableResidencyLoop` (lossy-but-monotone convergence, preview on exh
 
 ### Restrictions — real, not claimed away
 
-1. **One layer — and that is unreachable from the desktop anyway.** The session can hold at most
-   one image layer: `prepare_portable_image_layer_at_level` refuses a non-empty scene,
-   `bind_layer_to_open_dataset` only binds an existing one, and nothing else inserts one. The
-   multi-layer scene *renderer* works and is tested, but only synthetic test scenes reach it.
-   Generalising the demand route to several layers is speculative work against no caller.
-   Multi-**channel** within one layer is done and fixture-covered.
+1. ~~**One layer.**~~ **Lifted 2026-09-19.** `add_portable_image_layer(root)` binds a further
+   OME-Zarr to its own layer and the demand route renders every visible image layer at its own
+   level (STAGE0 "Multi-layer scenes"). The four-page budget across all enabled channels is the
+   remaining bound.
 2. ~~No per-frame level switching.~~ **Done.** `demand_scene_level` measures the footprint between
    two neighbouring centre pixels and feeds `select_portable_level`; the frame renders at the
    chosen level.

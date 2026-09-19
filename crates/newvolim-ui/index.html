@@ -1223,7 +1223,10 @@
 
       window.newvolimChunkServerOrigin = function () {
         const raw = document.getElementById("newvolim-browser-chunk-server-url").value.trim();
-        const origin = new URL(raw);
+        // Empty box: the API lives on the page's own origin (the server's `--page-dir` mode).
+        // A `file:` or `tauri:` page has no usable origin and must name the server.
+        const fallback = /^https?:$/.test(window.location.protocol) ? window.location.origin : "";
+        const origin = new URL(raw === "" ? fallback : raw);
         if (origin.protocol !== "http:" && origin.protocol !== "https:") {
           throw new Error("chunk server URL must use http: or https:");
         }
@@ -1357,6 +1360,10 @@
             return;
           }
           if (!window.__TAURI__ || !window.__TAURI__.core) {
+            if (window.newvolimServerScene?.active) {
+              await window.newvolimRenderServerScene(camera);
+              return;
+            }
             const preview = window.newvolimBrowserPreview;
             if (!preview) return;
             const generation = (window.newvolimVolumeGeneration || 0) + 1;
@@ -1805,6 +1812,227 @@
         }
       };
 
+      // Transfer-function panel: one row per channel of every image layer, edited through the
+      // session so every route — demand-driven volume, orthogonal slices, picks — renders the
+      // same state on its next frame.
+      window.newvolimRefreshChannels = async function () {
+        if (!window.__TAURI__ || !window.__TAURI__.core) return;
+        const layers = await window.__TAURI__.core.invoke("layer_channels");
+        window.newvolimRenderChannelPanel(layers);
+      };
+      window.newvolimRenderChannelPanel = function (layers) {
+        const panel = document.getElementById("newvolim-channels");
+        if (!panel) return;
+        panel.textContent = "";
+        for (const layer of layers) {
+          const heading = document.createElement("div");
+          heading.className = "channel-layer";
+          heading.textContent = `Layer ${layer.layerId}: ${layer.name}`;
+          panel.appendChild(heading);
+          for (const channel of layer.channels) {
+            const row = document.createElement("div");
+            row.className = "channel-row";
+            const label = document.createElement("span");
+            label.textContent = `channel ${channel.sourceIndex}`;
+            const enabled = document.createElement("input");
+            enabled.type = "checkbox"; enabled.checked = channel.enabled;
+            enabled.setAttribute("aria-label", `channel ${channel.sourceIndex} enabled`);
+            const colour = document.createElement("input");
+            colour.type = "color";
+            colour.value = "#" + channel.colorSrgb.map(value => value.toString(16).padStart(2, "0")).join("");
+            colour.setAttribute("aria-label", `channel ${channel.sourceIndex} colour`);
+            const start = document.createElement("input");
+            start.type = "number"; start.step = "any"; start.value = channel.windowStart;
+            start.setAttribute("aria-label", `channel ${channel.sourceIndex} window start`);
+            const end = document.createElement("input");
+            end.type = "number"; end.step = "any"; end.value = channel.windowEnd;
+            end.setAttribute("aria-label", `channel ${channel.sourceIndex} window end`);
+            const opacity = document.createElement("input");
+            opacity.type = "range"; opacity.min = "0"; opacity.max = "1"; opacity.step = "0.01";
+            opacity.value = channel.opacity;
+            opacity.setAttribute("aria-label", `channel ${channel.sourceIndex} opacity`);
+            const submit = () => window.newvolimSetChannelState(layer.layerId, channel.sourceIndex, {
+              enabled: enabled.checked,
+              colorSrgb: [1, 3, 5].map(offset => parseInt(colour.value.slice(offset, offset + 2), 16)),
+              windowStart: Number(start.value),
+              windowEnd: Number(end.value),
+              opacity: Number(opacity.value),
+            });
+            for (const control of [enabled, colour, start, end, opacity]) {
+              control.addEventListener("change", submit);
+            }
+            row.append(label, enabled, colour, start, end, opacity);
+            panel.appendChild(row);
+          }
+        }
+      };
+      // Add an image layer from another local OME-Zarr; it reads its own dataset and is
+      // composited over the layers before it by every route.
+      window.newvolimAddLayer = async function () {
+        const status = document.getElementById("newvolim-render-status");
+        if (!window.__TAURI__ || !window.__TAURI__.core) {
+          status.textContent = "Adding a layer requires the native desktop session";
+          return;
+        }
+        const root = document.getElementById("newvolim-layer-path").value.trim();
+        if (!root) { status.textContent = "Enter an OME-Zarr path for the new layer"; return; }
+        try {
+          const layers = await window.__TAURI__.core.invoke("add_portable_image_layer", { root });
+          window.newvolimRenderChannelPanel(layers);
+          window.newvolimScheduleVolumeCamera();
+          status.textContent = `Added layer ${layers.length - 1} from ${root}`;
+        } catch (error) {
+          status.textContent = error.message || String(error);
+        }
+      };
+      // Client-side rendering of a server dataset's whole scene: the server serves the exact
+      // words the desktop's recorder would upload for this camera — every chunk of each layer's
+      // camera-chosen level resident — and the page dispatches the desktop's own scene shader
+      // over them. Nine bindings in the recorder's order; the output is colour words then
+      // first-opacity distance bits.
+      window.newvolimServerScene = { active: false, busy: false, depth: null };
+      window.newvolimWordsFromBase64 = function (encoded) {
+        const bytes = Uint8Array.from(atob(encoded), character => character.charCodeAt(0));
+        if (bytes.byteLength % 4) throw new Error("server scene words are not whole u32s");
+        return new Uint32Array(bytes.buffer, bytes.byteOffset, bytes.byteLength / 4);
+      };
+      window.newvolimRenderServerScene = async function (camera = window.newvolimCamera) {
+        const status = document.getElementById("newvolim-render-status");
+        const scene = window.newvolimServerScene;
+        if (scene.busy) { scene.pending = camera; return; }
+        scene.busy = true;
+        try {
+          const origin = window.newvolimChunkServerOrigin();
+          const name = document.getElementById("newvolim-browser-chunk-server-dataset").value.trim();
+          if (!/^[A-Za-z0-9_-]{1,64}$/.test(name)) throw new Error("enter a configured chunk-server dataset name");
+          const canvas = document.getElementById("newvolim-volume");
+          const size = window.newvolimPhysicalCanvasSize(canvas);
+          const url = new URL(`/v1/datasets/${encodeURIComponent(name)}/portable/scene?`
+            + `width=${size.width}&height=${size.height}&orbitX=${Math.round(camera.orbitX)}`
+            + `&orbitY=${Math.round(camera.orbitY)}&zoom=${camera.zoom}`, origin);
+          const response = await fetch(url, { credentials: "omit", redirect: "error" });
+          if (!response.ok) throw new Error(`server scene packet failed (${response.status})`);
+          const packet = await response.json();
+          if (packet.width !== size.width || packet.height !== size.height || !Array.isArray(packet.pages)
+            || packet.pages.length !== 4 || typeof packet.shader !== "string" || !Array.isArray(packet.params)
+            || packet.params.length !== 16) throw new Error("server scene packet is malformed");
+          const adapter = await window.newvolimProbeWebGpu();
+          if (!adapter) return;
+          const browserGpu = window.newvolimBrowserGpu;
+          if (!browserGpu.device) {
+            browserGpu.device = await adapter.requestDevice();
+            browserGpu.device.lost.then(() => {
+              if (window.newvolimBrowserGpu === browserGpu) browserGpu.device = null;
+            });
+          }
+          const device = browserGpu.device;
+          const storage = (label, words, writable) => {
+            const buffer = device.createBuffer({
+              label, size: Math.max(4, words.byteLength),
+              usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | (writable ? GPUBufferUsage.COPY_SRC : 0),
+            });
+            if (words.byteLength) device.queue.writeBuffer(buffer, 0, words);
+            return buffer;
+          };
+          const pages = packet.pages.map((page, index) => storage(`server scene page ${index}`, window.newvolimWordsFromBase64(page), false));
+          const sceneData = storage("server scene data", window.newvolimWordsFromBase64(packet.sceneData), false);
+          const rays = storage("server scene rays", window.newvolimWordsFromBase64(packet.rays), false);
+          const output = storage("server scene output", new Uint32Array(packet.outputWords), true);
+          const uniform = device.createBuffer({ label: "server scene params", size: 64, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+          device.queue.writeBuffer(uniform, 0, new Uint32Array(packet.params));
+          const requests = storage("server scene requests", new Uint32Array(packet.requestCapacity).fill(0xffffffff), true);
+          const module = device.createShaderModule({ label: "server scene shader", code: packet.shader });
+          const pipeline = device.createComputePipeline({ label: "server scene pipeline", layout: "auto", compute: { module, entryPoint: "main" } });
+          const group = device.createBindGroup({
+            layout: pipeline.getBindGroupLayout(0),
+            entries: [
+              { binding: 0, resource: { buffer: pages[0] } },
+              { binding: 1, resource: { buffer: pages[1] } },
+              { binding: 2, resource: { buffer: pages[2] } },
+              { binding: 3, resource: { buffer: pages[3] } },
+              { binding: 4, resource: { buffer: sceneData } },
+              { binding: 5, resource: { buffer: rays } },
+              { binding: 6, resource: { buffer: output } },
+              { binding: 7, resource: { buffer: uniform } },
+              { binding: 8, resource: { buffer: requests } },
+            ],
+          });
+          const readback = device.createBuffer({ label: "server scene readback", size: packet.outputWords * 4, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
+          const encoder = device.createCommandEncoder();
+          const pass = encoder.beginComputePass();
+          pass.setPipeline(pipeline);
+          pass.setBindGroup(0, group);
+          pass.dispatchWorkgroups(packet.workgroups);
+          pass.end();
+          encoder.copyBufferToBuffer(output, 0, readback, 0, packet.outputWords * 4);
+          device.queue.submit([encoder.finish()]);
+          await readback.mapAsync(GPUMapMode.READ);
+          const words = new Uint32Array(readback.getMappedRange().slice(0));
+          readback.unmap();
+          const pixels = size.width * size.height;
+          // Colour words are little-endian RGBA bytes; depth words are f32 bits.
+          const rgba = new Uint8ClampedArray(words.buffer, 0, pixels * 4);
+          scene.depth = new Float32Array(words.buffer, pixels * 4, pixels);
+          window.newvolimPresentServerScene(canvas, device, rgba, size);
+          for (const buffer of [...pages, sceneData, rays, output, uniform, requests, readback]) buffer.destroy();
+          scene.active = true;
+          const finite = scene.depth.reduce((count, value) => count + (Number.isFinite(value) ? 1 : 0), 0);
+          status.textContent = `Client-side portable scene: levels ${packet.levels.join(",")}, ${finite} of ${pixels} pixels hit volume`;
+          window.newvolimAttachVolumeCameraControls(canvas);
+        } catch (error) {
+          status.textContent = error.message || String(error);
+        } finally {
+          scene.busy = false;
+          if (scene.pending) { const next = scene.pending; scene.pending = null; window.newvolimRenderServerScene(next); }
+        }
+      };
+      // Blit RGBA bytes to the volume canvas through its WebGPU context.
+      window.newvolimPresentServerScene = function (canvas, device, rgba, size) {
+        canvas.width = size.width; canvas.height = size.height;
+        const context = canvas.getContext("webgpu");
+        const format = navigator.gpu.getPreferredCanvasFormat();
+        context.configure({ device, format, alphaMode: "opaque" });
+        const texture = device.createTexture({ size: [size.width, size.height], format: "rgba8unorm", usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST });
+        device.queue.writeTexture({ texture }, rgba, { bytesPerRow: size.width * 4 }, [size.width, size.height]);
+        const module = device.createShaderModule({ code: `
+          @group(0) @binding(0) var frame: texture_2d<f32>;
+          @vertex fn vertex(@builtin(vertex_index) index: u32) -> @builtin(position) vec4f {
+            var positions = array<vec2f, 3>(vec2f(-1.0, -1.0), vec2f(3.0, -1.0), vec2f(-1.0, 3.0));
+            return vec4f(positions[index], 0.0, 1.0);
+          }
+          @fragment fn fragment(@builtin(position) position: vec4f) -> @location(0) vec4f {
+            let texel = textureLoad(frame, vec2u(position.xy), 0);
+            return vec4f(texel.rgb, 1.0);
+          }` });
+        const pipeline = device.createRenderPipeline({ layout: "auto", vertex: { module, entryPoint: "vertex" }, fragment: { module, entryPoint: "fragment", targets: [{ format }] }, primitive: { topology: "triangle-list" } });
+        const bindings = device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries: [{ binding: 0, resource: texture.createView() }] });
+        const encoder = device.createCommandEncoder();
+        const pass = encoder.beginRenderPass({ colorAttachments: [{ view: context.getCurrentTexture().createView(), loadOp: "clear", storeOp: "store", clearValue: { r: 0, g: 0, b: 0, a: 1 } }] });
+        pass.setPipeline(pipeline); pass.setBindGroup(0, bindings); pass.draw(3); pass.end();
+        device.queue.submit([encoder.finish()]);
+        texture.destroy();
+      };
+      window.newvolimSetChannelState = async function (layerId, channel, state) {
+        const status = document.getElementById("newvolim-render-status");
+        try {
+          const layers = await window.__TAURI__.core.invoke("set_channel_state", { layerId, channel, state });
+          window.newvolimRenderChannelPanel(layers);
+          // Re-render everything that classifies through the channel state.
+          window.newvolimScheduleVolumeCamera();
+          const canvas = document.getElementById("newvolim-xy");
+          const point = window.newvolimCrosshair;
+          if (canvas && point && window.newvolimCurrentOrthogonalCommand) {
+            window.newvolimScheduleOrthogonal({
+              width: canvas.width, height: canvas.height, x: point.x, y: point.y, z: point.z,
+            }, window.newvolimCurrentOrthogonalCommand);
+          }
+          status.textContent = `Channel ${channel} of layer ${layerId} updated`;
+        } catch (error) {
+          status.textContent = error.message || String(error);
+          await window.newvolimRefreshChannels();
+        }
+      };
+
       window.newvolimRefreshAnnotations = async function () {
         if (!window.__TAURI__ || !window.__TAURI__.core) return;
         const placements = await window.__TAURI__.core.invoke("list_annotations");
@@ -1898,6 +2126,7 @@
           try {
             window.newvolimNativePortableSource = await window.__TAURI__.core.invoke("prepare_default_portable_image_layer");
             window.newvolimNativePortableActive = true;
+            await window.newvolimRefreshChannels();
             await window.newvolimDrawPayload(NEWVOLIM_NATIVE_VOLUME_COMMAND, {
               request: window.newvolimNativePortableDrawRequest(canvas, window.newvolimCamera),
             });

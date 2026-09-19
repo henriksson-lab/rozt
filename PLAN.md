@@ -87,7 +87,8 @@ tables, our GUI) stays in newvolim.
 - **GUI: Leptos**, and therefore **Tauri** for the desktop build.
 - **2D slice and orthogonal views** as in `omezarr_viewers-rs`, but driven by palace rather
   than reimplemented.
-- **IO via `zarrs`** with the same reach as `omezarr_viewers-rs`: local files, HTTP, S3, and
+- **IO via `zarrs`** (chunk decoding does since 2026-09-19: `newvolim_io::read_array_region`;
+  remote backends still to add) with the same reach as `omezarr_viewers-rs`: local files, HTTP, S3, and
   an SSH remote agent, under an allow-list permission model.
 - Polygonal/metadata overlays (annotations, detections, labels) composited with the volume.
 
