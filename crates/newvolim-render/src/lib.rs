@@ -764,7 +764,9 @@ pub struct NativePortableDrawInput {
 ///
 /// Palace's fitted camera is intentionally represented as rays rather than a backend-specific
 /// matrix. This lets a portable recorder march exactly the camera used to project annotations,
-/// including its perspective and trackball orientation.
+/// including its perspective and trackball orientation. Palace fits that camera in physical
+/// units, so the producer divides the ray by the level-zero spacing to reach these voxel
+/// coordinates; the ray parameter along `direction_xyz` is therefore in voxel units.
 #[derive(Clone, Copy, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PortableCameraRay {

@@ -25,6 +25,10 @@ use newvolim_scene::{
     LayerTransform, Scene,
 };
 use serde::{Deserialize, Serialize};
+use std::sync::{
+    Arc, OnceLock,
+    atomic::{AtomicUsize, Ordering},
+};
 
 #[derive(Clone, Debug, Default)]
 pub struct LocalSession {
@@ -34,6 +38,52 @@ pub struct LocalSession {
     scene: Scene,
     layer_sources: HashMap<LayerId, LocalOmeZarrSource>,
     next_annotation_id: u64,
+    portable_device: Arc<OnceLock<Option<(wgpu::Device, wgpu::Queue)>>>,
+}
+
+/// Number of times a WGPU device has actually been acquired in this process.
+///
+/// Exposed so a test can prove the cache below, rather than inferring it from timing.
+pub static PORTABLE_DEVICE_ACQUISITIONS: AtomicUsize = AtomicUsize::new(0);
+
+impl LocalSession {
+    /// One WGPU device shared by every portable route of this session.
+    ///
+    /// Acquisition is expensive, and the demand loop re-renders until it converges, so acquiring
+    /// per call multiplied that cost by the number of passes — and an annotated frame paid it
+    /// again for the composite.
+    ///
+    /// The device is deliberately owned by the **session**, not by a process-wide static. A static
+    /// is never dropped, which leaves the graphics driver's own background threads alive at
+    /// `exit()`; on this host that faults in the driver's `[vkps] Update` thread on roughly a
+    /// third of runs. A twenty-line probe confirmed the cause directly: dropping a device before
+    /// exit crashed 0/20 times, leaking one crashed 8/20. Session ownership keeps the sharing that
+    /// matters — every pass of one frame — while guaranteeing the device is destroyed before the
+    /// process tears down.
+    ///
+    /// A failed acquisition is cached as a failure rather than retried. An eligible adapter does
+    /// not normally appear part-way through a session, and retrying per frame would pay the full
+    /// acquisition cost on every frame of exactly the host that most needs its CPU fallback to be
+    /// cheap.
+    pub fn portable_device(&self) -> Option<&(wgpu::Device, wgpu::Queue)> {
+        self.portable_device
+            .get_or_init(|| {
+                PORTABLE_DEVICE_ACQUISITIONS.fetch_add(1, Ordering::Relaxed);
+                let instance =
+                    wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+                let adapter = pollster::block_on(
+                    instance.request_adapter(&wgpu::RequestAdapterOptions::default()),
+                )
+                .ok()?;
+                pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+                    required_features: wgpu::Features::empty(),
+                    required_limits: wgpu::Limits::default(),
+                    ..Default::default()
+                }))
+                .ok()
+            })
+            .as_ref()
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -88,6 +138,74 @@ pub enum LocalChunkKeyEncoding {
 pub struct LocalLayerRenderRequest {
     pub layer: ImageLayerRenderRequest,
     pub source: LocalOmeZarrSource,
+}
+
+/// Linear chunk index for an XYZ chunk coordinate, X fastest, matching `PortableChunkGrid`.
+fn linear_chunk_index(chunk_xyz: [u64; 3], x_count: u32, y_count: u32) -> Option<u32> {
+    let [x, y, z] = chunk_xyz.map(|value| u32::try_from(value).ok());
+    let (x, y, z) = (x?, y?, z?);
+    x.checked_add(x_count.checked_mul(y.checked_add(y_count.checked_mul(z)?)?)?)
+}
+
+/// Build one chunk address for a bound layer request.
+///
+/// Shared by both chunk planners so a demand-driven set and a rectangular region cannot construct
+/// addresses differently: asset path encoding, dataset axis order, channel and timepoint
+/// placement, and the edge-aware logical extent all live here once.
+fn chunk_address(
+    request: &LocalLayerRenderRequest,
+    channel: &newvolim_render::SelectedChannel,
+    chunk_xyz: [u64; 3],
+) -> Result<LocalChunkAddress, SessionError> {
+    let source = &request.source;
+    let mut coordinates = vec![0_u64; source.axes.len()];
+    for axis in 0..3 {
+        coordinates[source.spatial_axes_xyz[axis] as usize] = chunk_xyz[axis];
+    }
+    if let Some(axis) = source.channel_axis {
+        coordinates[axis as usize] = u64::from(channel.source_index);
+    } else if channel.source_index != 0 {
+        return Err(SessionError::LayerSource(format!(
+            "layer {} selects C={} but source has no C axis",
+            request.layer.layer_id.0, channel.source_index
+        )));
+    }
+    if let Some(axis) = source.time_axis {
+        coordinates[axis as usize] = u64::from(source.timepoint);
+    }
+    let coordinate_key = match source.chunk_key_encoding {
+        LocalChunkKeyEncoding::V2Dot => coordinates
+            .iter()
+            .map(u64::to_string)
+            .collect::<Vec<_>>()
+            .join("."),
+        LocalChunkKeyEncoding::V3Slash => coordinates
+            .iter()
+            .map(u64::to_string)
+            .collect::<Vec<_>>()
+            .join("/"),
+    };
+    let asset_path = match source.chunk_key_encoding {
+        LocalChunkKeyEncoding::V2Dot => format!("{}/{}", source.array_path, coordinate_key),
+        LocalChunkKeyEncoding::V3Slash => format!("{}/c/{}", source.array_path, coordinate_key),
+    };
+    let logical_extent = coordinates
+        .iter()
+        .zip(source.shape.iter().zip(source.chunk_shape.iter()))
+        .map(|(coordinate, (shape, chunk))| {
+            shape
+                .saturating_sub(coordinate.saturating_mul(*chunk))
+                .min(*chunk)
+        })
+        .collect();
+    Ok(LocalChunkAddress {
+        asset_path,
+        coordinates,
+        channel: channel.source_index,
+        timepoint: source.timepoint,
+        spatial_chunk_xyz: chunk_xyz,
+        logical_extent,
+    })
 }
 
 /// One concrete asset read, preserving the array's declared coordinate order.
@@ -197,6 +315,18 @@ impl LocalSession {
     pub fn prepare_default_portable_image_layer(
         &mut self,
     ) -> Result<LocalOmeZarrSource, SessionError> {
+        self.prepare_portable_image_layer_at_level(0)
+    }
+
+    /// Admit the default image layer at a chosen pyramid level.
+    ///
+    /// Both the source array and the physical transform follow the level, because NGFF declares
+    /// coordinate transformations per dataset: admitting a coarser array while keeping level
+    /// zero's transform would render it at the wrong physical extent.
+    pub fn prepare_portable_image_layer_at_level(
+        &mut self,
+        level: u32,
+    ) -> Result<LocalOmeZarrSource, SessionError> {
         if !self.scene.layers().is_empty() {
             return Err(SessionError::LayerSource(
                 "default portable layer can only be prepared for an empty scene".into(),
@@ -210,11 +340,11 @@ impl LocalSession {
         let metadata = self.metadata.as_ref().ok_or_else(|| {
             SessionError::LayerSource("opened dataset has no parsed metadata".into())
         })?;
-        let source = LocalOmeZarrSource::level_zero(root, metadata)?;
+        let source = LocalOmeZarrSource::for_level(root, metadata, level)?;
         let multiscale = metadata.multiscales.first().ok_or_else(|| {
             SessionError::LayerSource("dataset has no multiscale metadata".into())
         })?;
-        let transform = portable_axis_aligned_transform(multiscale)?;
+        let transform = portable_axis_aligned_transform(multiscale, level as usize)?;
         let channel_count = source
             .channel_axis
             .map(|axis| source.shape[axis as usize])
@@ -412,7 +542,7 @@ impl LocalSession {
         else {
             return [1.0; 3];
         };
-        let Ok(transform) = portable_axis_aligned_transform(multiscale) else {
+        let Ok(transform) = portable_axis_aligned_transform(multiscale, 0) else {
             return [1.0; 3];
         };
         let spacing = transform.scale.map(f64::abs);
@@ -503,6 +633,78 @@ impl LocalSession {
                 Ok(LocalLayerRenderRequest { layer, source })
             })
             .collect()
+    }
+
+    /// The same bound layer requests, but reading a chosen pyramid level.
+    ///
+    /// Level *selection* is a per-frame decision; re-admitting the layer is not.
+    /// `prepare_portable_image_layer_at_level` takes `&mut self` and requires an empty scene, so
+    /// driving a level switch through it would destroy the user's scene every frame. Nothing about
+    /// a level is session state though: the source array and its physical transform are both pure
+    /// functions of the dataset metadata and the level index, so a renderer can ask for a level
+    /// without the session changing at all.
+    ///
+    /// The layer's own channel selection, transform authority and visibility are untouched; only
+    /// the array being read moves.
+    pub fn local_layer_render_requests_at_level(
+        &self,
+        limits: LayerRenderLimits,
+        level: u32,
+    ) -> Result<Vec<LocalLayerRenderRequest>, SessionError> {
+        let root = self.dataset_root.as_ref().ok_or_else(|| {
+            SessionError::LayerSource("open a local OME-Zarr dataset before rendering".into())
+        })?;
+        let metadata = self.metadata.as_ref().ok_or_else(|| {
+            SessionError::LayerSource("opened dataset has no parsed metadata".into())
+        })?;
+        let source = LocalOmeZarrSource::for_level(root, metadata, level)?;
+        self.local_layer_render_requests(limits)?
+            .into_iter()
+            .map(|request| {
+                let channel_count = source
+                    .channel_axis
+                    .map(|axis| source.shape[axis as usize])
+                    .unwrap_or(1);
+                for channel in &request.layer.channels {
+                    if u64::from(channel.source_index) >= channel_count {
+                        return Err(SessionError::LayerSource(format!(
+                            "image layer {} selected C={} but level {level} has {channel_count} channel(s)",
+                            request.layer.layer_id.0, channel.source_index
+                        )));
+                    }
+                }
+                Ok(LocalLayerRenderRequest {
+                    layer: request.layer,
+                    source: source.clone(),
+                })
+            })
+            .collect()
+    }
+
+    /// Plan an explicit chunk set against a chosen pyramid level.
+    pub fn local_layer_chunk_plan_for_chunks_at_level(
+        &self,
+        limits: LayerRenderLimits,
+        level: u32,
+        chunks_xyz: &[[u64; 3]],
+        max_chunk_addresses: usize,
+    ) -> Result<Vec<LocalLayerChunkPlan>, SessionError> {
+        self.chunk_plan_for_chunks(
+            self.local_layer_render_requests_at_level(limits, level)?,
+            chunks_xyz,
+            max_chunk_addresses,
+        )
+    }
+
+    /// The physical transform of one pyramid level, for a renderer choosing a level per frame.
+    pub fn portable_level_transform(&self, level: u32) -> Result<LayerTransform, SessionError> {
+        let metadata = self.metadata.as_ref().ok_or_else(|| {
+            SessionError::LayerSource("opened dataset has no parsed metadata".into())
+        })?;
+        let multiscale = metadata.multiscales.first().ok_or_else(|| {
+            SessionError::LayerSource("dataset has no multiscale metadata".into())
+        })?;
+        portable_axis_aligned_transform(multiscale, level as usize)
     }
 
     /// Native portable-renderer admission: descriptors and local source bindings are derived
@@ -943,56 +1145,7 @@ impl LocalSession {
                     for z in region.origin_xyz[2]..end_xyz[2] {
                         for y in region.origin_xyz[1]..end_xyz[1] {
                             for x in region.origin_xyz[0]..end_xyz[0] {
-                                let mut coordinates = vec![0_u64; source.axes.len()];
-                                coordinates[source.spatial_axes_xyz[0] as usize] = x;
-                                coordinates[source.spatial_axes_xyz[1] as usize] = y;
-                                coordinates[source.spatial_axes_xyz[2] as usize] = z;
-                                if let Some(axis) = source.channel_axis {
-                                    coordinates[axis as usize] = u64::from(channel.source_index);
-                                } else if channel.source_index != 0 {
-                                    return Err(SessionError::LayerSource(format!(
-                                        "layer {} selects C={} but source has no C axis",
-                                        request.layer.layer_id.0, channel.source_index
-                                    )));
-                                }
-                                if let Some(axis) = source.time_axis {
-                                    coordinates[axis as usize] = u64::from(source.timepoint);
-                                }
-                                let coordinate_key = match source.chunk_key_encoding {
-                                    LocalChunkKeyEncoding::V2Dot => coordinates
-                                        .iter()
-                                        .map(u64::to_string)
-                                        .collect::<Vec<_>>()
-                                        .join("."),
-                                    LocalChunkKeyEncoding::V3Slash => coordinates
-                                        .iter()
-                                        .map(u64::to_string)
-                                        .collect::<Vec<_>>()
-                                        .join("/"),
-                                };
-                                let asset_path = match source.chunk_key_encoding {
-                                    LocalChunkKeyEncoding::V2Dot => {
-                                        format!("{}/{}", source.array_path, coordinate_key)
-                                    }
-                                    LocalChunkKeyEncoding::V3Slash => {
-                                        format!("{}/c/{}", source.array_path, coordinate_key)
-                                    }
-                                };
-                                let logical_extent = coordinates
-                                    .iter()
-                                    .zip(source.shape.iter().zip(source.chunk_shape.iter()))
-                                    .map(|(coordinate, (shape, chunk))| {
-                                        shape.saturating_sub(coordinate.saturating_mul(*chunk)).min(*chunk)
-                                    })
-                                    .collect();
-                                chunks.push(LocalChunkAddress {
-                                    asset_path,
-                                    coordinates,
-                                    channel: channel.source_index,
-                                    timepoint: source.timepoint,
-                                    spatial_chunk_xyz: [x, y, z],
-                                    logical_extent,
-                                });
+                                chunks.push(chunk_address(&request, channel, [x, y, z])?);
                             }
                         }
                     }
@@ -1000,6 +1153,218 @@ impl LocalSession {
                 Ok(LocalLayerChunkPlan { request, chunks })
             })
             .collect()
+    }
+
+    /// Expand bound layer requests over an **explicit** set of XYZ chunk coordinates.
+    ///
+    /// The region planner can only describe a box, which is why the desktop scene route had to be
+    /// told which chunks to render by its caller. Demand-driven planning produces whatever set the
+    /// renderer actually missed, which is generally not a box. Both planners build their addresses
+    /// through the same `chunk_address` helper, so path construction, axis order, channel and
+    /// timepoint placement, and edge-aware logical extents cannot drift apart.
+    pub fn local_layer_chunk_plan_for_chunks(
+        &self,
+        limits: LayerRenderLimits,
+        chunks_xyz: &[[u64; 3]],
+        max_chunk_addresses: usize,
+    ) -> Result<Vec<LocalLayerChunkPlan>, SessionError> {
+        if max_chunk_addresses == 0 {
+            return Err(SessionError::LayerSource(
+                "chunk-address capacity must be non-zero".into(),
+            ));
+        }
+        if chunks_xyz.is_empty() {
+            return Err(SessionError::LayerSource(
+                "explicit chunk plan needs at least one chunk".into(),
+            ));
+        }
+        self.chunk_plan_for_chunks(
+            self.local_layer_render_requests(limits)?,
+            chunks_xyz,
+            max_chunk_addresses,
+        )
+    }
+
+    fn chunk_plan_for_chunks(
+        &self,
+        requests: Vec<LocalLayerRenderRequest>,
+        chunks_xyz: &[[u64; 3]],
+        max_chunk_addresses: usize,
+    ) -> Result<Vec<LocalLayerChunkPlan>, SessionError> {
+        if max_chunk_addresses == 0 {
+            return Err(SessionError::LayerSource(
+                "chunk-address capacity must be non-zero".into(),
+            ));
+        }
+        if chunks_xyz.is_empty() {
+            return Err(SessionError::LayerSource(
+                "explicit chunk plan needs at least one chunk".into(),
+            ));
+        }
+        let mut remaining = max_chunk_addresses;
+        requests
+            .into_iter()
+            .map(|request| {
+                let source = &request.source;
+                let spatial_counts: [u64; 3] = std::array::from_fn(|xyz| {
+                    let axis = source.spatial_axes_xyz[xyz] as usize;
+                    source.shape[axis].div_ceil(source.chunk_shape[axis])
+                });
+                let mut unique: Vec<[u64; 3]> = Vec::with_capacity(chunks_xyz.len());
+                for chunk in chunks_xyz {
+                    if chunk
+                        .iter()
+                        .zip(spatial_counts.iter())
+                        .any(|(coordinate, count)| *coordinate >= *count)
+                    {
+                        return Err(SessionError::LayerSource(format!(
+                            "chunk {chunk:?} is outside source chunk grid {spatial_counts:?}"
+                        )));
+                    }
+                    if !unique.contains(chunk) {
+                        unique.push(*chunk);
+                    }
+                }
+                // Ascending order keeps this plan a pure function of the demanded set, matching
+                // `PortableChunkPlan`, whose page ordinals are static binding slots.
+                unique.sort_unstable();
+                let count = unique
+                    .len()
+                    .checked_mul(request.layer.channels.len())
+                    .ok_or_else(|| {
+                        SessionError::LayerSource("chunk address count overflows usize".into())
+                    })?;
+                if count > remaining {
+                    return Err(SessionError::LayerSource(format!(
+                        "chunk request needs {count} addresses but only {remaining} remain in its bound"
+                    )));
+                }
+                remaining -= count;
+                let mut addresses = Vec::with_capacity(count);
+                for channel in &request.layer.channels {
+                    for chunk in &unique {
+                        addresses.push(chunk_address(&request, channel, *chunk)?);
+                    }
+                }
+                Ok(LocalLayerChunkPlan {
+                    request,
+                    chunks: addresses,
+                })
+            })
+            .collect()
+    }
+
+    /// Physical voxel spacing of every declared pyramid level, finest first.
+    ///
+    /// This is the input `palace_core::gpu::select_portable_level` needs, and it must come from
+    /// each dataset's own NGFF coordinate transformations: a pyramid can downsample its axes by
+    /// different factors per level, which is exactly the case the committed anisotropic fixture
+    /// covers, so reusing level zero's spacing would choose the wrong level.
+    pub fn portable_level_spacings(&self) -> Result<Vec<[f32; 3]>, SessionError> {
+        let metadata = self.metadata.as_ref().ok_or_else(|| {
+            SessionError::LayerSource("open a local OME-Zarr dataset before reading levels".into())
+        })?;
+        let multiscale = metadata.multiscales.first().ok_or_else(|| {
+            SessionError::LayerSource("dataset has no multiscale metadata".into())
+        })?;
+        (0..multiscale.datasets.len())
+            .map(|level| {
+                let transform = portable_axis_aligned_transform(multiscale, level)?;
+                Ok(transform.scale.map(|value| value.abs() as f32))
+            })
+            .collect()
+    }
+
+    /// Assemble one channel's demanded chunks into the page layout `PortableChunkPlan` computed.
+    ///
+    /// [`Self::native_portable_page_admission`] builds a dense XYZ subvolume spanning a box. This
+    /// instead concatenates each demanded chunk in ascending chunk-index order, which is the
+    /// layout the residency map and the portable shader address, and which a demand-driven set
+    /// generally cannot express as a box.
+    ///
+    /// Every chunk is checked against the plan's own offsets rather than trusted: a chunk whose
+    /// word count or placement disagrees with what was planned is refused, because rendering it
+    /// would silently read a neighbour's scalars through the residency map.
+    pub fn portable_chunk_plan_pages(
+        &self,
+        plan: &LocalLayerChunkPlan,
+        loaded: &[LoadedLocalChunk],
+        chunk_plan: &palace_core::gpu::PortableChunkPlan,
+        channel: u32,
+    ) -> Result<Vec<Vec<u32>>, SessionError> {
+        let source = &plan.request.source;
+        let spatial: [usize; 3] = source.spatial_axes_xyz.map(|axis| axis as usize);
+        let dimensions: [u32; 3] = std::array::from_fn(|axis| source.shape[spatial[axis]] as u32);
+        let chunk_shape: [u32; 3] =
+            std::array::from_fn(|axis| source.chunk_shape[spatial[axis]] as u32);
+        if chunk_plan.grid().dimensions_xyz() != dimensions
+            || chunk_plan.grid().chunk_shape_xyz() != chunk_shape
+        {
+            return Err(SessionError::LayerSource(format!(
+                "portable chunk plan grid {:?}/{:?} does not match source grid {dimensions:?}/{chunk_shape:?}",
+                chunk_plan.grid().dimensions_xyz(),
+                chunk_plan.grid().chunk_shape_xyz()
+            )));
+        }
+        let [x_count, y_count, _] = chunk_plan.grid().counts_xyz();
+        let mut pages: Vec<Vec<u32>> = vec![Vec::new(); chunk_plan.page_words().len()];
+        for planned in chunk_plan.chunks() {
+            let located = loaded
+                .iter()
+                .find(|entry| {
+                    entry.address.channel == channel
+                        && linear_chunk_index(entry.address.spatial_chunk_xyz, x_count, y_count)
+                            == Some(planned.chunk_index)
+                })
+                .ok_or_else(|| {
+                    SessionError::LayerSource(format!(
+                        "planned chunk {} of channel {channel} was not read",
+                        planned.chunk_index
+                    ))
+                })?;
+            let words = portable_words_xyz(&located.bytes, &located.address, source)?;
+            let expected = planned
+                .logical_xyz
+                .iter()
+                .try_fold(1_usize, |count, extent| {
+                    count.checked_mul(*extent as usize)
+                })
+                .ok_or_else(|| {
+                    SessionError::LayerSource("planned chunk word count overflows usize".into())
+                })?;
+            if words.len() != expected {
+                return Err(SessionError::LayerSource(format!(
+                    "chunk {} holds {} words but the plan sized it at {expected}",
+                    planned.chunk_index,
+                    words.len()
+                )));
+            }
+            let page = pages.get_mut(planned.page as usize).ok_or_else(|| {
+                SessionError::LayerSource(format!(
+                    "chunk {} names page {} outside the plan",
+                    planned.chunk_index, planned.page
+                ))
+            })?;
+            if page.len() != planned.first_word as usize {
+                return Err(SessionError::LayerSource(format!(
+                    "chunk {} starts at word {} of page {} but the plan placed it at {}",
+                    planned.chunk_index,
+                    page.len(),
+                    planned.page,
+                    planned.first_word
+                )));
+            }
+            page.extend(words);
+        }
+        for (page, expected) in pages.iter().zip(chunk_plan.page_words()) {
+            if page.len() != *expected as usize {
+                return Err(SessionError::LayerSource(format!(
+                    "assembled page holds {} words but the plan sized it at {expected}",
+                    page.len()
+                )));
+            }
+        }
+        Ok(pages)
     }
 
     /// Read only addresses emitted by [`Self::local_layer_chunk_plan`].  The plan remains the
@@ -1609,12 +1974,31 @@ impl LocalSession {
 
 impl LocalOmeZarrSource {
     fn level_zero(root: &Path, metadata: &DatasetMetadata) -> Result<Self, SessionError> {
+        Self::for_level(root, metadata, 0)
+    }
+
+    /// Admit one pyramid level of the first multiscale.
+    ///
+    /// The `level` field existed from the start but nothing ever set it to anything but zero, so
+    /// the desktop could not express a level choice at all. Levels are ordered finest first, as
+    /// NGFF declares them and as Palace's `LODTensorOperator::levels` is ordered.
+    pub fn for_level(
+        root: &Path,
+        metadata: &DatasetMetadata,
+        level: u32,
+    ) -> Result<Self, SessionError> {
         let multiscale = metadata.multiscales.first().ok_or_else(|| {
             SessionError::LayerSource("dataset has no multiscale metadata".into())
         })?;
-        let dataset = multiscale.datasets.first().ok_or_else(|| {
-            SessionError::LayerSource("dataset has no level-zero array metadata".into())
-        })?;
+        let dataset = multiscale
+            .datasets
+            .get(level as usize)
+            .ok_or_else(|| {
+                SessionError::LayerSource(format!(
+                    "dataset declares {} levels, so level {level} does not exist",
+                    multiscale.datasets.len()
+                ))
+            })?;
         let array = read_array_info(root, &dataset.path)?;
         let array_directory = root.join(&dataset.path);
         let chunk_key_encoding = if array_directory.join("zarr.json").is_file() {
@@ -1694,7 +2078,7 @@ impl LocalOmeZarrSource {
         Ok(Self {
             root: root.display().to_string(),
             multiscale_index: 0,
-            level: 0,
+            level,
             array_path: dataset.path.clone(),
             axes: multiscale
                 .axes
@@ -1713,10 +2097,16 @@ impl LocalOmeZarrSource {
     }
 }
 
+/// The axis-aligned physical transform of one pyramid level.
+///
+/// NGFF declares coordinate transformations **per dataset**, composed with the multiscale's shared
+/// ones, which `level_transform` already does. This previously hard-coded level zero, so admitting
+/// a coarser level would have rendered it with the finest level's physical extent.
 fn portable_axis_aligned_transform(
     multiscale: &Multiscale,
+    level: usize,
 ) -> Result<LayerTransform, SessionError> {
-    let transform = level_transform(multiscale, 0)
+    let transform = level_transform(multiscale, level)
         .map_err(|error| SessionError::LayerSource(error.to_string()))?;
     let axis = |name: &str| {
         multiscale
@@ -2507,6 +2897,329 @@ mod tests {
         assert_eq!(volume.frame.page_submission.pages[1], vec![2; 4]);
         assert_eq!(volume.channels[0].transfer.color_srgb, [255, 0, 0]);
         assert_eq!(volume.channels[1].transfer.color_srgb, [0, 255, 0]);
+    }
+
+    /// Admitting a level must move the source array *and* its physical transform together. The
+    /// fixture's level one halves x and y but keeps z, so a layer admitted there must report half
+    /// the voxel extent in x and y at twice the spacing, leaving the physical extent unchanged.
+    #[test]
+    fn portable_layer_admission_follows_the_chosen_level_in_both_array_and_transform() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../test-data/cells3d-anisotropic.ome.zarr");
+        let physical_extent = |level: u32| {
+            let mut session = LocalSession::default();
+            session.open_local_omezarr(&root).unwrap();
+            let source = session
+                .prepare_portable_image_layer_at_level(level)
+                .unwrap();
+            let spatial: [usize; 3] = source.spatial_axes_xyz.map(|axis| axis as usize);
+            let voxels: [u64; 3] = std::array::from_fn(|axis| source.shape[spatial[axis]]);
+            let layer = session.scene.layers().first().unwrap().clone();
+            let scale = layer.transform.scale;
+            (
+                voxels,
+                std::array::from_fn::<f64, 3, _>(|axis| voxels[axis] as f64 * scale[axis].abs()),
+                scale,
+            )
+        };
+        let (fine_voxels, fine_extent, fine_scale) = physical_extent(0);
+        let (coarse_voxels, coarse_extent, coarse_scale) = physical_extent(1);
+        assert_eq!(fine_voxels, [128, 128, 32]);
+        assert_eq!(coarse_voxels, [64, 64, 32]);
+        // Half the voxels at twice the spacing in x and y; z untouched in both.
+        assert!((coarse_scale[0] - fine_scale[0] * 2.0).abs() < 1e-9);
+        assert!((coarse_scale[2] - fine_scale[2]).abs() < 1e-9);
+        // The physical extent the layer occupies must be identical at both levels, which is the
+        // property a level-zero transform on a coarser array would break.
+        for axis in 0..3 {
+            assert!(
+                (fine_extent[axis] - coarse_extent[axis]).abs() < 1e-6,
+                "axis {axis} extent moved: {fine_extent:?} versus {coarse_extent:?}"
+            );
+        }
+    }
+
+    /// Per-level spacings come from each dataset's own NGFF transform. The committed fixture is
+    /// deliberately anisotropic per level: level one halves x and y but keeps z, and only level
+    /// two halves z. Deriving every level's spacing from level zero would therefore pick the wrong
+    /// level for a camera looking along z.
+    #[test]
+    fn portable_level_spacings_follow_each_datasets_own_ngff_transform() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../test-data/cells3d-anisotropic.ome.zarr");
+        let mut session = LocalSession::default();
+        session.open_local_omezarr(&root).unwrap();
+        let spacings = session.portable_level_spacings().unwrap();
+        assert_eq!(spacings.len(), 3);
+        let close = |actual: [f32; 3], expected: [f32; 3]| {
+            actual
+                .iter()
+                .zip(expected)
+                .all(|(actual, expected)| (actual - expected).abs() < 1e-6)
+        };
+        assert!(close(spacings[0], [0.26, 0.26, 0.29]), "{:?}", spacings[0]);
+        assert!(close(spacings[1], [0.52, 0.52, 0.29]), "{:?}", spacings[1]);
+        assert!(close(spacings[2], [1.04, 1.04, 0.58]), "{:?}", spacings[2]);
+        // z is unchanged between levels zero and one, which is the property a shared level-zero
+        // spacing would destroy.
+        assert_eq!(spacings[0][2], spacings[1][2]);
+        assert_ne!(spacings[0][0], spacings[1][0]);
+
+        // The selection rule consumes these directly. Looking along x, a 0.6-unit footprint
+        // admits level one; looking along z it admits level two, because z stays fine longer.
+        let along_x = [[1.0, 0.0, 0.0]];
+        let along_z = [[0.0, 0.0, 1.0]];
+        assert_eq!(
+            palace_core::gpu::select_portable_level(&spacings, &along_x, 0.6, 1.0),
+            Some(1)
+        );
+        assert_eq!(
+            palace_core::gpu::select_portable_level(&spacings, &along_z, 0.6, 1.0),
+            Some(2)
+        );
+    }
+
+    /// The pyramid is now addressable. Nothing previously set `LocalOmeZarrSource::level` to
+    /// anything but zero, so the desktop could not express a level choice; camera-driven level
+    /// selection has nothing to select from without this.
+    #[test]
+    fn local_source_admits_each_declared_pyramid_level() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../test-data/cells3d-anisotropic.ome.zarr");
+        let mut session = LocalSession::default();
+        session.open_local_omezarr(&root).unwrap();
+        let metadata = session.metadata.as_ref().unwrap();
+        let fine = LocalOmeZarrSource::for_level(&root, metadata, 0).unwrap();
+        let coarse = LocalOmeZarrSource::for_level(&root, metadata, 1).unwrap();
+        assert_eq!(fine.level, 0);
+        assert_eq!(coarse.level, 1);
+        assert_eq!(fine.array_path, "0");
+        assert_eq!(coarse.array_path, "1");
+        // The committed fixture halves x and y between these levels but keeps z, which is what
+        // makes it an anisotropic pyramid worth selecting between.
+        let spatial = |source: &LocalOmeZarrSource| -> [u64; 3] {
+            source
+                .spatial_axes_xyz
+                .map(|axis| source.shape[axis as usize])
+        };
+        assert_eq!(spatial(&fine), [128, 128, 32]);
+        assert_eq!(spatial(&coarse), [64, 64, 32]);
+        // Chunk shape is declared per array and happens to match here; assert it rather than
+        // assume a planner can reuse the finest level's grid.
+        assert_eq!(fine.chunk_shape, coarse.chunk_shape);
+        // Level zero still goes through the same path.
+        assert_eq!(LocalOmeZarrSource::level_zero(&root, metadata).unwrap(), fine);
+        // A level the dataset does not declare is refused rather than clamped.
+        assert!(LocalOmeZarrSource::for_level(&root, metadata, 99).is_err());
+    }
+
+    /// Plan-ordered page assembly. The existing admission builds a dense box; this concatenates
+    /// demanded chunks in the exact layout `PortableChunkPlan` computed, which is what the
+    /// residency map and the portable shader address. Each chunk's placement is pinned, so a
+    /// concatenation in read order rather than plan order would be caught.
+    #[test]
+    fn portable_chunk_plan_pages_place_each_demanded_chunk_where_the_plan_says() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../test-data/cells3d-anisotropic.ome.zarr");
+        let mut session = LocalSession::default();
+        session.open_local_omezarr(root).unwrap();
+        session.prepare_default_portable_image_layer().unwrap();
+        let limits = LayerRenderLimits::new(4, 4);
+        let demanded = [[0, 0, 0], [1, 0, 0], [0, 1, 0]];
+        let plans = session
+            .local_layer_chunk_plan_for_chunks(limits, &demanded, 64)
+            .unwrap();
+        let plan = &plans[0];
+        let loaded = session
+            .read_local_layer_chunks(&plans, 16 * 1024 * 1024, 64 * 1024 * 1024)
+            .unwrap();
+
+        let source = &plan.request.source;
+        let spatial: [usize; 3] = source.spatial_axes_xyz.map(|axis| axis as usize);
+        let dimensions: [u32; 3] = std::array::from_fn(|axis| source.shape[spatial[axis]] as u32);
+        let chunk_shape: [u32; 3] =
+            std::array::from_fn(|axis| source.chunk_shape[spatial[axis]] as u32);
+        let grid = palace_core::gpu::PortableChunkGrid::new(dimensions, chunk_shape).unwrap();
+        let [x_count, y_count, _] = grid.counts_xyz();
+        let indices = demanded
+            .iter()
+            .map(|chunk| {
+                palace_core::gpu::PortableFeedbackKey::new(
+                    linear_chunk_index(*chunk, x_count, y_count).unwrap(),
+                    0,
+                )
+                .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let palace_core::gpu::PortableChunkPlanOutcome::Planned(chunk_plan) =
+            palace_core::gpu::PortableChunkPlan::from_demand(0, grid, indices, 1).unwrap()
+        else {
+            panic!("three fixture chunks must fit the portable bound");
+        };
+
+        let channel = plan.request.layer.channels[0].source_index;
+        let pages = session
+            .portable_chunk_plan_pages(plan, &loaded, &chunk_plan, channel)
+            .unwrap();
+        assert_eq!(pages.len(), chunk_plan.page_words().len());
+        let voxels_per_chunk = chunk_shape.iter().product::<u32>() as usize;
+        assert_eq!(
+            pages.iter().map(Vec::len).sum::<usize>(),
+            voxels_per_chunk * demanded.len(),
+            "every demanded chunk must contribute its whole logical extent"
+        );
+
+        // Each chunk's own scalars must appear at the page and word the plan assigned it.
+        for planned in chunk_plan.chunks() {
+            let located = loaded
+                .iter()
+                .find(|entry| {
+                    entry.address.channel == channel
+                        && linear_chunk_index(entry.address.spatial_chunk_xyz, x_count, y_count)
+                            == Some(planned.chunk_index)
+                })
+                .unwrap();
+            let words = portable_words_xyz(&located.bytes, &located.address, source).unwrap();
+            let start = planned.first_word as usize;
+            assert_eq!(
+                &pages[planned.page as usize][start..start + words.len()],
+                words.as_slice(),
+                "chunk {} was not placed at page {} word {}",
+                planned.chunk_index,
+                planned.page,
+                planned.first_word
+            );
+        }
+    }
+
+    #[test]
+    fn portable_chunk_plan_pages_refuse_a_mismatched_grid_or_an_unread_chunk() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../test-data/cells3d-anisotropic.ome.zarr");
+        let mut session = LocalSession::default();
+        session.open_local_omezarr(root).unwrap();
+        session.prepare_default_portable_image_layer().unwrap();
+        let limits = LayerRenderLimits::new(4, 4);
+        let plans = session
+            .local_layer_chunk_plan_for_chunks(limits, &[[0, 0, 0]], 64)
+            .unwrap();
+        let plan = &plans[0];
+        let loaded = session
+            .read_local_layer_chunks(&plans, 16 * 1024 * 1024, 64 * 1024 * 1024)
+            .unwrap();
+        let channel = plan.request.layer.channels[0].source_index;
+        let source = &plan.request.source;
+        let spatial: [usize; 3] = source.spatial_axes_xyz.map(|axis| axis as usize);
+        let dimensions: [u32; 3] = std::array::from_fn(|axis| source.shape[spatial[axis]] as u32);
+        let chunk_shape: [u32; 3] =
+            std::array::from_fn(|axis| source.chunk_shape[spatial[axis]] as u32);
+
+        // A grid that disagrees with the source would compute different offsets, so it is refused
+        // rather than producing pages the residency map would address incorrectly.
+        let wrong = palace_core::gpu::PortableChunkGrid::new(
+            dimensions,
+            [chunk_shape[0] / 2, chunk_shape[1], chunk_shape[2]],
+        )
+        .unwrap();
+        let palace_core::gpu::PortableChunkPlanOutcome::Planned(mismatched) =
+            palace_core::gpu::PortableChunkPlan::from_demand(
+                0,
+                wrong,
+                [palace_core::gpu::PortableFeedbackKey::new(0, 0).unwrap()],
+                1,
+            )
+            .unwrap()
+        else {
+            panic!("one chunk must plan");
+        };
+        assert!(
+            session
+                .portable_chunk_plan_pages(plan, &loaded, &mismatched, channel)
+                .is_err()
+        );
+
+        // A plan demanding a chunk that was never read must be refused, not silently short.
+        let grid = palace_core::gpu::PortableChunkGrid::new(dimensions, chunk_shape).unwrap();
+        let palace_core::gpu::PortableChunkPlanOutcome::Planned(unread) =
+            palace_core::gpu::PortableChunkPlan::from_demand(
+                0,
+                grid,
+                [
+                    palace_core::gpu::PortableFeedbackKey::new(0, 0).unwrap(),
+                    palace_core::gpu::PortableFeedbackKey::new(1, 0).unwrap(),
+                ],
+                1,
+            )
+            .unwrap()
+        else {
+            panic!("two chunks must plan");
+        };
+        assert!(
+            session
+                .portable_chunk_plan_pages(plan, &loaded, &unread, channel)
+                .is_err()
+        );
+    }
+
+    /// Demand-driven planning produces whatever set the renderer missed, which is generally not
+    /// a box. This proves the explicit planner is address-identical to the region planner over a
+    /// box, so the two cannot drift apart in path encoding, axis order or edge extents.
+    #[test]
+    fn explicit_chunk_plan_matches_the_region_plan_over_the_same_box() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../test-data/cells3d-anisotropic.ome.zarr");
+        let mut session = LocalSession::default();
+        session.open_local_omezarr(root).unwrap();
+        session.prepare_default_portable_image_layer().unwrap();
+        let limits = LayerRenderLimits::new(4, 4);
+        let region = session
+            .local_layer_chunk_plan(limits, SpatialChunkRegion::new([0, 0, 0], [2, 1, 1]), 64)
+            .unwrap();
+        let explicit = session
+            .local_layer_chunk_plan_for_chunks(limits, &[[0, 0, 0], [1, 0, 0]], 64)
+            .unwrap();
+        assert_eq!(region, explicit);
+        assert!(!region.is_empty() && !region[0].chunks.is_empty());
+    }
+
+    #[test]
+    fn explicit_chunk_plan_is_order_independent_deduplicated_and_bounded() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../test-data/cells3d-anisotropic.ome.zarr");
+        let mut session = LocalSession::default();
+        session.open_local_omezarr(root).unwrap();
+        session.prepare_default_portable_image_layer().unwrap();
+        let limits = LayerRenderLimits::new(4, 4);
+        let ascending = session
+            .local_layer_chunk_plan_for_chunks(limits, &[[0, 0, 0], [1, 0, 0]], 64)
+            .unwrap();
+        // A demanded set arrives in whatever order the request table happened to hold it, and
+        // repeats are normal because several pixels miss the same chunk.
+        let shuffled = session
+            .local_layer_chunk_plan_for_chunks(
+                limits,
+                &[[1, 0, 0], [0, 0, 0], [1, 0, 0], [0, 0, 0]],
+                64,
+            )
+            .unwrap();
+        assert_eq!(ascending, shuffled);
+        // A chunk outside the source grid is rejected rather than clamped.
+        assert!(
+            session
+                .local_layer_chunk_plan_for_chunks(limits, &[[9_999, 0, 0]], 64)
+                .is_err()
+        );
+        // The address bound is enforced, and an empty demand is not a plan.
+        assert!(
+            session
+                .local_layer_chunk_plan_for_chunks(limits, &[[0, 0, 0], [1, 0, 0]], 1)
+                .is_err()
+        );
+        assert!(
+            session
+                .local_layer_chunk_plan_for_chunks(limits, &[], 64)
+                .is_err()
+        );
     }
 
     #[test]

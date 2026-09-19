@@ -892,6 +892,25 @@ mod tests {
         let attachments =
             render_local_zarr_with_camera_attachments(root, size, CameraControls::default())
                 .unwrap();
+        // The header alone is not the contract. A surface that is entirely `+infinity` encodes
+        // to a perfectly valid PFM, and that is exactly what every real dataset produced until
+        // the raycaster recorded a NaN `t` on saturation; the header check passed throughout.
+        let depth = attachments
+            .ray_distance()
+            .expect("Palace volume response must carry a paired first-opacity surface");
+        let finite = depth
+            .distances()
+            .iter()
+            .filter(|distance| distance.is_finite())
+            .count();
+        assert!(
+            finite > 0,
+            "the fixture paints volume, so its first-opacity surface must have finite distances"
+        );
+        assert!(depth
+            .distances()
+            .iter()
+            .all(|d| (d.is_finite() && *d >= 0.0) || *d == f32::INFINITY));
         let (png, ray_distance_pfm) = palace_png::encode_attachments(&attachments).into_parts();
         let ray_distance_pfm = ray_distance_pfm.expect("Palace volume response must carry PFM");
         assert_eq!(png_dimensions(&png), [32, 24]);

@@ -1,3 +1,5 @@
 /target/
 /.tools/
 /crates/newvolim-ui/dist/
+# Nested repository (henriksson-lab/palace-dev); referenced by path, versioned separately.
+/palace-dev/
