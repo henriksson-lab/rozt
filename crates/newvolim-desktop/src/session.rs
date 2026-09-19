@@ -1800,6 +1800,22 @@ impl LocalSession {
         Ok(())
     }
 
+    /// Test-only: a point at an exact physical position, bypassing voxel rounding. Pick tests
+    /// place annotations on a pixel's own ray at a chosen distance from the first-opacity
+    /// surface, which only means something if the point is *exactly* there.
+    #[cfg(test)]
+    pub fn add_point_annotation_physical(
+        &mut self,
+        label: impl Into<String>,
+        physical: [f64; 3],
+    ) -> Result<Annotation, SessionError> {
+        let geometry = AnnotationGeometry::Point(physical);
+        geometry
+            .validate()
+            .map_err(|error| SessionError::Annotation(error.to_string()))?;
+        self.insert_annotation(label, geometry)
+    }
+
     /// Add a point from the linked slice crosshair. `voxel_xyz` is converted through the first
     /// displayed NGFF level before being retained, so annotations never encode an accidental
     /// cubic-voxel assumption.

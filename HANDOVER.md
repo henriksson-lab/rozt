@@ -24,6 +24,10 @@ fixture that put the eye inside the box. `demand_world_ray_from_camera` adds onl
 translation; `portable_camera_rays_xyz` divides by the level-zero spacing. Level selection was
 re-derived on the corrected camera. The legacy pick bridge had been right all along.
 
+**Pick and display now share one frame per route** (`direct_route_frame`, `scene_route_frame`),
+and the webview's volume canvas is wired to the scene route, so the demand-driven frame is what
+users see and click against.
+
 **The comparison now runs as a pinned test**, `compare_desktop_portable_and_server_renderers`
 (desktop, `--ignored`): matched transfer, unshaded, level zero on both sides. Identical hit set;
 depth agrees at every pixel to a constant `−0.224` explained by Palace skipping its on-face
@@ -38,22 +42,53 @@ resample with explicit rounding, affine and border, held to Vulkan's `resample_t
 
 Nothing is blocked. Ordered by value:
 
-1. **Decide the pick-versus-display surface.** The two portable pick commands read depth from a
-   region-bounded static packet (chunk `origin_xyz`/`extent_xyz`), while the desktop displays the
-   demand-driven scene over the whole level; a pick can disagree with the screen wherever the
-   frame has volume the packet does not. Pre-existing. Either pick against the demand route's own
-   frame (it has the depth) or make the region explicit in the UI contract — but decide it.
-2. **Decide the voxel-centre convention.** The desktop's layer box is corner-based
-   (`[translation, translation + scale × dims]`) while Palace and NGFF centre voxel `i` at
-   `translation + i × scale`; the portable sampling grid is shifted half a voxel from Palace's.
-   Measured as harmless (identical hit set; the depth offset is entirely Palace's skipped face
-   sample), but it also decides where an annotation at voxel `i` is drawn. State it once.
-3. **Scheduler selection of the affine resample** for admitted pages; the LOD builder's
-   `resample` still calls `resample_transform`. Same shape as the existing floor-nearest and
-   rechunk selection.
-4. **Palace's 8-bit state truncation** (`from_uniform` is `u8vec4(v * 255)`) — a Vulkan renderer
-   property that loses weak-channel colour. Recorded; fix only if the Vulkan path is to remain a
-   reference for colour rather than only for geometry.
+1. ~~**Decide the pick-versus-display surface.**~~ **Done.** Each route now has one function
+   that decides its frame (`direct_route_frame`, `scene_route_frame`) and both the render
+   command and the pick command consume it, so the occluding surface is the one on screen by
+   construction. Along the way: the UI (`index.html`) displays and picks through the **direct**
+   route — the demand-driven scene command is not wired into the UI, contrary to what this
+   file said; Palace's page DVR admits no fitted-camera packet on the fixture, so the direct
+   route is the native recorder's; and that route's transported PFM carried voxel-unit
+   distances (`260.7` for a physical `75.5`), now converted per ray. STAGE0 "Pick versus
+   display: one frame decision per route".
+
+   **And the UI is wired to it:** the volume canvas renders through
+   `render_native_portable_scene_camera_draw` and picks through
+   `pick_native_portable_scene_annotation` (`NEWVOLIM_NATIVE_VOLUME_COMMAND` /
+   `…_PICK_COMMAND` in `index.html`; `dist/` rebuilt with `trunk build`). Pinned by
+   `webview_volume_canvas_is_wired_to_the_scene_route` and
+   `scene_render_command_payload_is_the_webview_contract_over_the_route_frame`. The page's
+   chunk-region fields are now inert for the volume (only the scene route's fallbacks read
+   them); removing them from the page is cleanup, not a contract change. STAGE0 "The webview
+   now shows the demand-driven frame".
+2. ~~**Decide the voxel-centre convention.**~~ **Done: voxel-centred everywhere.**
+   `layer_world_box` is the one place the desktop builds a layer box (`origin − 0.5` to
+   `origin + dims − 0.5` voxels); `newvolim-render`'s ray interval and both native shaders match.
+   An annotation at voxel `i` is now drawn where voxel `i` is painted; the depth offset against
+   Vulkan dropped from `−0.224` to `−0.076` (the remaining part is Palace's own corner-box entry
+   face). Invariant test plus four re-derived pins, mutation-checked. STAGE0 "The voxel-centre
+   convention, stated once".
+3. ~~**Scheduler selection of the affine resample.**~~ **Done.** `select_resample_transform`
+   (with `portable_resample_transform_admits` and `portable_resample_affine_dynamic`) takes the
+   portable affine path for an admitted lossless page and keeps Vulkan otherwise; `py-palace`'s
+   `resample_transform` goes through it, as `rechunk` already did. The LOD builder stays on
+   Vulkan on purpose (generic element type, volumes past one page). Identity-observable test,
+   spike runtime test, mutation-checked. STAGE0 "Scheduler selection of the affine resample".
+4. ~~**Palace's 8-bit state truncation.**~~ **Done.** `from_uniform` rounds. Palace's mean
+   alpha now equals the portable pass's (207.7 vs 207.3) and its green bias against the
+   transfer's hue is +0.47 levels (was −11.9), asserted in the comparison and mutation-checked.
+   STAGE0 "Palace rounds its 8-bit state".
+
+**Everything on this list is done.** What remains is not a defect list:
+
+- Commit: the outer repo's changes and `palace-dev`'s (raycaster, entry/exit pass, colour,
+  affine resample, selector) are uncommitted in their two repositories.
+- Cleanup: the page's chunk-region plumbing (`newvolimNativePortableRegion`) is inert for the
+  volume now that the scene route is wired; remove it when convenient.
+- Speed: the desktop adapter suite re-renders the demand frame per pick; ~15 s today, but the
+  pick tests could cache the route frame if it grows.
+- Deferred acceptance gates unchanged: browser, Apple and Windows/D3D12 adapters cannot be run
+  from this host.
 
 Not worth doing: multi-layer demand (the session cannot hold more than one image layer).
 
@@ -68,7 +103,13 @@ cargo test --offline --manifest-path palace-dev/Cargo.toml -p palace-wgpu -- --i
 cargo test --offline --manifest-path palace-dev/Cargo.toml -p palace-wgpu-spike -- --include-ignored --test-threads=1
 ```
 
-The worktree is intentionally dirty and `palace-dev/` is untracked; do not commit unless asked.
+Builds: the `stable` toolchain moved to rustc 1.98.1 on 2026-09-19, invalidating the caches in
+`target/` (102 GB) and `palace-dev/target/` (31 GB); `.cargo/config.toml` sets
+`CMAKE_POLICY_VERSION_MINIMUM=3.5` so `shaderc-sys` builds from source on current CMake; with
+`/data` nearly full, this session built into `CARGO_TARGET_DIR=/big/henriksson/cargo-target/newvolim`.
+
+The worktree is intentionally dirty and `palace-dev/` is its own repository (ignored here);
+do not commit unless asked.
 
 ## 2026-09-18 continuation update
 

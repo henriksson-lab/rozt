@@ -145,6 +145,14 @@
           && target.colorEncoding === "srgb" && validDepth);
       };
 
+      // The volume canvas renders and picks through the native portable *scene* route: the
+      // desktop renders the demand-driven frame over the whole level (its chunk region below is
+      // consulted only by the fallbacks), and the matching pick command reads that same frame's
+      // depth, so a click is occluded by exactly what is on screen. The direct region-bounded
+      // route (`render_native_portable_camera_draw` / `pick_native_portable_annotation`) stays
+      // registered on the desktop for its own tests but is not what users see.
+      const NEWVOLIM_NATIVE_VOLUME_COMMAND = "render_native_portable_scene_camera_draw";
+      const NEWVOLIM_NATIVE_VOLUME_PICK_COMMAND = "pick_native_portable_scene_annotation";
       window.newvolimDrawPayload = async function (command, args) {
         const canvas = document.getElementById("newvolim-volume");
         const status = document.getElementById("newvolim-render-status");
@@ -162,18 +170,18 @@
           // Preserve only a validator-approved renderer attachment; it must never be inferred
           // from PNG alpha or treated as browser raster depth.
           window.newvolimNativeRayDistancePfm = payload.rayDistancePfmBase64 || null;
-          window.newvolimNativePortableFrame = command === "render_native_portable_camera_draw";
+          window.newvolimNativePortableFrame = command === NEWVOLIM_NATIVE_VOLUME_COMMAND;
           const image = new Image();
           image.onload = () => {
             if (generation !== window.newvolimVolumeGeneration) return;
             canvas.width = payload.width;
             canvas.height = payload.height;
             canvas.getContext("2d").drawImage(image, 0, 0);
-            if (command === "render_open_dataset" || command === "render_native_portable_camera_draw") {
+            if (command === "render_open_dataset" || command === NEWVOLIM_NATIVE_VOLUME_COMMAND) {
               window.newvolimAttachVolumeCameraControls(canvas);
             }
             status.textContent = window.newvolimNativePortableFrame
-              ? "Native portable WGPU frame"
+              ? "Native portable scene frame"
               : "Native Palace frame";
           };
           image.onerror = () => { status.textContent = "Frame decode failed"; };
@@ -1363,7 +1371,7 @@
             return;
           }
           if (window.newvolimNativePortableActive) {
-            window.newvolimAdmitFrame("render_native_portable_camera_draw", {
+            window.newvolimAdmitFrame(NEWVOLIM_NATIVE_VOLUME_COMMAND, {
               request: window.newvolimNativePortableDrawRequest(canvas, camera),
             });
           } else {
@@ -1428,7 +1436,7 @@
             if (window.newvolimNativeRayDistancePfm && window.newvolimNativePortableFrame
               && window.__TAURI__ && window.__TAURI__.core) {
               const camera = window.newvolimCamera;
-              const picked = await window.__TAURI__.core.invoke("pick_native_portable_annotation", {
+              const picked = await window.__TAURI__.core.invoke(NEWVOLIM_NATIVE_VOLUME_PICK_COMMAND, {
                 request: {
                   draw: window.newvolimNativePortableDrawRequest(canvas, camera),
                   x: point.x, y: point.y,
@@ -1890,7 +1898,7 @@
           try {
             window.newvolimNativePortableSource = await window.__TAURI__.core.invoke("prepare_default_portable_image_layer");
             window.newvolimNativePortableActive = true;
-            await window.newvolimDrawPayload("render_native_portable_camera_draw", {
+            await window.newvolimDrawPayload(NEWVOLIM_NATIVE_VOLUME_COMMAND, {
               request: window.newvolimNativePortableDrawRequest(canvas, window.newvolimCamera),
             });
             await window.newvolimDrawOrthogonal({

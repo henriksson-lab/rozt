@@ -4891,3 +4891,229 @@ Debug profile, `--test-threads=1`.
 - Ties. Palace's `round` and this `floor(p + 0.5)` can differ on an exact `.5`; the comparison
   avoids ties and the contract says so. A caller that needs tie-for-tie equality with Vulkan has
   no such guarantee from Vulkan itself.
+
+## Pick versus display: one frame decision per route (2026-09-19)
+
+The handover's open item was that the portable pick commands could test an annotation against a
+surface other than the one on screen. Reading the shipped webview (`crates/newvolim-ui/index.html`)
+first corrected the premise: the UI displays through `render_native_portable_camera_draw` — the
+**direct**, region-bounded route — and picks through `pick_native_portable_annotation`. The
+demand-driven scene route (`render_native_portable_scene_camera_draw`) exists and is tested but
+the UI never invokes it; the 2026-09-19 handover text saying "the desktop displays the
+demand-driven scene" was wrong and is corrected there.
+
+So each route had its own pick/display gap:
+
+- **Direct route.** The display used Palace's page DVR for an annotation-free packet and the
+  native recorder for an annotation-bearing one, while the picker read Palace's depth first in
+  every case. On this fixture that gap turned out to be hypothetical — Palace's page DVR does not
+  admit a fitted-camera packet at all here (`"portable Palace DVR raymarch input is not admitted"`
+  for every region tried, with or without annotations), so both sides fell to the native
+  recorder. What was *not* hypothetical: the transported PFM carried the native recorder's
+  **voxel-space ray parameter** as if it were a physical distance (`260.67` where the physical
+  distance is `75.49`), while the picker converted per ray. The `RayDistanceF32` contract says
+  physical.
+- **Scene route.** The display rendered the demand-driven frame over the whole level; the picker
+  rendered a static packet of the request's chunk region. Where the displayed frame has volume
+  the packet does not, an annotation behind the visible surface was selectable.
+
+### The change
+
+`RouteFrame { attachments, rays, renderer }` and one function per route that decides it:
+
+- `direct_route_frame(session, packet, physical_rays)` — Palace page DVR for an annotation-free
+  packet when it admits one, else the native recorder with its distances converted per ray to
+  physical by the same `physical_distance_per_palace_unit` the picker uses. The render command
+  and `pick_native_portable_annotation` both consume it.
+- `scene_route_frame(session, request)` — demand-driven frame with the rays it marched (the
+  demand route now returns them, `demand_driven_scene_camera_draw_with_rays`), else Palace's
+  static scene over the region, else the native scene recorder. The render command composites
+  annotations on top for Palace frames (a rejected projected record is now an error rather than
+  a quiet switch to the native recorder, which would have put a different surface on screen
+  from the one the pick tests); `pick_native_portable_scene_annotation` consumes the same frame.
+- `pick_in_route_frame(frame, index, annotations)` — the pixel's own ray and depth, `+infinity`
+  occluding nothing.
+
+`RouteRenderer` is recorded on the frame so a test can assert *which* frame the display used.
+`FramePayload::native_wgpu_camera` is gone (nothing builds a payload from a raw native frame any
+more) and `portable_scene_pick_depth` is test-only.
+
+### Evidence
+
+All `--test-threads=1`, debug. Annotations in these tests are placed **exactly** on a pixel's
+ray (`LocalSession::add_point_annotation_physical`, test-only) rather than rounded to a voxel:
+the fixture's volume begins at the entry face on nearly every ray, so a route sampling every
+0.13 µm puts its surface 0.065 µm in and there is no voxel-sized room in front of it. The pick
+compares an exact closest-approach distance against an `f32` depth, so a 0.02 µm room is three
+orders above the depth's resolution.
+
+- `pick_in_route_frame_uses_the_pixels_own_ray_and_depth` (CPU oracle): a two-pixel synthetic
+  frame; the nearer annotation wins at its distance, one behind the depth is occluded, one on a
+  `+infinity` pixel is found, an out-of-frame pixel is refused.
+- `scene_pick_is_occluded_by_the_displayed_demand_frame_not_the_region_packet` (adapter): at
+  128x96, zoom 0.5 (level zero on the corrected camera), the displayed frame is `Demand`; on the
+  roomiest ray where the region packet finds no volume, an annotation behind the displayed
+  surface returns `None` and one in front is found. **Mutation:** the picker reading the static
+  packet again finds the hidden annotation (`Some(id 0 at 36.41)` against a surface at `31.75`).
+- `direct_route_frame_reports_physical_distances` (adapter): the fixture packet's frame is
+  `Native`; every finite distance equals the recorder's parameter times the per-ray factor, the
+  factor differs from one somewhere, and a second evaluation is identical. **Mutation:** leaving
+  the parameter unconverted fails at `260.67` against `75.49`.
+- `native_portable_picker_uses_its_matching_camera_packet_and_depth` and
+  `native_portable_scene_picker_uses_ordered_scene_renderer_depth` now read their surface through
+  the route frame (behind occluded, front found at its distance). **Mutation:**
+  `pick_in_route_frame` handed `+infinity` fails both.
+- Sweep after the change, all `--test-threads=1`, debug, in the relocated target: workspace
+  green (desktop 45 default + 14 adapter, server 17); `palace-core` 90 (rerun alone after the
+  batched run's rebuild overran its slot); `palace-frame` 13; `palace-wgpu` 16;
+  `palace-wgpu-spike` 26 (both `--include-ignored`); `git diff --check` clean.
+
+### Environment note, because it cost an hour
+
+Mid-run the `stable` toolchain was updated to rustc 1.98.1 (`~/.rustup/toolchains/stable-…`
+modified 16:39), which invalidates every cached artefact: 102 GB in `target/` and 31 GB in
+`palace-dev/target`, all built by 1.98.0. The full rebuild then failed in `shaderc-sys 0.9.1`,
+whose bundled CMake project is rejected by the host's CMake without
+`CMAKE_POLICY_VERSION_MINIMUM=3.5` — it had only ever built from cache. `.cargo/config.toml`
+now sets that variable for build scripts. `/data` was down to 4.6 GB, so this session's builds
+go to `/big/henriksson/cargo-target/newvolim` via `CARGO_TARGET_DIR`; nothing was deleted.
+
+## The webview now shows the demand-driven frame (2026-09-19)
+
+Until now the shipped page (`crates/newvolim-ui/index.html`) drove the volume canvas through the
+direct, region-bounded route: `render_native_portable_camera_draw` for every frame and
+`pick_native_portable_annotation` for clicks. The demand-driven scene route — the whole point of
+§9.3.1 item 4 — was reachable only from tests. The volume canvas now renders through
+`render_native_portable_scene_camera_draw` and picks through
+`pick_native_portable_scene_annotation`, named once each as `NEWVOLIM_NATIVE_VOLUME_COMMAND` and
+`NEWVOLIM_NATIVE_VOLUME_PICK_COMMAND`; the frame-kind flag and the camera-control attach check use
+the same constant. Both commands take the request the page already builds
+(`newvolimNativePortableDrawRequest`): the chunk region in it is consulted only by the scene
+route's fallbacks, so the page's region plumbing is now inert for the volume. The direct route
+stays registered for its own tests and is no longer invoked by the page. `dist/` was rebuilt with
+`trunk build` (0.21.14, dev profile).
+
+### Evidence
+
+- `webview_volume_canvas_is_wired_to_the_scene_route` (CPU): reads the page source and requires
+  the two constants with the scene command names, exactly one admit, one draw and one pick call
+  through them, no string invocation of either direct command, and both scene commands in the
+  desktop's `generate_handler!`. **Mutation:** the pick constant set back to the direct command
+  fails it.
+- `scene_render_command_payload_is_the_webview_contract_over_the_route_frame` (adapter): the scene
+  render command, fed the page's request shape (a chunk region, canvas extent, orbit, zoom) with
+  an annotation in the session, returns a payload the page's validator accepts — `image/png`,
+  final, sRGB RGBA8, `rayDistanceF32` with a PFM of the frame's extent — whose decoded PFM equals
+  the route frame's depth pixel for pixel, and that frame is `Demand`. **Mutation:** the render
+  command displaying the static Palace scene instead fails the depth equality.
+- Sweep, all `--test-threads=1`, debug, relocated target: workspace green (desktop 46 default,
+  server 17), desktop adapter suite 15 passed, `trunk build` of the page succeeds; `git diff
+  --check` clean. The palace crates were not touched by this step.
+
+## The voxel-centre convention, stated once (2026-09-19)
+
+Annotations, NGFF and Palace put voxel `i` at `translation + i × scale`; the desktop's layer box
+was corner-based, `[t, t + s × dims]`, so its sampling rule `floor((p − min) / extent × dims)`
+painted voxel `i` over `[t + i·s, t + (i+1)·s)` — centred half a voxel away from where an
+annotation "at voxel `i`" is drawn. The comparison against Vulkan had measured the consequence
+as a constant `−0.224` depth offset it could explain but not remove.
+
+Decided: **voxel-centred everywhere.** A layer box runs from `origin − 0.5` to
+`origin + dims − 0.5` voxels, and every renderer reads the nearest voxel of a local coordinate.
+
+- Desktop: `layer_world_box(transform, origin, dims)` is the one place the box is built, used by
+  the direct route (whose page-local rays are now converted through the transform of the global
+  voxel coordinate, not offset from `minimum`), the static scene, the scene extent folds, the
+  demand route and level selection.
+- `newvolim-render`: `PortableSceneLayerInput::world_ray_interval` intersects `[-0.5, dim − 0.5]`.
+- `newvolim-wgpu-frame`: the direct shader's slabs and the scene shader's bounds are
+  voxel-centred and both sample `floor(local + 0.5)`.
+- Palace-side contracts are untouched: `PortableDvrVolumeLevel` takes whatever box it is given.
+
+### Evidence
+
+All `--test-threads=1`, debug, relocated target.
+
+- `layer_world_box_centres_each_voxel_on_its_annotation_position` (CPU): under an anisotropic
+  scale, a translation and a non-zero page origin, every voxel's `voxel_to_world` position lands
+  at cell coordinate `i + 0.5` of the box on every axis. **Mutation:** the corner-based box fails
+  it (and `fitted_native_camera_and_page_submission_adapt_to_palace_dvr`).
+- Four pinned values re-derived, each with its arithmetic in a comment: the render crate's
+  interval `(0, 8) → (0, 6)`; the native scene ray range `[1, 3] → [0.5, 2.5]` and its packed
+  words; the direct-route CPU render `2.0 → 1.5` (twice) and `4.0 → 3.0` under scale 2. Two
+  native scene adapter tests marched a single-voxel layer at `(0.5, 0.5)` — the corner box's
+  cell centre, now the voxel's edge — and ran through nothing; their rays go through the voxel's
+  position `(0, 0)`.
+- `compare_desktop_portable_and_server_renderers`: hit set still identical (1936/1936/0
+  one-sided), mean alpha 201.8 vs 207.3, and the depth offset against Vulkan is now
+  `−0.0760` mean / `−0.0800` max — down from `−0.224` by the predicted `0.145` (half a 0.29 µm
+  voxel) — with every shared depth still within one voxel.
+- The pick tests (exact placement) pass unchanged; the fixture box in their oracle is now
+  voxel-centred too.
+- Sweep, all `--test-threads=1`, debug, relocated target: workspace green (desktop 47 default,
+  render 25, server 17), desktop adapter suite 15, `newvolim-wgpu-frame` 8 with adapter tests;
+  `git diff --check` clean. Palace crates untouched by this step.
+
+What remains different from Palace is Palace's own entry face: its entry/exit pass rasterizes
+the corner box `[0, dims × spacing]` while its sampler is voxel-centred, so its rays start half a
+voxel earlier than ours and its on-face sample rounds outside the array. That is a Palace
+convention, recorded, not something this migration should mirror.
+
+## Scheduler selection of the affine resample (2026-09-19)
+
+The transform-compatible resample now has the same selection the rechunk and floor-nearest
+paths have, and in the same place.
+
+- `portable_resample_affine_dynamic` — the `DType` entry to `portable_resample_affine_cpu`
+  (`u16`/`u32` scalars), mirroring `portable_resample_dynamic`.
+- `portable_resample_transform_admits` — the decision, exposed on its own: a lossless scalar
+  tensor whose complete input and output each fit one portable page, under a matrix and rank
+  `PortableAffineResampleLayout::new` accepts.
+- `select_resample_transform` — the portable affine path when admitted, the Vulkan
+  `resample_transform` otherwise. It is the one place the choice is made; callers wanting a
+  specific path call it directly, and nothing is redirected silently.
+- `py-palace`'s `Tensor.resample_transform` now goes through the selector, exactly as its
+  `rechunk` already selected the portable page for admitted tensors and kept Vulkan for larger
+  ones. The LOD builder (`smooth_downsample` → `resample` → `resample_transform`) is generic
+  over the element type and is deliberately left on Vulkan: it runs on every dtype and on
+  volumes far past one page, and a selector inside a generic operator would have to specialise
+  on the element type to say anything.
+
+### Evidence
+
+- `select_resample_transform_takes_the_portable_path_only_for_an_admitted_page` (CPU +
+  Vulkan): the selection is observable through operator identity. An admitted `u16` 3x5 page
+  under a `(+1, −2)` translation with `Pad0` resolves to `portable_resample_affine_cpu`'s
+  operator and its values are the oracle's; an `f32` tensor and a 1025x1024 `u16` tensor (one
+  row past the 4 MiB page) resolve to `resample_transform`'s operator, the `f32` case with
+  values equal to a direct Vulkan call. **Mutation:** the selector forced to Vulkan fails on the
+  admitted page's identity (`"resample_transform"` against `"portable_resample_affine_cpu"`).
+- `runtime_selects_wgpu_for_the_bounded_affine_resample` (adapter, `palace-wgpu-spike`): the
+  selected operator with an installed WGPU recorder produces the oracle's chunked, zero-padded
+  words through the ordinary scheduler.
+- `cargo check -p palace --no-default-features` compiles the Python binding with the selector
+  (default features need ffmpeg development libraries this host lacks).
+
+## Palace rounds its 8-bit state (2026-09-19)
+
+`from_uniform` in `palace-core/src/glsl/color.glsl` was `u8vec4(v * 255)` — truncation. The DVR
+raycaster converts its accumulated colour through it on every step, so any increment smaller
+than a level was dropped, most of all in a tinted transfer's weak channels: with `[255, 51, 85]`
+the fixture came back at ratios like `[206, 28, 60]`. Both overloads now round
+(`u8vec4(clamp(v, 0, 1) * 255 + 0.5)`); the only users are the raycaster's state and
+`intensity_to_grey`.
+
+### Evidence
+
+`compare_desktop_portable_and_server_renderers` (matched transfer, unshaded, level zero):
+
+- mean alpha over hit pixels: Palace **207.7** against portable 207.3 (was 201.8 — the
+  truncation bias); per-pixel `portable − server` alpha percentiles 5/25/50/75/95 now
+  `−57 −21 0 21 57`, median exactly zero; mean channel delta 12.25 → 9.79.
+- Palace's green over 1874 bright pixels: bias **+0.47** levels against the transfer's hue,
+  worst pixel 7.2. Asserted: `|bias| ≤ 1.0` and worst `≤ 12`. **Mutation:** truncation restored
+  gives bias `−11.92`, worst 20.4, and the assertion fails.
+- Sweep after items 3 and 4, all `--test-threads=1`, debug, relocated target: `palace-core` 91,
+  `palace-frame` 13, `palace-wgpu` 16 and `palace-wgpu-spike` 27 (both `--include-ignored`),
+  workspace green (desktop 47 default + 15 adapter, render 25, server 17); `git diff --check`
+  clean. No palace-core test pins raycast bytes, so the rounding change broke nothing there.

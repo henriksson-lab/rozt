@@ -199,21 +199,6 @@ impl FramePayload {
         })
     }
 
-    fn native_wgpu_camera(
-        width: u32,
-        height: u32,
-        frame: newvolim_wgpu_frame::RenderedProjection,
-    ) -> Result<Self, String> {
-        let rgba = frame.rgba.into_iter().flatten().collect();
-        let attachments = palace_core::gpu::PortableFrameAttachments::new(
-            width,
-            height,
-            rgba,
-            frame.ray_distances,
-        )
-        .ok_or_else(|| "native WGPU renderer returned an invalid paired frame".to_owned())?;
-        Self::portable_frame_attachments(attachments)
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -1035,15 +1020,8 @@ fn palace_dvr_packet_from_native_camera(
             .ok_or_else(|| "portable Palace DVR page is not admitted".to_owned())
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let minimum = transform
-        .voxel_to_world(input.voxel_origin_xyz.map(|value| value as f64))
-        .map(|value| value as f32);
-    let maximum = std::array::from_fn(|axis| {
-        (transform.translation[axis]
-            + transform.scale[axis]
-                * (input.voxel_origin_xyz[axis] + u64::from(volume.dimensions_xyz[axis])) as f64)
-            as f32
-    });
+    let (minimum, maximum) =
+        layer_world_box(transform, input.voxel_origin_xyz, volume.dimensions_xyz);
     let level = palace_core::gpu::PortableDvrVolumeLevel::new(
         volume.dimensions_xyz,
         minimum,
@@ -1055,8 +1033,13 @@ fn palace_dvr_packet_from_native_camera(
         .rays
         .iter()
         .map(|ray| {
+            // The packet's rays are in page-local voxel coordinates; voxel-centred, so the
+            // world position is the transform of the global voxel coordinate itself.
             let origin = std::array::from_fn(|axis| {
-                minimum[axis] + ray.origin_xyz[axis] * transform.scale[axis] as f32
+                (transform.translation[axis]
+                    + transform.scale[axis]
+                        * (input.voxel_origin_xyz[axis] as f64 + f64::from(ray.origin_xyz[axis])))
+                    as f32
             });
             let raw_direction =
                 std::array::from_fn(|axis| ray.direction_xyz[axis] * transform.scale[axis] as f32);
@@ -1590,8 +1573,6 @@ fn render_native_portable_camera_draw(
     request: NativePortableDrawRequest,
     session: tauri::State<'_, Mutex<LocalSession>>,
 ) -> Result<FramePayload, String> {
-    let width = request.width;
-    let height = request.height;
     let owned = {
         let session = session
             .lock()
@@ -1599,24 +1580,217 @@ fn render_native_portable_camera_draw(
         session.clone()
     };
     let packet = native_portable_camera_draw_for_session(request, &owned)?;
-    if packet.draw.annotation_words.is_empty() {
-        match render_palace_portable_camera_draw(&owned, &packet) {
-            Ok(frame) => FramePayload::portable_frame_attachments(frame),
-            // A fitted Palace camera can legitimately exceed the bounded page-DVR packet's
-            // current sample limit. Keep the established native route for that packet rather
-            // than silently truncating its depth or rejecting an otherwise valid frame.
-            Err(_) => {
-                let frame = newvolim_wgpu_frame::render_portable_camera_draw(&packet, 0)?;
-                FramePayload::native_wgpu_camera(width, height, frame)
-            }
-        }
-    } else {
-        // Palace's page-DVR owns the direct-volume colour/depth route. Until its overlay pass is
-        // migrated, retain the existing recorder only when it must composite trusted projected
-        // annotation records into the returned colour attachment.
-        let frame = newvolim_wgpu_frame::render_portable_camera_draw(&packet, 0)?;
-        FramePayload::native_wgpu_camera(width, height, frame)
+    let rays = direct_route_physical_rays(&owned, &packet)?;
+    let frame = direct_route_frame(&owned, &packet, &rays)?;
+    FramePayload::portable_frame_attachments(frame.attachments)
+}
+
+/// The physical box of `dimensions` voxels of a layer level starting at local voxel origin
+/// `origin`, in the **voxel-centred** convention: voxel `i` sits at `translation + i × scale` —
+/// NGFF's and Palace's rule, and the one annotations are placed with — and occupies half a
+/// voxel either side, so the box runs from `origin - 0.5` to `origin + dimensions - 0.5` voxels.
+/// A renderer sampling `floor((p - minimum) / (maximum - minimum) × dimensions)` over this box
+/// therefore reads the nearest voxel, and an annotation at voxel `i` is drawn where voxel `i`
+/// is painted. The desktop used a corner-based box before, which put the two half a voxel apart.
+fn layer_world_box(
+    transform: newvolim_scene::LayerTransform,
+    origin: [u64; 3],
+    dimensions: [u32; 3],
+) -> ([f32; 3], [f32; 3]) {
+    let corner = |offset: f64| -> [f32; 3] {
+        std::array::from_fn(|axis| {
+            (transform.translation[axis]
+                + transform.scale[axis] * (origin[axis] as f64 + offset))
+                as f32
+        })
+    };
+    let minimum = corner(-0.5);
+    let maximum: [f32; 3] = std::array::from_fn(|axis| {
+        (transform.translation[axis]
+            + transform.scale[axis] * (origin[axis] as f64 + f64::from(dimensions[axis]) - 0.5))
+            as f32
+    });
+    (minimum, maximum)
+}
+
+/// Which renderer produced a route's frame. Kept so a test can assert that a pick was tested
+/// against the frame the display actually used, not merely against *a* frame.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RouteRenderer {
+    /// The demand-driven Palace scene pass over the whole level.
+    Demand,
+    /// Palace's static-page DVR over the packet's region.
+    Palace,
+    /// The native WGPU recorder over the packet's region.
+    Native,
+}
+
+/// The one frame a route displays for a request: colour, **physical** first-opacity distances,
+/// and the physical ray each pixel was marched along.
+///
+/// Both the render command and the pick command of a route obtain their frame here, so the
+/// surface an annotation is tested against is the surface on screen by construction. Before
+/// this, the direct route displayed the native recorder's frame whenever annotations were
+/// present — the only time a pick matters — while its picker read Palace's page-DVR depth
+/// first; and the scene picker read a region-bounded static packet while the scene display
+/// rendered the demand-driven frame over the whole level.
+struct RouteFrame {
+    attachments: palace_core::gpu::PortableFrameAttachments,
+    rays: Vec<newvolim_render::PickRay>,
+    renderer: RouteRenderer,
+}
+
+/// Pick against a route frame at one pixel: the annotation nearest along that pixel's ray, no
+/// further than the frame's first-opacity distance there (`+infinity` where the ray found no
+/// volume, so nothing is occluded).
+fn pick_in_route_frame(
+    frame: &RouteFrame,
+    index: usize,
+    annotations: &[Annotation],
+) -> Result<Option<AnnotationPickPayload>, String> {
+    let distance = *frame
+        .attachments
+        .first_opacity_distance
+        .get(index)
+        .ok_or_else(|| "the route frame omitted the requested depth pixel".to_owned())?;
+    let ray = *frame
+        .rays
+        .get(index)
+        .ok_or_else(|| "the route frame omitted the requested pixel ray".to_owned())?;
+    depth_aware_annotation_pick(annotations, ray, f64::from(distance))
+}
+
+/// The direct route's rays in the physical annotation frame, with the factor that takes the
+/// native recorder's voxel-space ray parameter to physical distance.
+fn direct_route_physical_rays(
+    session: &LocalSession,
+    packet: &newvolim_render::NativePortableCameraDrawInput,
+) -> Result<Vec<session::PalacePhysicalRay>, String> {
+    packet
+        .rays
+        .iter()
+        .map(|ray| {
+            let global_origin = std::array::from_fn(|axis| {
+                f64::from(ray.origin_xyz[axis]) + packet.voxel_origin_xyz[axis] as f64
+            });
+            session
+                .portable_voxel_ray_to_physical(global_origin, ray.direction_xyz.map(f64::from))
+                .map_err(|error| error.to_string())
+        })
+        .collect()
+}
+
+/// The frame the direct route displays for an admitted packet.
+///
+/// Palace's page DVR owns an annotation-free packet. A packet carrying projected annotation
+/// records is composited by the native recorder until Palace's overlay pass reaches this route,
+/// and its depth is then the surface on screen. The native recorder's distances are its
+/// voxel-space ray parameter; they are converted per ray to physical here, so the transported
+/// PFM and the pick share one unit, as `newvolim-render`'s `RayDistanceF32` contract requires.
+fn direct_route_frame(
+    session: &LocalSession,
+    packet: &newvolim_render::NativePortableCameraDrawInput,
+    physical_rays: &[session::PalacePhysicalRay],
+) -> Result<RouteFrame, String> {
+    if physical_rays.len() != packet.rays.len() {
+        return Err("direct route rays do not match the packet".into());
     }
+    let rays = physical_rays.iter().map(|ray| ray.ray).collect::<Vec<_>>();
+    if packet.draw.annotation_words.is_empty() {
+        // A fitted Palace camera can legitimately exceed the bounded page-DVR packet's sample
+        // limit; that packet takes the native route rather than a truncated depth.
+        if let Ok(attachments) = render_palace_portable_camera_draw(session, packet) {
+            return Ok(RouteFrame {
+                attachments,
+                rays,
+                renderer: RouteRenderer::Palace,
+            });
+        }
+    }
+    let frame = newvolim_wgpu_frame::render_portable_camera_draw(packet, 0)?;
+    let distances = frame
+        .ray_distances
+        .iter()
+        .zip(physical_rays)
+        .map(|(distance, ray)| {
+            if distance.is_finite() {
+                (f64::from(*distance) * ray.physical_distance_per_palace_unit) as f32
+            } else {
+                *distance
+            }
+        })
+        .collect();
+    let attachments = palace_core::gpu::PortableFrameAttachments::new(
+        packet.draw.extent_pixels[0],
+        packet.draw.extent_pixels[1],
+        frame.rgba.into_iter().flatten().collect(),
+        distances,
+    )
+    .ok_or_else(|| "native WGPU renderer returned an invalid paired frame".to_owned())?;
+    Ok(RouteFrame {
+        attachments,
+        rays,
+        renderer: RouteRenderer::Native,
+    })
+}
+
+/// The volume frame the scene route displays for a request, in the display's own order of
+/// preference: renderer-driven demand over the whole level first (the webview's chunk region is
+/// not consulted), then Palace's static-page scene over that region, then the native scene
+/// recorder. Annotation compositing is the render command's step on top; the pick needs only the
+/// volume surface, which compositing leaves untouched.
+fn scene_route_frame(
+    session: &LocalSession,
+    request: NativePortableDrawRequest,
+) -> Result<RouteFrame, String> {
+    if let Ok((attachments, rays)) = demand_driven_scene_camera_draw_with_rays(session, request) {
+        let rays = rays
+            .iter()
+            .map(|ray| {
+                newvolim_render::PickRay::new(
+                    ray.origin().map(f64::from),
+                    ray.direction().map(f64::from),
+                )
+                .map_err(|error| error.to_string())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        return Ok(RouteFrame {
+            attachments,
+            rays,
+            renderer: RouteRenderer::Demand,
+        });
+    }
+    let packet = native_portable_scene_camera_draw_for_session(request, session)?;
+    let rays = packet
+        .rays
+        .iter()
+        .map(|ray| {
+            newvolim_render::PickRay::new(ray.origin_world, ray.direction_world)
+                .map_err(|error| error.to_string())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if let Ok(scene) = palace_dvr_scene_from_native_camera(&packet) {
+        if let Ok(attachments) = render_palace_portable_scene_camera_draw(session, &scene) {
+            return Ok(RouteFrame {
+                attachments,
+                rays,
+                renderer: RouteRenderer::Palace,
+            });
+        }
+    }
+    let frame = newvolim_wgpu_frame::render_portable_scene_camera_draw(&packet, 0)?;
+    let attachments = palace_core::gpu::PortableFrameAttachments::new(
+        packet.draw.extent_pixels[0],
+        packet.draw.extent_pixels[1],
+        frame.rgba.into_iter().flatten().collect(),
+        frame.ray_distances,
+    )
+    .ok_or_else(|| "native scene renderer returned an invalid paired frame".to_owned())?;
+    Ok(RouteFrame {
+        attachments,
+        rays,
+        renderer: RouteRenderer::Native,
+    })
 }
 
 /// Convert the already-admitted ordered scene and its one-authority world rays to Palace's
@@ -1629,16 +1803,8 @@ fn palace_dvr_scene_from_native_camera(
     let pages = &scene.frame.page_submission.pages;
     let mut layers = Vec::new();
     for layer in &scene.layers {
-        let minimum = layer
-            .transform
-            .voxel_to_world(layer.voxel_origin_xyz.map(|value| value as f64))
-            .map(|value| value as f32);
-        let maximum = std::array::from_fn(|axis| {
-            (layer.transform.translation[axis]
-                + layer.transform.scale[axis]
-                    * (layer.voxel_origin_xyz[axis] + u64::from(layer.dimensions_xyz[axis])) as f64)
-                as f32
-        });
+        let (minimum, maximum) =
+            layer_world_box(layer.transform, layer.voxel_origin_xyz, layer.dimensions_xyz);
         let mut channels = Vec::new();
         for channel in &layer.channels {
             let first = channel.page_offset as usize;
@@ -1696,22 +1862,17 @@ fn palace_dvr_scene_from_native_camera(
         .layers
         .iter()
         .fold([f32::INFINITY; 3], |minimum, layer| {
-            let origin = layer
-                .transform
-                .voxel_to_world(layer.voxel_origin_xyz.map(|value| value as f64));
-            std::array::from_fn(|axis| minimum[axis].min(origin[axis] as f32))
+            let (origin, _) =
+                layer_world_box(layer.transform, layer.voxel_origin_xyz, layer.dimensions_xyz);
+            std::array::from_fn(|axis| minimum[axis].min(origin[axis]))
         });
     let scene_maximum = scene
         .layers
         .iter()
         .fold([f32::NEG_INFINITY; 3], |maximum, layer| {
-            let end = std::array::from_fn(|axis| {
-                layer.voxel_origin_xyz[axis] + u64::from(layer.dimensions_xyz[axis])
-            });
-            let corner = layer
-                .transform
-                .voxel_to_world(end.map(|value| value as f64));
-            std::array::from_fn(|axis| maximum[axis].max(corner[axis] as f32))
+            let (_, end) =
+                layer_world_box(layer.transform, layer.voxel_origin_xyz, layer.dimensions_xyz);
+            std::array::from_fn(|axis| maximum[axis].max(end[axis]))
         });
     // A framed camera necessarily has pixels that miss the admitted scene.  Such a ray is
     // admitted as a degenerate `near == far` interval, which carries no samples and renders as a
@@ -1775,27 +1936,20 @@ fn render_native_portable_scene_camera_draw_for_session(
     request: NativePortableDrawRequest,
     session: &LocalSession,
 ) -> Result<FramePayload, String> {
-    let width = request.width;
-    let height = request.height;
-    // Renderer-driven demand first: the scene pass decides which chunks it needs, so the
-    // webview-supplied chunk region is not consulted at all. Anything this route refuses — more
-    // than one layer or channel, no eligible adapter, a working set beyond the portable bound —
-    // falls back to the established region-based routes below.
-    if let Ok(frame) = render_demand_driven_scene_camera_draw(session, request) {
-        if let Ok(frame) = composite_palace_scene_annotations(session, request, frame) {
-            return FramePayload::portable_frame_attachments(frame);
+    // One frame decision for display and pick alike (`scene_route_frame`): renderer-driven
+    // demand first — the scene pass decides which chunks it needs, so the webview-supplied chunk
+    // region is not consulted — then the region-based Palace scene, then the native recorder.
+    let frame = scene_route_frame(session, request)?;
+    let attachments = match frame.renderer {
+        // A projected record Palace rejects is an error here rather than a quiet switch to the
+        // native recorder: that switch would put a different surface on screen from the one the
+        // pick command tests against.
+        RouteRenderer::Demand | RouteRenderer::Palace => {
+            composite_palace_scene_annotations(session, request, frame.attachments)?
         }
-    }
-    let packet = native_portable_scene_camera_draw_for_session(request, session)?;
-    if let Ok(scene) = palace_dvr_scene_from_native_camera(&packet) {
-        if let Ok(frame) = render_palace_portable_scene_camera_draw(session, &scene) {
-            if let Ok(frame) = composite_palace_scene_annotations(session, request, frame) {
-                return FramePayload::portable_frame_attachments(frame);
-            }
-        }
-    }
-    let frame = newvolim_wgpu_frame::render_portable_scene_camera_draw(&packet, 0)?;
-    FramePayload::native_wgpu_camera(width, height, frame)
+        RouteRenderer::Native => frame.attachments,
+    };
+    FramePayload::portable_frame_attachments(attachments)
 }
 
 /// Composite this session's projected annotations over a Palace-rendered scene frame.
@@ -1873,6 +2027,30 @@ fn render_demand_driven_scene_camera_draw(
     render_demand_driven_scene_camera_draw_at_level(session, request, level)
 }
 
+/// The demand route's frame together with the physical world rays it marched, one per pixel.
+/// A pick against this frame must use these rays: the frame's first-opacity distances are
+/// measured from their origins.
+fn demand_driven_scene_camera_draw_with_rays(
+    session: &LocalSession,
+    request: NativePortableDrawRequest,
+) -> Result<
+    (
+        palace_core::gpu::PortableFrameAttachments,
+        Vec<palace_core::gpu::PortableRayInterval>,
+    ),
+    String,
+> {
+    let size = desktop_frame_size(request.width, request.height, 1)?;
+    let controls = CameraControls {
+        orbit_delta: [request.orbit_x, request.orbit_y],
+        zoom: request.zoom,
+    }
+    .validate()
+    .map_err(|error| error.to_string())?;
+    let level = demand_scene_level(session, size, controls)?;
+    demand_driven_scene_camera_draw_with_rays_at_level(session, request, level)
+}
+
 /// The demand route at an explicit pyramid level. The desktop always lets the camera choose (see
 /// [`render_demand_driven_scene_camera_draw`]); a comparison against another renderer needs the
 /// level pinned so that a level difference is not mistaken for a renderer difference.
@@ -1881,6 +2059,21 @@ fn render_demand_driven_scene_camera_draw_at_level(
     request: NativePortableDrawRequest,
     level: u32,
 ) -> Result<palace_core::gpu::PortableFrameAttachments, String> {
+    demand_driven_scene_camera_draw_with_rays_at_level(session, request, level)
+        .map(|(frame, _)| frame)
+}
+
+fn demand_driven_scene_camera_draw_with_rays_at_level(
+    session: &LocalSession,
+    request: NativePortableDrawRequest,
+    level: u32,
+) -> Result<
+    (
+        palace_core::gpu::PortableFrameAttachments,
+        Vec<palace_core::gpu::PortableRayInterval>,
+    ),
+    String,
+> {
     let size = desktop_frame_size(request.width, request.height, 1)?;
     let controls = CameraControls {
         orbit_delta: [request.orbit_x, request.orbit_y],
@@ -1929,12 +2122,7 @@ fn render_demand_driven_scene_camera_draw_at_level(
     let transform = session
         .portable_level_transform(level)
         .map_err(|error| error.to_string())?;
-    let minimum = transform
-        .voxel_to_world([0.0; 3])
-        .map(|value| value as f32);
-    let maximum: [f32; 3] = std::array::from_fn(|axis| {
-        (transform.translation[axis] + transform.scale[axis] * f64::from(dimensions[axis])) as f32
-    });
+    let (minimum, maximum) = layer_world_box(transform, [0; 3], dimensions);
     let rays = portable_demand_world_rays(dimensions, size, controls, transform, minimum, maximum)?;
     let transfers = channels
         .iter()
@@ -2040,7 +2228,7 @@ fn render_demand_driven_scene_camera_draw_at_level(
             }
         }
         if complete {
-            return Ok(frame);
+            return Ok((frame, rays));
         }
     }
     Err("demand-driven scene exceeded its iteration budget".into())
@@ -2089,13 +2277,11 @@ fn demand_scene_level(
     let transform = session
         .portable_level_transform(0)
         .map_err(|error| error.to_string())?;
-    let minimum = transform
-        .voxel_to_world([0.0; 3])
-        .map(|value| value as f32);
-    let maximum: [f32; 3] = std::array::from_fn(|axis| {
-        (transform.translation[axis]
-            + transform.scale[axis] * f64::from(dimensions_zyx[2 - axis])) as f32
-    });
+    let (minimum, maximum) = layer_world_box(
+        transform,
+        [0; 3],
+        std::array::from_fn(|axis| dimensions_zyx[2 - axis]),
+    );
     let ray = |x: u32| {
         demand_world_ray(
             dimensions_zyx,
@@ -2474,68 +2660,34 @@ fn pick_native_portable_annotation_for_session(
     request: NativePortablePickRequest,
     session: &LocalSession,
 ) -> Result<Option<AnnotationPickPayload>, String> {
-    let (packet, physical_ray, annotations, index) = {
-        let (draw, root, voxel_origin_xyz) =
-            native_portable_draw_for_session(request.draw, session)?;
-        if request.x >= draw.extent_pixels[0] || request.y >= draw.extent_pixels[1] {
-            return Err("portable annotation-pick pixel is outside the admitted extent".into());
-        }
-        let size = FrameSize::new(draw.extent_pixels[0], draw.extent_pixels[1])
-            .map_err(|error| error.to_string())?;
-        let controls = CameraControls {
-            orbit_delta: draw.camera.orbit_delta,
-            zoom: draw.camera.zoom,
-        };
-        let spacing = level_zero_spacing_xyz(session)?;
-        let rays = portable_camera_rays_xyz(&root, size, controls, voxel_origin_xyz, spacing)?;
-        let packet = newvolim_render::NativePortableCameraDrawInput::new_with_voxel_origin(
-            draw,
-            voxel_origin_xyz,
-            rays,
-        )
-        .map_err(|error| error.to_string())?;
-        let index = usize::try_from(request.y)
-            .ok()
-            .and_then(|row| row.checked_mul(packet.draw.extent_pixels[0] as usize))
-            .and_then(|row| row.checked_add(request.x as usize))
-            .ok_or_else(|| "portable annotation-pick pixel offset overflows usize".to_owned())?;
-        let ray = packet
-            .rays
-            .get(index)
-            .ok_or_else(|| "portable camera packet omitted the requested pixel ray".to_owned())?;
-        let global_origin = std::array::from_fn(|axis| {
-            f64::from(ray.origin_xyz[axis]) + voxel_origin_xyz[axis] as f64
-        });
-        let physical_ray = session
-            .portable_voxel_ray_to_physical(global_origin, ray.direction_xyz.map(f64::from))
-            .map_err(|error| error.to_string())?;
-        (packet, physical_ray, session.annotations().to_vec(), index)
-    };
-    // Selection is volume-occluded by the same Palace page-DVR invocation that owns an admitted
-    // direct frame. Its distances are physical units. A packet outside the current bounded DVR
-    // sample limit takes the established native recorder fallback, whose local distance retains
-    // the host-owned physical conversion captured with this exact camera.
-    match render_palace_portable_camera_draw(session, &packet) {
-        Ok(frame) => {
-            let distance = *frame
-                .first_opacity_distance
-                .get(index)
-                .ok_or_else(|| "portable recorder omitted the requested depth pixel".to_owned())?;
-            depth_aware_annotation_pick(&annotations, physical_ray.ray, f64::from(distance))
-        }
-        Err(_) => {
-            let frame = newvolim_wgpu_frame::render_portable_camera_draw(&packet, 0)?;
-            let distance = *frame
-                .ray_distances
-                .get(index)
-                .ok_or_else(|| "portable recorder omitted the requested depth pixel".to_owned())?;
-            depth_aware_annotation_pick(
-                &annotations,
-                physical_ray.ray,
-                f64::from(distance) * physical_ray.physical_distance_per_palace_unit,
-            )
-        }
+    let (draw, root, voxel_origin_xyz) = native_portable_draw_for_session(request.draw, session)?;
+    if request.x >= draw.extent_pixels[0] || request.y >= draw.extent_pixels[1] {
+        return Err("portable annotation-pick pixel is outside the admitted extent".into());
     }
+    let size = FrameSize::new(draw.extent_pixels[0], draw.extent_pixels[1])
+        .map_err(|error| error.to_string())?;
+    let controls = CameraControls {
+        orbit_delta: draw.camera.orbit_delta,
+        zoom: draw.camera.zoom,
+    };
+    let spacing = level_zero_spacing_xyz(session)?;
+    let rays = portable_camera_rays_xyz(&root, size, controls, voxel_origin_xyz, spacing)?;
+    let packet = newvolim_render::NativePortableCameraDrawInput::new_with_voxel_origin(
+        draw,
+        voxel_origin_xyz,
+        rays,
+    )
+    .map_err(|error| error.to_string())?;
+    let index = usize::try_from(request.y)
+        .ok()
+        .and_then(|row| row.checked_mul(packet.draw.extent_pixels[0] as usize))
+        .and_then(|row| row.checked_add(request.x as usize))
+        .ok_or_else(|| "portable annotation-pick pixel offset overflows usize".to_owned())?;
+    // The same frame the render command displays for this packet — same renderer choice, same
+    // physical distances, same rays — so selection is occluded by exactly what is on screen.
+    let physical_rays = direct_route_physical_rays(session, &packet)?;
+    let frame = direct_route_frame(session, &packet, &physical_rays)?;
+    pick_in_route_frame(&frame, index, session.annotations())
 }
 
 /// Pick an annotation against a newly rendered ordered portable scene. Scene DVR rays and
@@ -2556,23 +2708,20 @@ fn pick_native_portable_scene_annotation_for_session(
     request: NativePortableScenePickRequest,
     session: &LocalSession,
 ) -> Result<Option<AnnotationPickPayload>, String> {
-    let packet = native_portable_scene_camera_draw_for_session(request.draw, session)?;
-    if request.x >= packet.draw.extent_pixels[0] || request.y >= packet.draw.extent_pixels[1] {
+    let size = desktop_frame_size(request.draw.width, request.draw.height, 1)?;
+    if request.x >= size.width || request.y >= size.height {
         return Err("portable scene annotation-pick pixel is outside the admitted extent".into());
     }
     let index = usize::try_from(request.y)
         .ok()
-        .and_then(|row| row.checked_mul(packet.draw.extent_pixels[0] as usize))
+        .and_then(|row| row.checked_mul(size.width as usize))
         .and_then(|row| row.checked_add(request.x as usize))
         .ok_or_else(|| "portable scene annotation-pick pixel offset overflows usize".to_owned())?;
-    let ray = *packet
-        .rays
-        .get(index)
-        .ok_or_else(|| "portable scene camera packet omitted the requested pixel ray".to_owned())?;
-    let physical_ray = newvolim_render::PickRay::new(ray.origin_world, ray.direction_world)
-        .map_err(|error| error.to_string())?;
-    let distance = portable_scene_pick_depth(session, &packet, index)?;
-    depth_aware_annotation_pick(session.annotations(), physical_ray, distance)
+    // The frame the scene render command displays for this request, in its own order of
+    // preference — the demand-driven frame over the whole level when it is available, which a
+    // region-bounded static packet is not the same surface as.
+    let frame = scene_route_frame(session, request.draw)?;
+    pick_in_route_frame(&frame, index, session.annotations())
 }
 
 /// Read the occluding physical distance for one scene pixel from the renderer that owns depth.
@@ -2582,6 +2731,7 @@ fn pick_native_portable_scene_annotation_for_session(
 /// admitted volume's first-opacity distance, never a depth buffer that already has projected
 /// annotations composited into it. The native scene renderer remains the fallback for packets
 /// Palace cannot admit, or for a host without an eligible adapter.
+#[cfg(test)]
 fn portable_scene_pick_depth(
     session: &LocalSession,
     packet: &newvolim_render::NativePortableSceneCameraDrawInput,
@@ -3393,9 +3543,12 @@ mod tests {
         let transfer = palace_transfer_from_native_camera(&camera).unwrap();
         assert_eq!(transfer.classify(0.0), [255, 0, 0, 0]);
         assert_eq!(transfer.classify(1.0), [255, 0, 0, 255]);
+        // Voxel-centred box over the two voxels: x from -0.5 to 1.5. From x = -1 the ray enters
+        // at 0.5 and samples every unit from there: x = -0.5 reads the transparent voxel 0, and
+        // x = 0.5 — half a voxel before voxel 1's position at x = 1 — reads the opaque one.
         assert_eq!(
             input.render_cpu(&transfer, 1.0 / 256.0).unwrap().first_opacity_distance,
-            [2.0]
+            [1.5]
         );
         let resident_chunk_camera =
             newvolim_render::NativePortableCameraDrawInput::new_with_voxel_origin(
@@ -3410,16 +3563,18 @@ mod tests {
         let input = level.raymarch_input(1, 1, rays, 1.0).unwrap();
         assert_eq!(
             input.render_cpu(&transfer, 1.0 / 256.0).unwrap().first_opacity_distance,
-            [2.0]
+            [1.5]
         );
         let mut transformed = camera.clone();
         transformed.draw.volume.frame.descriptors[0].transform =
             newvolim_scene::LayerTransform::new([2.0, 1.0, 1.0], [0.0; 3]).unwrap();
         let (level, rays) = palace_dvr_packet_from_native_camera(&transformed).unwrap();
         let input = level.raymarch_input(1, 1, rays, 1.0).unwrap();
+        // Scale 2 on x: voxels at x = 0 and 2, box from -1 to 3, entered from x = -2 after one
+        // unit; unit samples at x = -1 and 0 read voxel 0, x = 1 reads the opaque voxel 1.
         assert_eq!(
             input.render_cpu(&transfer, 1.0 / 256.0).unwrap().first_opacity_distance,
-            [4.0]
+            [3.0]
         );
     }
 
@@ -3768,9 +3923,9 @@ mod tests {
         );
     }
 
-    /// The direct portable route's pick occludes behind, and admits in front of, the surface the
-    /// same packet's Palace page DVR produces, on the packet's own voxel-space rays taken back to
-    /// the physical annotation frame.
+    /// The direct portable route's pick occludes behind, and admits in front of, the surface of
+    /// the frame the route displays for the same packet — read through the same
+    /// `direct_route_frame` the render command uses.
     #[test]
     #[ignore = "requires a local WGPU adapter"]
     fn native_portable_picker_uses_its_matching_camera_packet_and_depth() {
@@ -3789,39 +3944,12 @@ mod tests {
             zoom: 1.0,
         };
         let packet = native_portable_camera_draw_for_session(draw, &session).unwrap();
-        let physical_rays = packet
-            .rays
-            .iter()
-            .map(|ray| {
-                let global_origin = std::array::from_fn(|axis| {
-                    f64::from(ray.origin_xyz[axis]) + packet.voxel_origin_xyz[axis] as f64
-                });
-                session
-                    .portable_voxel_ray_to_physical(global_origin, ray.direction_xyz.map(f64::from))
-                    .unwrap()
-            })
-            .collect::<Vec<_>>();
-        // The same depth source, in the same order of preference, as the pick itself.
-        let depths: Vec<f64> = match render_palace_portable_camera_draw(&session, &packet) {
-            Ok(frame) => frame
-                .first_opacity_distance
-                .iter()
-                .map(|distance| f64::from(*distance))
-                .collect(),
-            Err(_) => {
-                let frame = newvolim_wgpu_frame::render_portable_camera_draw(&packet, 0).unwrap();
-                frame
-                    .ray_distances
-                    .iter()
-                    .zip(&physical_rays)
-                    .map(|(distance, ray)| f64::from(*distance) * ray.physical_distance_per_palace_unit)
-                    .collect()
-            }
-        };
+        let physical_rays = direct_route_physical_rays(&session, &packet).unwrap();
+        let frame = direct_route_frame(&session, &packet, &physical_rays).unwrap();
         let (index, origin, direction, near, surface, far) = roomiest_pixel(
-            physical_rays.len(),
-            |pixel| (physical_rays[pixel].ray.origin, physical_rays[pixel].ray.direction),
-            |pixel| depths[pixel],
+            frame.rays.len(),
+            |pixel| (frame.rays[pixel].origin, frame.rays[pixel].direction),
+            |pixel| f64::from(frame.attachments.first_opacity_distance[pixel]),
         );
         let request = NativePortablePickRequest {
             draw,
@@ -3849,6 +3977,63 @@ mod tests {
             .expect("an annotation in front of the first-opacity surface must be selectable");
         assert_eq!(hit.annotation_id, front);
         assert!((hit.distance - front_distance).abs() < 0.5);
+    }
+
+    /// The frame the direct route displays carries **physical** distances whichever renderer
+    /// produced it. On this fixture Palace's page DVR does not admit a fitted camera packet
+    /// ("raymarch input is not admitted"), so the route is the native recorder's — whose own
+    /// distances are the voxel-space ray parameter. The route frame must convert them per ray
+    /// by the same factor the picker uses, and the anisotropic fixture makes that factor
+    /// distinguishable from one.
+    #[test]
+    #[ignore = "requires a local WGPU adapter"]
+    fn direct_route_frame_reports_physical_distances() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../test-data/cells3d-anisotropic.ome.zarr");
+        let mut session = LocalSession::default();
+        session.open_local_omezarr(&root).unwrap();
+        session.prepare_default_portable_image_layer().unwrap();
+        let draw = NativePortableDrawRequest {
+            origin_xyz: [2, 2, 0],
+            extent_xyz: [1, 1, 1],
+            width: 64,
+            height: 48,
+            orbit_x: 0,
+            orbit_y: 0,
+            zoom: 1.0,
+        };
+        let packet = native_portable_camera_draw_for_session(draw, &session).unwrap();
+        let physical_rays = direct_route_physical_rays(&session, &packet).unwrap();
+        let frame = direct_route_frame(&session, &packet, &physical_rays).unwrap();
+        assert_eq!(frame.renderer, RouteRenderer::Native);
+        let native = newvolim_wgpu_frame::render_portable_camera_draw(&packet, 0).unwrap();
+        let mut converted = 0_usize;
+        for (pixel, (shown, raw)) in frame
+            .attachments
+            .first_opacity_distance
+            .iter()
+            .zip(&native.ray_distances)
+            .enumerate()
+        {
+            let factor = physical_rays[pixel].physical_distance_per_palace_unit;
+            if raw.is_finite() {
+                let expected = (f64::from(*raw) * factor) as f32;
+                assert_eq!(*shown, expected, "pixel {pixel}: {raw} voxel units × {factor}");
+                converted += usize::from((factor - 1.0).abs() > 1e-3);
+            } else {
+                assert_eq!(*shown, *raw);
+            }
+        }
+        assert!(
+            converted > 0,
+            "the anisotropic fixture must give a per-ray factor other than one somewhere"
+        );
+        // And the pick reads that same frame: identical depth at every pixel.
+        let again = direct_route_frame(&session, &packet, &physical_rays).unwrap();
+        assert_eq!(
+            again.attachments.first_opacity_distance,
+            frame.attachments.first_opacity_distance
+        );
     }
 
     #[test]
@@ -3978,12 +4163,14 @@ mod tests {
     /// (report in `STAGE0.md`):
     ///
     /// - **Hit set.** Identical: every ray that finds volume on one side finds it on the other.
-    /// - **Depth.** Palace samples the nearest voxel at `round(p / spacing)` stepping
-    ///   `|dir ⊙ spacing|` from the entry face; its sample *on* the face rounds to an index
-    ///   outside the array and is skipped, so its first contribution is one step in. The portable
-    ///   pass samples `floor((p − min) / extent × dims)` at half the finest spacing, starting half
-    ///   a step in. The difference is therefore a constant `−(palace_step − portable_step / 2)`
-    ///   per ray, `−0.224` on the fixture's centre rays, and never exceeds one Palace step.
+    /// - **Depth.** Both sample the nearest voxel of the same voxel-centred grid, but from
+    ///   different entry faces: Palace's entry/exit pass rasterizes the corner box
+    ///   `[0, dims × spacing]` and its sample *on* that face rounds to an index outside the
+    ///   array and is skipped, so its first contribution is one step (`|dir ⊙ spacing|`) in;
+    ///   the portable pass enters its voxel-centred box half a voxel later and samples half a
+    ///   step (0.065) in. The difference is a constant per ray, `−0.076` on the fixture's centre
+    ///   rays (it was `−0.224` before the desktop's box was voxel-centred), and never exceeds
+    ///   one Palace step.
     /// - **Colour.** Palace keeps its accumulated colour in 8 bits between steps and truncates
     ///   (`from_uniform` is `uint(v * 255)`), which loses small increments — most of all in the
     ///   weak channels, so the fixture's `[255, 51, 85]` transfer comes back with green and blue
@@ -4178,7 +4365,7 @@ mod tests {
             "mean alpha over hit pixels: server {server_alpha:.1}, portable {portable_alpha:.1}"
         );
         // The portable pass accumulates in f32, so its hue is the transfer's own at every pixel
-        // with measurable colour; Palace's 8-bit truncation is what makes this untrue for it.
+        // with measurable colour.
         for &pixel in &hits {
             let colour = &portable.rgba[pixel * 4..pixel * 4 + 4];
             if colour[0] >= 64 {
@@ -4189,6 +4376,35 @@ mod tests {
                 );
             }
         }
+        // Palace keeps its state in 8 bits between steps, so its hue can only follow the
+        // transfer if each conversion *rounds*: truncation dropped the weak channels' small
+        // increments every step and the fixture's green came back a third low (28 for a red of
+        // 206, against 41). Rounding is unbiased, so the error is a few levels of scatter per
+        // pixel and nothing on average.
+        let mut hue_error_sum = 0.0_f64;
+        let mut hue_error_max = 0.0_f64;
+        let mut hue_pixels = 0_usize;
+        for &pixel in &hits {
+            let colour = &server_colour[pixel * 4..pixel * 4 + 4];
+            if colour[0] >= 64 {
+                let expected_g = f64::from(colour[0]) * f64::from(state.color_srgb[1]) / 255.0;
+                let error = f64::from(colour[1]) - expected_g;
+                hue_error_max = hue_error_max.max(error.abs());
+                hue_error_sum += error;
+                hue_pixels += 1;
+            }
+        }
+        assert!(hue_pixels > 0);
+        let hue_bias = hue_error_sum / hue_pixels as f64;
+        println!(
+            "Palace hue over {hue_pixels} bright pixels: green bias {hue_bias:+.2} levels, worst \
+             {hue_error_max:.1}"
+        );
+        assert!(
+            hue_bias.abs() <= 1.0,
+            "Palace's green is biased by {hue_bias:+.2} levels against the transfer's hue"
+        );
+        assert!(hue_error_max <= 12.0, "a pixel's green is {hue_error_max} levels off");
     }
 
     /// Side-by-side portable-versus-native rendering of the **same packet**, reported rather than
@@ -4363,12 +4579,7 @@ mod tests {
                 let spatial: [usize; 3] = source.spatial_axes_xyz.map(|axis| axis as usize);
                 let dimensions: [u32; 3] =
                     std::array::from_fn(|axis| source.shape[spatial[axis]] as u32);
-                let minimum = transform.voxel_to_world([0.0; 3]).map(|value| value as f32);
-                let maximum: [f32; 3] = std::array::from_fn(|axis| {
-                    (transform.translation[axis]
-                        + transform.scale[axis] * f64::from(dimensions[axis]))
-                        as f32
-                });
+                let (minimum, maximum) = layer_world_box(transform, [0; 3], dimensions);
                 let start = std::time::Instant::now();
                 let rays = portable_demand_world_rays(
                     dimensions, size, controls, transform, minimum, maximum,
@@ -4710,8 +4921,9 @@ mod tests {
         );
     }
 
-    /// The ordered-scene pick occludes behind, and admits in front of, the Palace scene
-    /// attachment for the same packet, on the packet's own physical world rays.
+    /// The ordered-scene pick occludes behind, and admits in front of, the surface of the frame
+    /// the scene route displays — the demand-driven frame, read through the same
+    /// `scene_route_frame` the render command uses.
     #[test]
     #[ignore = "requires a local WGPU adapter"]
     fn native_portable_scene_picker_uses_ordered_scene_renderer_depth() {
@@ -4720,38 +4932,28 @@ mod tests {
         let mut session = LocalSession::default();
         session.open_local_omezarr(&root).unwrap();
         session.prepare_default_portable_image_layer().unwrap();
+        // 128x96 at zoom 0.5 selects level zero on the corrected camera; at the coarsest level
+        // every ray's first sample contributes, leaving no room in front of the surface.
         let draw = NativePortableDrawRequest {
             origin_xyz: [2, 2, 0],
             extent_xyz: [1, 1, 1],
-            width: 64,
-            height: 48,
+            width: 128,
+            height: 96,
             orbit_x: 0,
             orbit_y: 0,
-            zoom: 1.0,
+            zoom: 0.5,
         };
-        let packet = native_portable_scene_camera_draw_for_session(draw, &session).unwrap();
-        // One render of the packet's Palace scene gives every pixel's depth; the pick reads the
-        // same attachment (checked below at the chosen pixel) but re-renders per call.
-        let scene = palace_dvr_scene_from_native_camera(&packet).unwrap();
-        let frame = palace_portable_scene_camera_draw_on_adapter(&session, &scene)
-            .expect("this host has an eligible WGPU adapter");
+        let frame = scene_route_frame(&session, draw).unwrap();
+        assert_eq!(frame.renderer, RouteRenderer::Demand);
         let (index, origin, direction, near, surface, far) = roomiest_pixel(
-            packet.rays.len(),
-            |pixel| {
-                let ray = packet.rays[pixel];
-                (ray.origin_world.map(f64::from), ray.direction_world.map(f64::from))
-            },
-            |pixel| f64::from(frame.first_opacity_distance[pixel]),
-        );
-        assert_eq!(
-            portable_scene_pick_depth(&session, &packet, index).unwrap(),
-            surface,
-            "the pick must read the same Palace scene attachment"
+            frame.rays.len(),
+            |pixel| (frame.rays[pixel].origin, frame.rays[pixel].direction),
+            |pixel| f64::from(frame.attachments.first_opacity_distance[pixel]),
         );
         let request = NativePortableScenePickRequest {
             draw,
-            x: (index % 64) as u32,
-            y: (index / 64) as u32,
+            x: (index % 128) as u32,
+            y: (index / 128) as u32,
         };
 
         let behind = place_on_ray(
@@ -4776,10 +4978,247 @@ mod tests {
         assert!((hit.distance - front_distance).abs() < 0.5);
     }
 
-    /// Place a point annotation on a physical world ray at `distance` from its origin, rounded to
-    /// the nearest level-zero voxel, and return its id. Rounding moves the point by at most half
-    /// a voxel diagonal, 0.24 um on the fixture: well inside the 0.5 um pick radius and inside
-    /// the margins the pick tests keep on either side of the first-opacity surface.
+    /// The scene display is the demand-driven frame over the whole level; the region-bounded
+    /// static packet the picker used to read has no volume outside its chunk. On a ray where
+    /// the displayed frame finds volume and the one-chunk packet finds none, an annotation
+    /// behind the displayed surface must be occluded — the old pick would have found it.
+    #[test]
+    #[ignore = "requires a local WGPU adapter"]
+    fn scene_pick_is_occluded_by_the_displayed_demand_frame_not_the_region_packet() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../test-data/cells3d-anisotropic.ome.zarr");
+        let mut session = LocalSession::default();
+        session.open_local_omezarr(&root).unwrap();
+        session.prepare_default_portable_image_layer().unwrap();
+        // 128x96 at zoom 0.5 selects level zero on the corrected camera; at the coarsest level
+        // every ray's first sample contributes, leaving no room in front of the surface.
+        let draw = NativePortableDrawRequest {
+            origin_xyz: [2, 2, 0],
+            extent_xyz: [1, 1, 1],
+            width: 128,
+            height: 96,
+            orbit_x: 0,
+            orbit_y: 0,
+            zoom: 0.5,
+        };
+        let displayed = scene_route_frame(&session, draw).unwrap();
+        assert_eq!(displayed.renderer, RouteRenderer::Demand);
+        let packet = native_portable_scene_camera_draw_for_session(draw, &session).unwrap();
+        let scene = palace_dvr_scene_from_native_camera(&packet).unwrap();
+        let region_only = palace_portable_scene_camera_draw_on_adapter(&session, &scene)
+            .expect("this host has an eligible WGPU adapter");
+
+        let mut best: Option<(usize, f64, f64, f64, f64)> = None;
+        for pixel in 0..displayed.rays.len() {
+            let shown = f64::from(displayed.attachments.first_opacity_distance[pixel]);
+            if !shown.is_finite() || region_only.first_opacity_distance[pixel].is_finite() {
+                continue;
+            }
+            let ray = displayed.rays[pixel];
+            let Some((near, far)) = fixture_box_crossing(ray.origin, ray.direction) else {
+                continue;
+            };
+            let room = (shown - near).min(far - shown);
+            if best.is_none_or(|(_, _, _, _, current)| room > current) {
+                best = Some((pixel, near, shown, far, room));
+            }
+        }
+        let (index, near, shown, far, room) =
+            best.expect("the displayed frame must find volume the one-chunk packet does not");
+        assert!(room >= 0.02, "no such ray has 0.02 um of room (best {room})");
+        let ray = displayed.rays[index];
+        let request = NativePortableScenePickRequest {
+            draw,
+            x: (index % 128) as u32,
+            y: (index / 128) as u32,
+        };
+        let behind = place_on_ray(
+            &mut session,
+            "behind",
+            ray.origin,
+            ray.direction,
+            shown + (far - shown) / 2.0,
+        );
+        assert_eq!(
+            pick_native_portable_scene_annotation_for_session(request, &session).unwrap(),
+            None,
+            "occluded by the displayed surface at {shown}; the region packet saw no volume here"
+        );
+        let front_distance = near + (shown - near) / 2.0;
+        let front = place_on_ray(&mut session, "front", ray.origin, ray.direction, front_distance);
+        assert_ne!(front, behind);
+        let hit = pick_native_portable_scene_annotation_for_session(request, &session)
+            .unwrap()
+            .expect("visible in front of the displayed surface");
+        assert_eq!(hit.annotation_id, front);
+    }
+
+    /// The shipped webview drives the volume canvas through the scene route — render and pick
+    /// alike — so the demand-driven frame is what users see and what their clicks are tested
+    /// against. Pinned by reading the UI source: a wiring change is a contract change.
+    #[test]
+    fn webview_volume_canvas_is_wired_to_the_scene_route() {
+        let source = std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../newvolim-ui/index.html"),
+        )
+        .unwrap();
+        assert!(source.contains(
+            "const NEWVOLIM_NATIVE_VOLUME_COMMAND = \"render_native_portable_scene_camera_draw\";"
+        ));
+        assert!(source.contains(
+            "const NEWVOLIM_NATIVE_VOLUME_PICK_COMMAND = \"pick_native_portable_scene_annotation\";"
+        ));
+        assert_eq!(source.matches("newvolimAdmitFrame(NEWVOLIM_NATIVE_VOLUME_COMMAND").count(), 1);
+        assert_eq!(source.matches("newvolimDrawPayload(NEWVOLIM_NATIVE_VOLUME_COMMAND").count(), 1);
+        assert_eq!(source.matches("invoke(NEWVOLIM_NATIVE_VOLUME_PICK_COMMAND").count(), 1);
+        // The direct route is not invoked by the page any more, only named in a comment.
+        for direct in ["\"render_native_portable_camera_draw\"", "\"pick_native_portable_annotation\""] {
+            assert!(
+                !source.contains(direct),
+                "the webview still invokes the direct route: {direct}"
+            );
+        }
+        // The desktop registers both scene commands the page names.
+        let desktop = include_str!("main.rs");
+        let handler = &desktop[desktop.find("tauri::generate_handler![").unwrap()..];
+        let handler = &handler[..handler.find("])").unwrap()];
+        assert!(handler.contains("render_native_portable_scene_camera_draw,"));
+        assert!(handler.contains("pick_native_portable_scene_annotation,"));
+    }
+
+    /// The scene render command, fed the request shape the webview builds, returns the payload
+    /// the webview's validator accepts (final, sRGB RGBA8, paired `rayDistanceF32` PFM of the
+    /// frame's extent), and its depth is the route frame's — the surface the pick command reads.
+    #[test]
+    #[ignore = "requires a local WGPU adapter"]
+    fn scene_render_command_payload_is_the_webview_contract_over_the_route_frame() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../test-data/cells3d-anisotropic.ome.zarr");
+        let mut session = LocalSession::default();
+        session.open_local_omezarr(&root).unwrap();
+        session.prepare_default_portable_image_layer().unwrap();
+        session.add_point_annotation("marker", [64, 64, 16]).unwrap();
+        // What `newvolimNativePortableDrawRequest` produces: a chunk region (irrelevant to the
+        // demand-driven frame) plus the canvas extent and camera.
+        let request = NativePortableDrawRequest {
+            origin_xyz: [1, 1, 1],
+            extent_xyz: [2, 2, 2],
+            width: 96,
+            height: 64,
+            orbit_x: 5,
+            orbit_y: -3,
+            zoom: 1.1,
+        };
+        let payload = render_native_portable_scene_camera_draw_for_session(request, &session).unwrap();
+        assert_eq!((payload.mime_type, payload.width, payload.height), ("image/png", 96, 64));
+        assert_eq!(payload.progress, FrameProgress::Final);
+        assert_eq!(payload.target.depth, DepthAttachment::RayDistanceF32);
+        assert_eq!(payload.target.color_format, ColorFormat::Rgba8Unorm);
+        assert_eq!(payload.target.color_encoding, ColorEncoding::Srgb);
+        assert!(payload.data_url.starts_with("data:image/png;base64,"));
+        let pfm = STANDARD
+            .decode(payload.ray_distance_pfm_base64.expect("scene payload carries the PFM"))
+            .unwrap();
+        // PFM as `palace_png` writes it: header, then rows bottom-to-top, little-endian f32.
+        let header = b"Pf\n96 64\n-1.0\n";
+        assert!(pfm.starts_with(header));
+        let body = &pfm[header.len()..];
+        assert_eq!(body.len(), 96 * 64 * 4);
+        let mut distances = body
+            .chunks_exact(4)
+            .map(|word| f32::from_le_bytes([word[0], word[1], word[2], word[3]]))
+            .collect::<Vec<_>>()
+            .chunks_exact(96)
+            .rev()
+            .flat_map(|row| row.to_vec())
+            .collect::<Vec<_>>();
+        let frame = scene_route_frame(&session, request).unwrap();
+        assert_eq!(frame.renderer, RouteRenderer::Demand);
+        assert_eq!(distances.len(), frame.attachments.first_opacity_distance.len());
+        assert_eq!(distances, frame.attachments.first_opacity_distance);
+        assert!(distances.iter().any(|distance| distance.is_finite()));
+        distances.clear();
+    }
+
+    /// The convention, stated as an invariant: the position an annotation is stored at for voxel
+    /// `i` (`voxel_to_world`, NGFF's `translation + i × scale`) is the *centre* of the cell the
+    /// layer box assigns to voxel `i` — so the sampling rule `floor((p - min) / extent × dims)`
+    /// reads voxel `i` there, on every axis, at any page origin, under anisotropic scale and
+    /// translation. A corner-based box puts it on the cell's edge instead.
+    #[test]
+    fn layer_world_box_centres_each_voxel_on_its_annotation_position() {
+        let transform =
+            newvolim_scene::LayerTransform::new([0.26, 0.5, 0.29], [10.0, -3.0, 7.25]).unwrap();
+        let origin = [5_u64, 0, 12];
+        let dimensions = [8_u32, 3, 4];
+        let (minimum, maximum) = layer_world_box(transform, origin, dimensions);
+        let corner = transform.voxel_to_world(origin.map(|v| v as f64 - 0.5));
+        for axis in 0..3 {
+            assert!((f64::from(minimum[axis]) - corner[axis]).abs() < 1e-5);
+        }
+        for x in 0..u64::from(dimensions[0]) {
+            for y in 0..u64::from(dimensions[1]) {
+                for z in 0..u64::from(dimensions[2]) {
+                    let voxel = [origin[0] + x, origin[1] + y, origin[2] + z];
+                    let placed = transform.voxel_to_world(voxel.map(|v| v as f64));
+                    for (axis, local) in [x, y, z].into_iter().enumerate() {
+                        let cell = (placed[axis] - f64::from(minimum[axis]))
+                            / f64::from(maximum[axis] - minimum[axis])
+                            * f64::from(dimensions[axis]);
+                        assert!(
+                            (cell - (local as f64 + 0.5)).abs() < 1e-4,
+                            "voxel {voxel:?} axis {axis}: annotation position falls at cell \
+                             coordinate {cell}, not the centre of cell {local}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// CPU oracle for picking against a route frame: the pixel's own ray and its own depth,
+    /// `+infinity` occluding nothing, and out-of-frame pixels refused.
+    #[test]
+    fn pick_in_route_frame_uses_the_pixels_own_ray_and_depth() {
+        let frame = RouteFrame {
+            attachments: palace_core::gpu::PortableFrameAttachments::new(
+                2,
+                1,
+                vec![0; 8],
+                vec![5.0, f32::INFINITY],
+            )
+            .unwrap(),
+            rays: vec![
+                newvolim_render::PickRay::new([0.0, 0.0, 0.0], [1.0, 0.0, 0.0]).unwrap(),
+                newvolim_render::PickRay::new([0.0, 10.0, 0.0], [1.0, 0.0, 0.0]).unwrap(),
+            ],
+            renderer: RouteRenderer::Native,
+        };
+        let point = |id: u64, at: [f64; 3]| {
+            Annotation::new(
+                newvolim_scene::AnnotationId(id),
+                "p",
+                newvolim_scene::AnnotationGeometry::Point(at),
+                [255, 216, 72],
+            )
+            .unwrap()
+        };
+        let near = point(1, [3.0, 0.0, 0.0]);
+        let behind = point(2, [7.0, 0.0, 0.0]);
+        let other_row = point(3, [7.0, 10.0, 0.0]);
+        let all = [near.clone(), behind.clone(), other_row.clone()];
+        let hit = pick_in_route_frame(&frame, 0, &all).unwrap().unwrap();
+        assert_eq!((hit.annotation_id, hit.distance), (1, 3.0));
+        assert_eq!(pick_in_route_frame(&frame, 0, &[behind]).unwrap(), None);
+        let hit = pick_in_route_frame(&frame, 1, &all).unwrap().unwrap();
+        assert_eq!((hit.annotation_id, hit.distance), (3, 7.0));
+        assert!(pick_in_route_frame(&frame, 2, &all).is_err());
+    }
+
+    /// Place a point annotation exactly on a physical world ray at `distance` from its origin
+    /// and return its id. The point is not rounded to a voxel: the pick tests reason about
+    /// distances of hundredths of a micron either side of a first-opacity surface, and the pick
+    /// itself compares the exact closest-approach distance against the frame's `f32` depth.
     fn place_on_ray(
         session: &mut LocalSession,
         label: &str,
@@ -4788,25 +5227,30 @@ mod tests {
         distance: f64,
     ) -> u64 {
         let physical = std::array::from_fn(|axis| origin[axis] + direction[axis] * distance);
-        let voxel = session.physical_point_voxel_xyz(physical).unwrap();
-        session.add_point_annotation(label, voxel).unwrap().id.0
+        session
+            .add_point_annotation_physical(label, physical)
+            .unwrap()
+            .id
+            .0
     }
 
     /// Entry and exit distances of a physical world ray through the fixture's level-zero box:
-    /// 128x128x32 voxels at 0.26x0.26x0.29 um with no translation, in the desktop's corner
-    /// convention.
+    /// 128x128x32 voxels at 0.26x0.26x0.29 um with no translation, voxel-centred (half a voxel
+    /// either side of the first and last voxel positions), as `layer_world_box` builds it.
     fn fixture_box_crossing(origin: [f64; 3], direction: [f64; 3]) -> Option<(f64, f64)> {
-        let maximum = [128.0 * 0.26, 128.0 * 0.26, 32.0 * 0.29];
+        let spacing = [0.26, 0.26, 0.29];
+        let minimum = spacing.map(|s| -0.5 * s);
+        let maximum = [127.5 * 0.26, 127.5 * 0.26, 31.5 * 0.29];
         let mut near = 0.0_f64;
         let mut far = f64::INFINITY;
         for axis in 0..3 {
             if direction[axis].abs() < 1e-12 {
-                if origin[axis] < 0.0 || origin[axis] > maximum[axis] {
+                if origin[axis] < minimum[axis] || origin[axis] > maximum[axis] {
                     return None;
                 }
                 continue;
             }
-            let first = -origin[axis] / direction[axis];
+            let first = (minimum[axis] - origin[axis]) / direction[axis];
             let second = (maximum[axis] - origin[axis]) / direction[axis];
             near = near.max(first.min(second));
             far = far.min(first.max(second));
@@ -4815,13 +5259,12 @@ mod tests {
     }
 
     /// The pixel whose ray leaves the most room on both sides of the route's first-opacity
-    /// surface inside the fixture box, with that ray and its entry/surface/exit distances. A
-    /// pick test needs room: an annotation in front must be clearly in front, one behind clearly
-    /// behind, after both are rounded to voxels. The annotations are placed at half the room, so
-    /// the margin against the surface is half the room too; requiring 0.6 um of room keeps that
-    /// margin above the 0.235 um rounding radius. The server's saturating transfer puts its
-    /// surface at the first non-zero voxel, typically well under a micron behind the entry
-    /// face, which is why the bound is not a full voxel-free micron.
+    /// surface inside the fixture box, with that ray and its entry/surface/exit distances. The
+    /// annotations are placed exactly on the ray at half the room, so the margin against the
+    /// surface is half the room; 0.02 um of room keeps that margin three orders above the
+    /// `f32` depth's resolution at these distances. Little room is the fixture's nature: its
+    /// volume begins at the entry face on nearly every ray, so a route sampling every 0.13 um
+    /// puts its surface 0.065 um in, and the server's saturating transfer under a voxel.
     fn roomiest_pixel(
         pixels: usize,
         ray: impl Fn(usize) -> ([f64; 3], [f64; 3]),
@@ -4845,8 +5288,8 @@ mod tests {
         let (pixel, origin, direction, near, surface, far, room) =
             best.expect("the fixture camera must find volume on at least one ray");
         assert!(
-            room >= 0.6,
-            "no ray has 0.6 um of room on both sides of its surface (best {room})"
+            room >= 0.02,
+            "no ray has 0.02 um of room on both sides of its surface (best {room})"
         );
         (pixel, origin, direction, near, surface, far)
     }

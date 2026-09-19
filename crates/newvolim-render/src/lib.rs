@@ -485,6 +485,12 @@ impl PortableSceneLayerInput {
     /// Return the physical-world ray interval intersecting this admitted local page. The ray is
     /// converted through the layer transform without normalizing the local direction, so the
     /// returned parameter remains directly comparable across transformed layers.
+    ///
+    /// The page's box is **voxel-centred**: local voxel `i` occupies `[i - 0.5, i + 0.5)`, so the
+    /// box runs from `-0.5` to `dimension - 0.5`. That is the NGFF and Palace convention —
+    /// index `i` sits at `translation + i × scale` — and the one annotations are placed with, so
+    /// an annotation at voxel `i` is drawn where voxel `i` is painted. Every renderer that
+    /// samples a page rounds a local coordinate to the nearest voxel accordingly.
     pub fn world_ray_interval(&self, ray: PortableWorldRay) -> Option<(f64, f64)> {
         let local = ray.to_layer(self.transform, self.voxel_origin_xyz);
         let mut entry = f64::NEG_INFINITY;
@@ -492,14 +498,15 @@ impl PortableSceneLayerInput {
         for axis in 0..3 {
             let origin = local.origin_xyz[axis];
             let direction = local.direction_xyz[axis];
-            let upper = f64::from(self.dimensions_xyz[axis]);
+            let lower = -0.5;
+            let upper = f64::from(self.dimensions_xyz[axis]) - 0.5;
             if direction.abs() < f64::EPSILON {
-                if origin < 0.0 || origin > upper {
+                if origin < lower || origin > upper {
                     return None;
                 }
                 continue;
             }
-            let first = -origin / direction;
+            let first = (lower - origin) / direction;
             let second = (upper - origin) / direction;
             entry = entry.max(first.min(second));
             exit = exit.min(first.max(second));
@@ -2609,11 +2616,13 @@ mod tests {
                 direction_xyz: [0.0, 0.0, 0.25],
             }
         );
+        // Voxel-centred box: the two local z voxels span [-0.5, 1.5], which at 0.25 local units
+        // per world unit is world [-2, 6] from this origin; the entry clamps to the ray's start.
         assert_eq!(
             scene.layers[1].world_ray_interval(
                 PortableWorldRay::new([25.0, 33.0, 35.0], [0.0, 0.0, 1.0]).unwrap(),
             ),
-            Some((0.0, 8.0))
+            Some((0.0, 6.0))
         );
         assert_eq!(
             scene.layers[1].world_ray_interval(

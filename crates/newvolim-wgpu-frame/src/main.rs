@@ -1897,9 +1897,11 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
     let base = frame.annotation_count * 13u + output_index * 6u;
     camera_origin = vec3f(bitcast<f32>(packet[base]), bitcast<f32>(packet[base + 1u]), bitcast<f32>(packet[base + 2u]));
     camera_direction = vec3f(bitcast<f32>(packet[base + 3u]), bitcast<f32>(packet[base + 4u]), bitcast<f32>(packet[base + 5u]));
-    let x_interval = slab_interval(camera_origin.x, camera_direction.x, 0.0, f32(frame.width));
-    let y_interval = slab_interval(camera_origin.y, camera_direction.y, 0.0, f32(frame.height));
-    let z_interval = slab_interval(camera_origin.z, camera_direction.z, 0.0, f32(frame.depth));
+    // Voxel-centred box: voxel i occupies [i - 0.5, i + 0.5), matching NGFF, Palace and the
+    // annotation placement convention.
+    let x_interval = slab_interval(camera_origin.x, camera_direction.x, -0.5, f32(frame.width) - 0.5);
+    let y_interval = slab_interval(camera_origin.y, camera_direction.y, -0.5, f32(frame.height) - 0.5);
+    let z_interval = slab_interval(camera_origin.z, camera_direction.z, -0.5, f32(frame.depth) - 0.5);
     camera_entry = max(0.0, max(x_interval.x, max(y_interval.x, z_interval.x)));
     camera_exit = min(x_interval.y, min(y_interval.y, z_interval.y));
     if (camera_exit > camera_entry) {
@@ -1916,9 +1918,9 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
       travelled = camera_entry + (f32(ray) + 0.5) * 0.5;
       if (travelled >= camera_exit) { break; }
       let position = camera_origin + camera_direction * travelled;
-      x = u32(clamp(floor(position.x), 0.0, f32(frame.width - 1u)));
-      y = u32(clamp(floor(position.y), 0.0, f32(frame.height - 1u)));
-      z = u32(clamp(floor(position.z), 0.0, f32(frame.depth - 1u)));
+      x = u32(clamp(floor(position.x + 0.5), 0.0, f32(frame.width - 1u)));
+      y = u32(clamp(floor(position.y + 0.5), 0.0, f32(frame.height - 1u)));
+      z = u32(clamp(floor(position.z + 0.5), 0.0, f32(frame.depth - 1u)));
     } else {
       if (frame.axis == 0u) { x = gid.x; y = gid.y; z = ray; }
       if (frame.axis == 1u) { x = gid.x; y = ray; z = gid.y; }
@@ -2038,8 +2040,9 @@ fn main(@builtin(global_invocation_id) gid: vec3u) {
         let voxel = (world - vec3f(layer.translation_x, layer.translation_y, layer.translation_z)) /
           vec3f(layer.scale_x, layer.scale_y, layer.scale_z) - vec3f(f32(layer.origin_x), f32(layer.origin_y), f32(layer.origin_z));
         var layer_colour = vec3f(0.0); var layer_opacity = 0.0;
-        if (all(voxel >= vec3f(0.0)) && voxel.x < f32(layer.width) && voxel.y < f32(layer.height) && voxel.z < f32(layer.depth)) {
-          let coordinate = vec3u(floor(voxel));
+        // Voxel-centred: nearest voxel, inside [-0.5, dimension - 0.5).
+        if (all(voxel >= vec3f(-0.5)) && voxel.x < f32(layer.width) - 0.5 && voxel.y < f32(layer.height) - 0.5 && voxel.z < f32(layer.depth) - 0.5) {
+          let coordinate = vec3u(floor(voxel + vec3f(0.5)));
           let voxel_index = coordinate.x + layer.width * (coordinate.y + layer.height * coordinate.z);
           for (var channel_index = 0u; channel_index < layer.channel_count; channel_index = channel_index + 1u) {
             let channel = scene.channels[layer.channel_offset + channel_index];
@@ -2447,9 +2450,11 @@ mod tests {
             ],
         )
         .unwrap();
+        // Voxel-centred box: the first layer's two z voxels span local [-0.5, 1.5], entered by
+        // a ray starting at z = -1 after 0.5 and left after 2.5.
         assert_eq!(
             portable_scene_ray_ranges(&camera).unwrap(),
-            vec![[1.0, 3.0]]
+            vec![[0.5, 2.5]]
         );
         let gpu_packet = prepare_portable_scene_gpu_packet(&camera).unwrap();
         assert_eq!(&gpu_packet.config[..5], &[1, 1, 2, 0.5_f32.to_bits(), 0]);
@@ -2457,8 +2462,8 @@ mod tests {
         assert_eq!(gpu_packet.page_table[0], 0);
         assert_eq!(gpu_packet.page_table[8], 1 << OFFSET_BITS);
         assert_eq!(gpu_packet.rays.len(), 8);
-        assert_eq!(f32::from_bits(gpu_packet.rays[6]), 1.0);
-        assert_eq!(f32::from_bits(gpu_packet.rays[7]), 3.0);
+        assert_eq!(f32::from_bits(gpu_packet.rays[6]), 0.5);
+        assert_eq!(f32::from_bits(gpu_packet.rays[7]), 2.5);
         scene.layers[1].voxel_origin_xyz = [u64::from(u32::MAX) + 1, 0, 0];
         assert!(pack_portable_scene_layers(&scene).is_err());
     }
@@ -2561,7 +2566,9 @@ mod tests {
             newvolim_render::NativePortableSceneDrawInput::new(scene, [1, 1], annotation_words)
                 .unwrap(),
             vec![
-                newvolim_render::PortableWorldRay::new([0.5, 0.5, -1.0], [0.0, 0.0, 1.0]).unwrap(),
+                // Through the single voxel's position: layer boxes are voxel-centred, so the voxel
+                // spans [-0.5, 0.5] and (0.5, 0.5) would sit on its edge.
+                newvolim_render::PortableWorldRay::new([0.0, 0.0, -1.0], [0.0, 0.0, 1.0]).unwrap(),
             ],
         )
         .unwrap();
@@ -2645,7 +2652,9 @@ mod tests {
         let camera = newvolim_render::NativePortableSceneCameraDrawInput::new(
             newvolim_render::NativePortableSceneDrawInput::new(scene, [1, 1], Vec::new()).unwrap(),
             vec![
-                newvolim_render::PortableWorldRay::new([0.5, 0.5, -1.0], [0.0, 0.0, 1.0]).unwrap(),
+                // Through the single voxel's position: layer boxes are voxel-centred, so the voxel
+                // spans [-0.5, 0.5] and (0.5, 0.5) would sit on its edge.
+                newvolim_render::PortableWorldRay::new([0.0, 0.0, -1.0], [0.0, 0.0, 1.0]).unwrap(),
             ],
         )
         .unwrap();
