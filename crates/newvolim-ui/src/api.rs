@@ -200,6 +200,27 @@ pub fn layers_url(origin: &str, dataset: &str) -> String {
     format!("{origin}/v1/datasets/{}/layers", encode_path(dataset))
 }
 
+/// Scene-wide settings of a dataset's session: `GET`/`POST /v1/datasets/{d}/settings`.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SceneSettings {
+    /// See-through depth: a multiplier on the opacity reference, 1 by default, 0.05..=20.
+    pub depth_scale: f32,
+}
+
+pub fn settings_url(origin: &str, dataset: &str) -> String {
+    format!("{origin}/v1/datasets/{}/settings", encode_path(dataset))
+}
+
+/// The depth slider is logarithmic: position −1..1 is scale 0.1..10.
+pub fn depth_scale_from_slider(position: f32) -> f32 {
+    10_f32.powf(position.clamp(-1.0, 1.0))
+}
+
+pub fn slider_from_depth_scale(scale: f32) -> f32 {
+    scale.max(1e-6).log10().clamp(-1.0, 1.0)
+}
+
 /// The client residency routes: the plan (JSON), the rays (binary words) and the chunk words
 /// (binary) for a camera; `levels` overrides the camera's level choice after a page-bound refusal.
 pub fn scene_plan_url(origin: &str, dataset: &str, width: u32, height: u32, orbit_x: i32, orbit_y: i32, zoom: f32, levels: Option<&[u32]>) -> String {
@@ -425,6 +446,17 @@ mod tests {
         assert_eq!(chunks_from_le_bytes(&bytes, 2).unwrap(), vec![vec![7, 9], vec![4]]);
         assert!(chunks_from_le_bytes(&bytes, 3).is_err());
         assert!(chunks_from_le_bytes(&bytes[..7], 1).is_err());
+    }
+
+    #[test]
+    fn settings_are_camel_case_and_the_depth_slider_is_logarithmic() {
+        assert_eq!(settings_url("http://h", "d"), "http://h/v1/datasets/d/settings");
+        assert_eq!(serde_json::to_value(SceneSettings { depth_scale: 2.5 }).unwrap(), serde_json::json!({"depthScale": 2.5}));
+        assert!((depth_scale_from_slider(0.0) - 1.0).abs() < 1e-6);
+        assert!((depth_scale_from_slider(1.0) - 10.0).abs() < 1e-5);
+        assert!((depth_scale_from_slider(-1.0) - 0.1).abs() < 1e-6);
+        assert!((slider_from_depth_scale(depth_scale_from_slider(0.3)) - 0.3).abs() < 1e-5);
+        assert_eq!(slider_from_depth_scale(1000.0), 1.0, "clamped into the slider");
     }
 
     #[test]

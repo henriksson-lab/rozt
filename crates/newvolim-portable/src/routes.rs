@@ -808,7 +808,7 @@ pub fn render_palace_portable_camera_draw(
         )
         .ok_or_else(|| "portable Palace DVR raymarch input is not admitted".to_owned())?;
     let transfer = palace_transfer_from_native_camera(input)?;
-    let opacity_reference = portable_opacity_reference(std::array::from_fn(|axis| {
+    let opacity_reference = scene_opacity_reference(session, std::array::from_fn(|axis| {
         (level.maximum()[axis] - level.minimum()[axis]).abs()
     }))?;
     // The oracle is the fallback, not a preamble: this path has local-adapter parity, so rendering
@@ -1833,7 +1833,7 @@ pub fn prepare_demand_scene(
         .iter()
         .map(|layer| demand_scene_step_size(layer.transform))
         .fold(f32::INFINITY, f32::min);
-    let opacity_reference = portable_opacity_reference(std::array::from_fn(|axis| {
+    let opacity_reference = scene_opacity_reference(session, std::array::from_fn(|axis| {
         (scene_maximum[axis] - scene_minimum[axis]).abs()
     }))?;
 
@@ -2420,6 +2420,13 @@ pub fn demand_scene_layer_level(
     u32::try_from(selected).map_err(|_| "selected level does not fit the wire contract".to_owned())
 }
 
+/// The scene's opacity reference: the geometric default scaled by the session's depth scale,
+/// so both the demand route and the direct route see through the volume as far as the user
+/// asked. Every frame route takes its reference from here.
+pub fn scene_opacity_reference(session: &LocalSession, extent_physical: [f32; 3]) -> Result<f32, String> {
+    Ok(portable_opacity_reference(extent_physical)? * session.depth_scale())
+}
+
 pub fn portable_opacity_reference(extent_physical: [f32; 3]) -> Result<f32, String> {
     let diagonal = extent_physical
         .iter()
@@ -2868,6 +2875,56 @@ pub fn portable_scene_world_rays(
 mod tests {
     use super::*;
     use palace_frame::render_local_zarr_with_camera_attachments;
+
+    /// The depth scale multiplies the opacity reference every route renders with: the plan the
+    /// browser receives and the reference the direct route computes both scale by it, and the
+    /// session refuses a scale outside its bounds.
+    #[test]
+    fn depth_scale_multiplies_the_opacity_reference_of_every_route() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../test-data/cells3d-anisotropic.ome.zarr");
+        let mut session = LocalSession::default();
+        session.open_local_omezarr(&root).unwrap();
+        session.prepare_default_portable_image_layer().unwrap();
+        let request = NativePortableDrawRequest { origin_xyz: [0; 3], extent_xyz: [1; 3], width: 32, height: 24, orbit_x: 0, orbit_y: 0, zoom: 1.0 };
+        let (plan_at_one, _) = demand_scene_plan(&session, request, None).unwrap();
+        let direct_at_one = scene_opacity_reference(&session, [3.0, 4.0, 12.0]).unwrap();
+        assert!((direct_at_one - 13.0 / 256.0).abs() < 1e-6, "diagonal / 256 at scale 1: {direct_at_one}");
+        assert_eq!(session.depth_scale(), 1.0);
+        session.set_depth_scale(4.0).unwrap();
+        let (plan_at_four, _) = demand_scene_plan(&session, request, None).unwrap();
+        assert!((plan_at_four.opacity_reference / plan_at_one.opacity_reference - 4.0).abs() < 1e-5, "{} vs {}", plan_at_four.opacity_reference, plan_at_one.opacity_reference);
+        assert!((scene_opacity_reference(&session, [3.0, 4.0, 12.0]).unwrap() / direct_at_one - 4.0).abs() < 1e-5);
+        for bad in [0.0, -1.0, f32::NAN, f32::INFINITY, 100.0] {
+            assert!(session.set_depth_scale(bad).is_err(), "{bad} accepted");
+        }
+        assert_eq!(session.depth_scale(), 4.0, "a refused scale leaves the old one");
+    }
+
+    /// Seen through the demand route on the adapter: a larger depth scale lets light through
+    /// deeper, so the accumulated opacity over the frame falls while the set of pixels that hit
+    /// the volume at all stays the same.
+    #[test]
+    #[ignore = "requires a local WGPU adapter"]
+    fn depth_scale_lets_light_through_deeper_on_the_adapter() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../test-data/cells3d-anisotropic.ome.zarr");
+        let mut session = LocalSession::default();
+        session.open_local_omezarr(&root).unwrap();
+        session.prepare_default_portable_image_layer().unwrap();
+        let request = NativePortableDrawRequest { origin_xyz: [0; 3], extent_xyz: [1; 3], width: 64, height: 48, orbit_x: 20, orbit_y: -10, zoom: 1.0 };
+        let mut alphas = Vec::new();
+        let mut hit_sets = Vec::new();
+        for scale in [0.25_f32, 1.0, 4.0] {
+            session.set_depth_scale(scale).unwrap();
+            let (frame, _) = demand_driven_scene_camera_draw_with_rays(&session, request).unwrap();
+            let alpha: f64 = frame.rgba.chunks_exact(4).map(|px| px[3] as f64).sum::<f64>() / (64.0 * 48.0);
+            alphas.push(alpha);
+            hit_sets.push(frame.first_opacity_distance.iter().map(|d| d.is_finite()).collect::<Vec<_>>());
+        }
+        assert!(alphas[0] > alphas[1] && alphas[1] > alphas[2], "mean alpha must fall with depth scale: {alphas:?}");
+        assert_eq!(hit_sets[0], hit_sets[1]);
+        assert_eq!(hit_sets[1], hit_sets[2]);
+        eprintln!("mean alpha at scale 0.25 / 1 / 4: {alphas:?}");
+    }
 
     /// The client residency loop assembles, from the plan and fetched chunk words alone, the
     /// same nine bindings the server's demand route packs for the same demanded chunks —

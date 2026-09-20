@@ -152,6 +152,20 @@ impl SessionStore {
     }
 
     /// Apply one channel edit to the dataset's session and return every layer's channels.
+    /// Set the dataset session's see-through depth scale; returns the settings as stored.
+    fn set_depth_scale(&self, dataset: &str, root: &Path, scale: f32) -> Result<SceneSettings, String> {
+        self.session_for(dataset, root)?;
+        let mut sessions = self
+            .sessions
+            .lock()
+            .map_err(|_| "portable session store lock was poisoned".to_owned())?;
+        let session = sessions
+            .get_mut(dataset)
+            .ok_or_else(|| "session vanished while setting the depth scale".to_owned())?;
+        session.set_depth_scale(scale).map_err(|error| error.to_string())?;
+        Ok(SceneSettings { depth_scale: session.depth_scale() })
+    }
+
     fn set_channel_state(
         &self,
         dataset: &str,
@@ -430,6 +444,10 @@ fn app_router(
             get(dataset_channels).post(set_dataset_channel),
         )
         .route("/v1/datasets/{dataset}/layers", post(add_dataset_layer))
+        .route(
+            "/v1/datasets/{dataset}/settings",
+            get(dataset_settings).post(set_dataset_settings),
+        )
         .route("/v1/datasets/{dataset}/portable/scene", get(browser_scene))
         .route("/v1/datasets/{dataset}/portable/plan", get(browser_scene_plan))
         .route("/v1/datasets/{dataset}/portable/rays", get(browser_scene_rays))
@@ -493,6 +511,40 @@ async fn dataset_channels(
         .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "session task failed".to_owned()))?
         .map_err(|message| (StatusCode::BAD_REQUEST, message))?;
     Ok(Json(session.layer_channels()))
+}
+
+/// Scene-wide render settings of a dataset's session.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SceneSettings {
+    /// See-through depth: a multiplier on the opacity reference, 1 by default.
+    depth_scale: f32,
+}
+
+async fn dataset_settings(
+    State(state): State<AppState>,
+    AxumPath(dataset): AxumPath<String>,
+) -> Result<Json<SceneSettings>, (StatusCode, String)> {
+    let root = resolve_frame_dataset(&state.datasets, &dataset)?;
+    let session = tokio::task::spawn_blocking(move || state.sessions.session_for(&dataset, &root))
+        .await
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "session task failed".to_owned()))?
+        .map_err(|message| (StatusCode::BAD_REQUEST, message))?;
+    Ok(Json(SceneSettings { depth_scale: session.depth_scale() }))
+}
+
+async fn set_dataset_settings(
+    State(state): State<AppState>,
+    AxumPath(dataset): AxumPath<String>,
+    Json(settings): Json<SceneSettings>,
+) -> Result<Json<SceneSettings>, (StatusCode, String)> {
+    let root = resolve_frame_dataset(&state.datasets, &dataset)?;
+    let sessions = state.sessions.clone();
+    tokio::task::spawn_blocking(move || sessions.set_depth_scale(&dataset, &root, settings.depth_scale))
+        .await
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "settings task failed".to_owned()))?
+        .map_err(|message| (StatusCode::BAD_REQUEST, message))
+        .map(Json)
 }
 
 /// The camera for a browser scene packet; the same controls a frame request carries.
@@ -2326,6 +2378,51 @@ mod tests {
         let bare = app_router(state(), vec![], None);
         let (status, _, _) = get(bare, "/").await;
         assert_eq!(status, StatusCode::NOT_FOUND, "no page without --page-dir");
+    }
+
+    /// The settings route reads and writes the session's depth scale, refuses a scale outside
+    /// the session's bounds without changing it, and the scale then reaches the browser plan.
+    #[tokio::test]
+    async fn settings_route_sets_the_depth_scale_the_plan_renders_with() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../test-data/cells3d-anisotropic.ome.zarr")
+            .canonicalize()
+            .unwrap();
+        let (render_queue, _receiver) = mpsc::channel(1);
+        let state = AppState {
+            datasets: Arc::new(HashMap::from([("cells3d".to_owned(), root)])),
+            render_queue,
+            next_session_id: Arc::new(AtomicU64::new(1)),
+            sessions: SessionStore::default(),
+        };
+        let app = app_router(state, vec![], None);
+        let call = |app: Router, method: &str, uri: &str, body: Option<String>| {
+            let mut request = Request::builder().method(method).uri(uri);
+            if body.is_some() {
+                request = request.header(header::CONTENT_TYPE, "application/json");
+            }
+            let request = request.body(body.map(Body::from).unwrap_or_else(Body::empty)).unwrap();
+            async move {
+                let response = app.oneshot(request).await.unwrap();
+                let status = response.status();
+                let bytes = axum::body::to_bytes(response.into_body(), 1 << 24).await.unwrap();
+                (status, String::from_utf8_lossy(&bytes).into_owned())
+            }
+        };
+        let (status, body) = call(app.clone(), "GET", "/v1/datasets/cells3d/settings", None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&body).unwrap(), serde_json::json!({"depthScale": 1.0}));
+        let plan_at_one: serde_json::Value = serde_json::from_str(&call(app.clone(), "GET", "/v1/datasets/cells3d/portable/plan?width=32&height=24", None).await.1).unwrap();
+        let (status, body) = call(app.clone(), "POST", "/v1/datasets/cells3d/settings", Some(r#"{"depthScale": 2.5}"#.into())).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&body).unwrap(), serde_json::json!({"depthScale": 2.5}));
+        let (status, body) = call(app.clone(), "POST", "/v1/datasets/cells3d/settings", Some(r#"{"depthScale": 0}"#.into())).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        let (_, body) = call(app.clone(), "GET", "/v1/datasets/cells3d/settings", None).await;
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&body).unwrap()["depthScale"], 2.5, "a refused write leaves the old scale");
+        let plan_at_two_and_a_half: serde_json::Value = serde_json::from_str(&call(app, "GET", "/v1/datasets/cells3d/portable/plan?width=32&height=24", None).await.1).unwrap();
+        let ratio = plan_at_two_and_a_half["opacityReference"].as_f64().unwrap() / plan_at_one["opacityReference"].as_f64().unwrap();
+        assert!((ratio - 2.5).abs() < 1e-4, "the plan's opacity reference scales: {ratio}");
     }
 
     #[tokio::test]

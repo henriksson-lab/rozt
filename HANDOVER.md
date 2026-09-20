@@ -56,6 +56,14 @@ demand route now coarsens its level instead of refusing panes larger than ~256 p
 `crates/newvolim-ui` (no `wasm-opt` offline; `data-wasm-opt="0"`). Verify in a browser with
 the other repo's CDP driver (`scratchpad/shoot.py` pattern), not with `--virtual-time-budget`.
 
+**See-through depth:** `LocalSession::depth_scale` multiplies the opacity reference of every
+route; `GET/POST /v1/datasets/{d}/settings {depthScale}`; the page's "Scene → Depth" slider
+(STAGE0 "See-through depth").
+
+**Slice panes** pan by drag and zoom by wheel about the cursor; the crosshair is the pane's centre
+(`focus`, continuous; `crosshair` its floor) and is not drawn (STAGE0 "Slice panes are 2-D
+cameras"). Depth moves via the axis sliders, the orientation box or another pane's pan.
+
 **Camera:** `orbit_delta` is `[dx, dy]` of a screen drag and `camera_for_volume` (palace-frame)
 is a turntable — `dx` spins about the volume's vertical axis at 0.01 rad/px, `dy` tilts,
 clamped to ±89°. It replaced Palace's additive `pan_around` nudge, which also read the drag in

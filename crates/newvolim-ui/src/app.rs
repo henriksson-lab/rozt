@@ -149,7 +149,16 @@ pub struct Session {
     pub dataset: RwSignal<Option<String>>,
     pub layers: RwSignal<Vec<LayerChannelSummary>>,
     pub voxel_shape: RwSignal<Option<[u32; 3]>>,
+    /// The voxel at the centre of every slice pane: the integer crosshair the slices are cut
+    /// at, derived from `focus`.
     pub crosshair: RwSignal<[u32; 3]>,
+    /// The point at the centre of the slice panes, in voxels, continuous so a pan is smooth;
+    /// `crosshair` is its floor.
+    pub focus: RwSignal<[f64; 3]>,
+    /// Zoom of the XY, XZ and YZ panes over their slice: 1 fits the whole slice.
+    pub zoom_2d: RwSignal<[f64; 3]>,
+    /// Bumped on window resize so pane geometry recomputes.
+    pub layout_tick: RwSignal<u32>,
     pub camera: RwSignal<Camera>,
     pub view_mode: RwSignal<ViewMode>,
     pub renderer: RwSignal<Renderer>,
@@ -172,6 +181,11 @@ pub struct Session {
     browser_dirty: StoredValue<bool>,
     channel_inflight: StoredValue<bool>,
     channel_dirty: StoredValue<Option<ChannelEdit>>,
+    /// Scene-wide see-through depth (the server's `depthScale`), shown at once and sent
+    /// latest-only.
+    pub depth_scale: RwSignal<f32>,
+    settings_inflight: StoredValue<bool>,
+    settings_dirty: StoredValue<Option<f32>>,
     /// The browser renderer's chunk cache, kept across frames (taken during a frame).
     chunk_cache: StoredValue<Option<newvolim_residency::ChunkCache>>,
     volume_canvas: NodeRef<leptos::html::Canvas>,
@@ -190,6 +204,9 @@ impl Session {
             layers: RwSignal::new(Vec::new()),
             voxel_shape: RwSignal::new(None),
             crosshair: RwSignal::new([0; 3]),
+            focus: RwSignal::new([0.0; 3]),
+            zoom_2d: RwSignal::new([1.0; 3]),
+            layout_tick: RwSignal::new(0),
             camera: RwSignal::new(Camera::default()),
             view_mode: RwSignal::new(ViewMode::Grid),
             renderer: RwSignal::new(Renderer::Server),
@@ -210,6 +227,9 @@ impl Session {
             browser_dirty: StoredValue::new(false),
             channel_inflight: StoredValue::new(false),
             channel_dirty: StoredValue::new(None),
+            depth_scale: RwSignal::new(1.0),
+            settings_inflight: StoredValue::new(false),
+            settings_dirty: StoredValue::new(None),
             chunk_cache: StoredValue::new(None),
             volume_canvas: NodeRef::new(),
             volume_pane: NodeRef::new(),
@@ -227,7 +247,8 @@ impl Session {
         let busy = self.volume_inflight.get_value().is_some()
             || self.ortho_inflight.get_value().is_some()
             || self.browser_busy.get_value()
-            || self.channel_inflight.get_value();
+            || self.channel_inflight.get_value()
+            || self.settings_inflight.get_value();
         self.busy.set(busy);
     }
 
@@ -267,6 +288,7 @@ impl Session {
         self.error.set(None);
         self.status.set(format!("Opening {name}…"));
         self.refresh_layers();
+        self.refresh_settings();
         self.open_socket();
         // The panes mount on the next frame; ask for the first frames at their real sizes. The
         // first orthogonal reply brings the voxel shape and a centred crosshair.
@@ -301,6 +323,53 @@ impl Session {
             match get_json::<Vec<LayerChannelSummary>>(&url).await {
                 Ok(layers) => self.layers.set(layers),
                 Err(message) => self.fail(message),
+            }
+        });
+    }
+
+    fn refresh_settings(self) {
+        let Some(dataset) = self.dataset.get() else { return };
+        let url = settings_url(&self.origin.get(), &dataset);
+        spawn_local(async move {
+            match get_json::<SceneSettings>(&url).await {
+                Ok(settings) => self.depth_scale.set(settings.depth_scale),
+                Err(message) => self.fail(message),
+            }
+        });
+    }
+
+    /// The see-through depth: shown at once, sent latest-only, then the volume follows.
+    pub fn set_depth_scale(self, scale: f32) {
+        self.depth_scale.set(scale);
+        if self.settings_inflight.get_value() {
+            self.settings_dirty.set_value(Some(scale));
+            return;
+        }
+        self.post_depth_scale(scale);
+    }
+
+    fn post_depth_scale(self, scale: f32) {
+        let Some(dataset) = self.dataset.get_untracked() else { return };
+        let url = settings_url(&self.origin.get_untracked(), &dataset);
+        self.settings_inflight.set_value(true);
+        self.update_busy();
+        spawn_local(async move {
+            match post_json::<SceneSettings, _>(&url, &SceneSettings { depth_scale: scale }).await {
+                Ok(settings) => {
+                    if self.settings_dirty.get_value().is_none() {
+                        self.depth_scale.set(settings.depth_scale);
+                    }
+                    self.error.set(None);
+                }
+                Err(message) => self.fail(message),
+            }
+            self.settings_inflight.set_value(false);
+            self.update_busy();
+            if let Some(next) = self.settings_dirty.get_value() {
+                self.settings_dirty.set_value(None);
+                self.post_depth_scale(next);
+            } else {
+                self.request_volume();
             }
         });
     }
@@ -573,8 +642,10 @@ impl Session {
                     self.ortho_inflight.set_value(None);
                     let first = self.voxel_shape.get_untracked().is_none();
                     self.voxel_shape.set(Some(voxel_shape_xyz));
-                    if first || !self.ortho_dirty.get_value() {
+                    if first {
                         self.crosshair.set(crosshair_xyz);
+                        self.focus.set(crosshair_xyz.map(|v| v as f64 + 0.5));
+                        self.zoom_2d.set([1.0; 3]);
                     }
                     self.slices.set(Some(Slices {
                         xy: format!("data:image/png;base64,{xy_base64}"),
@@ -603,11 +674,27 @@ impl Session {
         }
     }
 
+    /// Move the crosshair to a voxel (from the sliders or the orientation box): the focus goes
+    /// to that voxel's centre.
     pub fn move_crosshair(self, next: [u32; 3]) {
         let Some(shape) = self.voxel_shape.get_untracked() else { return };
         let clamped = [next[0].min(shape[0].saturating_sub(1)), next[1].min(shape[1].saturating_sub(1)), next[2].min(shape[2].saturating_sub(1))];
+        self.focus.set(clamped.map(|v| v as f64 + 0.5));
         if clamped != self.crosshair.get_untracked() {
             self.crosshair.set(clamped);
+            self.request_orthogonal();
+        }
+    }
+
+    /// Move the focus continuously (a pan): the crosshair follows as its floor, and the slices
+    /// are re-cut only when that integer changes.
+    pub fn set_focus(self, next: [f64; 3]) {
+        let Some(shape) = self.voxel_shape.get_untracked() else { return };
+        let clamped: [f64; 3] = std::array::from_fn(|axis| next[axis].clamp(0.0, shape[axis].max(1) as f64));
+        self.focus.set(clamped);
+        let crosshair: [u32; 3] = std::array::from_fn(|axis| (clamped[axis].floor() as u32).min(shape[axis].saturating_sub(1)));
+        if crosshair != self.crosshair.get_untracked() {
+            self.crosshair.set(crosshair);
             self.request_orthogonal();
         }
     }
@@ -636,6 +723,7 @@ impl Session {
     pub fn set_view_mode(self, mode: ViewMode) {
         self.notice.set(None);
         self.view_mode.set(mode);
+        self.layout_tick.update(|tick| *tick += 1);
         // Pane sizes changed with the layout; render both at their new sizes.
         request_animation_frame(move || {
             self.request_orthogonal();
@@ -844,17 +932,6 @@ fn physical_size(element: &web_sys::Element) -> (u32, u32) {
     (size(element.client_width()), size(element.client_height()))
 }
 
-fn pointer_fraction(event: &web_sys::MouseEvent) -> Option<(f64, f64)> {
-    let target = event.current_target()?.dyn_into::<web_sys::Element>().ok()?;
-    let rect = target.get_bounding_client_rect();
-    if rect.width() <= 0.0 || rect.height() <= 0.0 {
-        return None;
-    }
-    Some((
-        ((event.client_x() as f64 - rect.left()) / rect.width()).clamp(0.0, 1.0),
-        ((event.client_y() as f64 - rect.top()) / rect.height()).clamp(0.0, 1.0),
-    ))
-}
 
 // ---- components ---------------------------------------------------------------------------
 
@@ -864,6 +941,7 @@ pub fn App() -> impl IntoView {
     provide_context(session);
     session.connect();
     window_event_listener(leptos::ev::resize, move |_| {
+        session.layout_tick.update(|tick| *tick += 1);
         if session.dataset.get_untracked().is_some() {
             session.request_orthogonal();
             session.request_volume();
@@ -1010,16 +1088,20 @@ fn ViewerShell() -> impl IntoView {
     }
 }
 
+/// One slice pane as a 2-D camera: the slice image is placed so the session's focus sits at
+/// the pane's centre at the pane's zoom; drag pans (moving the focus, hence the other panes'
+/// cuts), wheel zooms about the cursor. The crosshair is implicit — the centre — and not drawn.
 #[component]
 fn OrthoPane(plane: Plane) -> impl IntoView {
     let session = expect_context::<Session>();
-    let (h_axis, v_axis, depth_axis) = plane.axes();
-    let hidden = move || !session.view_mode.get().shows_plane(plane);
-    let fraction = move |axis: usize| {
-        let shape = session.voxel_shape.get().unwrap_or([1; 3]);
-        let at = session.crosshair.get()[axis] as f64 + 0.5;
-        format!("{}%", (at / shape[axis].max(1) as f64 * 100.0).clamp(0.0, 100.0))
+    let (h_axis, v_axis, _) = plane.axes();
+    let pane_index = match plane {
+        Plane::Xy => 0,
+        Plane::Xz => 1,
+        Plane::Yz => 2,
     };
+    let node_ref = session.ortho_panes[pane_index];
+    let hidden = move || !session.view_mode.get().shows_plane(plane);
     let image = move || {
         session.slices.get().map(|slices| match plane {
             Plane::Xy => slices.xy,
@@ -1027,35 +1109,99 @@ fn OrthoPane(plane: Plane) -> impl IntoView {
             Plane::Yz => slices.yz,
         })
     };
-    let on_click = move |ev: web_sys::MouseEvent| {
-        let Some(shape) = session.voxel_shape.get_untracked() else { return };
-        let Some((fx, fy)) = pointer_fraction(&ev) else { return };
-        let mut next = session.crosshair.get_untracked();
-        next[h_axis] = ((fx * shape[h_axis] as f64).floor() as u32).min(shape[h_axis].saturating_sub(1));
-        next[v_axis] = ((fy * shape[v_axis] as f64).floor() as u32).min(shape[v_axis].saturating_sub(1));
-        session.move_crosshair(next);
+    // The pane's size in CSS pixels and the scale from voxels to pixels at zoom 1 (the whole
+    // slice fits, square voxels).
+    let geometry = move || -> Option<(f64, f64, f64)> {
+        let _ = session.layout_tick.get();
+        let pane = node_ref.get()?;
+        let rect = pane.get_bounding_client_rect();
+        let shape = session.voxel_shape.get()?;
+        let dims = (shape[h_axis].max(1) as f64, shape[v_axis].max(1) as f64);
+        let fit = (rect.width() / dims.0).min(rect.height() / dims.1);
+        (fit.is_finite() && fit > 0.0).then_some((rect.width(), rect.height(), fit))
     };
+    let placement = move || -> Option<(f64, f64, f64, f64)> {
+        let (width, height, fit) = geometry()?;
+        let shape = session.voxel_shape.get()?;
+        let scale = fit * session.zoom_2d.get()[pane_index];
+        let focus = session.focus.get();
+        Some((
+            width * 0.5 - focus[h_axis] * scale,
+            height * 0.5 - focus[v_axis] * scale,
+            shape[h_axis] as f64 * scale,
+            shape[v_axis] as f64 * scale,
+        ))
+    };
+    let last = StoredValue::new(None::<(i32, i32)>);
+    let on_down = move |ev: web_sys::PointerEvent| {
+        if ev.button() != 0 {
+            return;
+        }
+        last.set_value(Some((ev.client_x(), ev.client_y())));
+        if let Some(target) = ev.current_target().and_then(|t| t.dyn_into::<web_sys::Element>().ok()) {
+            let _ = target.set_pointer_capture(ev.pointer_id());
+        }
+    };
+    let on_move = move |ev: web_sys::PointerEvent| {
+        let Some((lx, ly)) = last.get_value() else { return };
+        if ev.buttons() & 1 == 0 {
+            return;
+        }
+        let (x, y) = (ev.client_x(), ev.client_y());
+        last.set_value(Some((x, y)));
+        let Some((_, _, fit)) = geometry() else { return };
+        let scale = fit * session.zoom_2d.get_untracked()[pane_index];
+        let mut focus = session.focus.get_untracked();
+        focus[h_axis] -= (x - lx) as f64 / scale;
+        focus[v_axis] -= (y - ly) as f64 / scale;
+        session.set_focus(focus);
+    };
+    let on_up = move |_: web_sys::PointerEvent| last.set_value(None);
     let on_wheel = move |ev: web_sys::WheelEvent| {
         ev.prevent_default();
-        let mut next = session.crosshair.get_untracked();
-        let step = if ev.delta_y() > 0.0 { 1 } else { -1 };
-        next[depth_axis] = (next[depth_axis] as i64 + step).max(0) as u32;
-        session.move_crosshair(next);
+        let Some((width, height, fit)) = geometry() else { return };
+        let Some(pane) = node_ref.get_untracked() else { return };
+        let rect = pane.get_bounding_client_rect();
+        let cursor = (ev.client_x() as f64 - rect.left() - width * 0.5, ev.client_y() as f64 - rect.top() - height * 0.5);
+        let old_zoom = session.zoom_2d.get_untracked()[pane_index];
+        let new_zoom = (old_zoom * (1.0 - ev.delta_y() * 0.001)).clamp(0.25, 64.0);
+        // The voxel under the cursor stays under the cursor.
+        let (old_scale, new_scale) = (fit * old_zoom, fit * new_zoom);
+        let mut focus = session.focus.get_untracked();
+        focus[h_axis] += cursor.0 / old_scale - cursor.0 / new_scale;
+        focus[v_axis] += cursor.1 / old_scale - cursor.1 / new_scale;
+        session.zoom_2d.update(|zoom| zoom[pane_index] = new_zoom);
+        session.set_focus(focus);
     };
-    let node_ref = session.ortho_panes[match plane {
-        Plane::Xy => 0,
-        Plane::Xz => 1,
-        Plane::Yz => 2,
-    }];
     view! {
-        <div class="pane ortho" class:hidden-pane=hidden node_ref=node_ref on:click=on_click on:wheel=on_wheel>
-            {move || match image() {
-                Some(src) => view! { <img class="pane-image" src=src alt=plane.label() draggable="false"/> }.into_any(),
-                None => view! { <div class="pane-empty">"waiting for slices…"</div> }.into_any(),
+        <div
+            class="pane ortho"
+            class:hidden-pane=hidden
+            node_ref=node_ref
+            on:pointerdown=on_down
+            on:pointermove=on_move
+            on:pointerup=on_up
+            on:pointercancel=on_up
+            on:wheel=on_wheel
+        >
+            {move || match (image(), placement()) {
+                (Some(src), Some((left, top, width, height))) => view! {
+                    <img
+                        class="slice-image"
+                        src=src
+                        alt=plane.label()
+                        draggable="false"
+                        style:left=format!("{left}px")
+                        style:top=format!("{top}px")
+                        style:width=format!("{width}px")
+                        style:height=format!("{height}px")
+                    />
+                }.into_any(),
+                (Some(src), None) => view! { <img class="pane-image" src=src alt=plane.label() draggable="false"/> }.into_any(),
+                (None, _) => view! { <div class="pane-empty">"waiting for slices…"</div> }.into_any(),
             }}
-            <div class="crosshair-v" style:left=move || fraction(h_axis)></div>
-            <div class="crosshair-h" style:top=move || fraction(v_axis)></div>
             <span class="pane-label">{plane.label()}</span>
+            <span class="pane-zoom">{move || format!("{:.2}×", session.zoom_2d.get()[pane_index])}</span>
         </div>
     }
 }
@@ -1295,6 +1441,26 @@ fn Sidebar() -> impl IntoView {
             <Show when=move || session.layers.get().is_empty()>
                 <div class="hint">"No image layers yet."</div>
             </Show>
+            <div class="layer-block">
+                <h3>"Scene"</h3>
+                <div class="slider-row" title="How far light penetrates: a multiplier on the distance over which an opaque voxel absorbs everything (the scene diagonal / 256 at 1×). Larger sees deeper.">
+                    <span>"Depth"</span>
+                    <input
+                        type="range"
+                        min="-1"
+                        max="1"
+                        step="0.02"
+                        prop:value=move || slider_from_depth_scale(session.depth_scale.get()).to_string()
+                        on:input=move |ev| {
+                            if let Ok(position) = event_target_value(&ev).parse::<f32>() {
+                                session.set_depth_scale(depth_scale_from_slider(position));
+                            }
+                        }
+                    />
+                    <span class="slider-value">{move || format!("{:.2}×", session.depth_scale.get())}</span>
+                </div>
+                <div class="hint">"Each channel's window start is its transparency cutoff and its opacity scales alpha; depth changes how far the ray sees before it saturates."</div>
+            </div>
             <div class="layer-block add-layer">
                 <h3>"Add layer"</h3>
                 <div class="row">

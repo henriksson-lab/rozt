@@ -5642,3 +5642,64 @@ leaving the 3D pane empty.
 page from the camera would leave only chunks and an 8 KB plan on the wire. GPU buffers are
 recreated per pass. Only image layers; the per-pass fetch is serial per (layer, level,
 channel) group.
+
+## Slice panes are 2-D cameras (2026-09-20)
+
+The user: wheel in a slice pane should zoom, not step the third axis, and the drawn red
+crosshair is the wrong model — the crosshair is implicitly the centre of the pane, and the pane
+should pan. Done as in `omezarr_viewers-rs`:
+
+- The session holds a continuous `focus` (voxels) and a per-pane `zoom_2d`; the integer
+  `crosshair` the slices are cut at is the focus's floor, and the slices are re-requested only
+  when that integer changes. Each slice image is placed so the focus sits at the pane's centre
+  at `fit × zoom` pixels per voxel (square voxels; the whole slice fits at zoom 1).
+- Drag pans the focus along the pane's two axes, which moves the other two panes' cuts.
+  Wheel zooms about the cursor (the voxel under it stays put), 0.25×–64×; the zoom is shown in
+  the pane's corner. The depth axis moves through the axis sliders, the orientation box or a
+  pan in another pane. No crosshair lines are drawn.
+
+### Evidence
+
+- Live, release server, Chrome over CDP on the IDR image: a 100×40 px drag in XY moved the
+  crosshair from (135, 137, 118) to (67, 110, 118) — the slice is 1.48 px per voxel, so 68 and
+  27 voxels — and the image moved by exactly the drag; a wheel of −500 zoomed XY to 1.50× with
+  the image growing from 400.6 to 600.9 px wide; a 60 px upward drag in XZ moved z from 118 to
+  153 and re-cut the XY slice; the page contains no crosshair elements
+  (`scratchpad/pan-zoom.png`, `pan-xz.png`).
+- The pane logic is DOM-bound (`app.rs`), so it is verified by the driven browser above; the
+  native suites are unchanged (ui 10).
+
+## See-through depth (2026-09-20)
+
+The user asked how transparency is handled and whether a slider is needed. How it works: a
+sample's alpha is the channel's linear window ramp times its opacity; that alpha is
+step-corrected as `1 − (1 − a)^(step / opacity_reference)` (Beer-Lambert), the reference being
+the scene diagonal / 256; channels and layers composite front to back and the ray stops at
+0.95. The per-channel opacity scales alpha linearly, so it cannot make a ray see much deeper;
+the reference can, exponentially, and it was hard-coded.
+
+Now: `LocalSession::depth_scale` (`DepthScale`, 0.05..=20, default 1), a multiplier on the
+opacity reference in `scene_opacity_reference`, which both the demand route and the direct
+route take their reference from (so the browser plan carries it too). Server:
+`GET`/`POST /v1/datasets/{d}/settings` with `{depthScale}`. Page: a "Scene" block in the
+sidebar with a logarithmic Depth slider (0.1×–10×), shown at once, sent latest-only, then the
+volume re-renders; slices are unaffected. The early-termination threshold stays 0.95.
+
+### Evidence
+
+- `depth_scale_multiplies_the_opacity_reference_of_every_route` (portable, CPU): the direct
+  route's reference is diagonal / 256 at 1; at 4 both the plan's `opacity_reference` and the
+  direct reference are 4×; 0, −1, NaN, ∞ and 100 are refused and leave the old scale.
+- `depth_scale_lets_light_through_deeper_on_the_adapter` (portable, adapter): the demand
+  frame's mean alpha over the frame falls 153 → 130 → 64 at scales 0.25 / 1 / 4 while the set
+  of pixels that hit the volume is identical.
+- `settings_route_sets_the_depth_scale_the_plan_renders_with` (server, CPU): GET reads 1.0,
+  POST 2.5 is stored, POST 0 is 400 and leaves 2.5, and the plan's `opacityReference` is 2.5×.
+- `settings_are_camel_case_and_the_depth_slider_is_logarithmic` (ui, CPU).
+- **Mutation:** the multiplier dropped — the portable test fails ("0.1874 vs 0.1874") and the
+  server test fails ("the plan's opacity reference scales: 1").
+- Suites: ui 11, portable 57 + 20 adapter, server 23 + 2, `git diff --check` clean.
+- Live, release server, Chrome over CDP on the IDR image: the slider at 10× stores
+  `{"depthScale":10.0}`, the volume re-renders in 486 ms, and the 3D pane's mean luminance
+  falls from 91 to 50: the yellow cytoplasm haze becomes see-through and the ring of nuclei
+  inside is visible (`scratchpad/depth-montage.png`).

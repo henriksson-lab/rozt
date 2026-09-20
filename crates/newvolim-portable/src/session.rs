@@ -44,6 +44,32 @@ pub struct LocalSession {
     layer_datasets: HashMap<LayerId, LayerDataset>,
     next_annotation_id: u64,
     portable_device: Arc<OnceLock<Option<(wgpu::Device, wgpu::Queue)>>>,
+    depth_scale: DepthScale,
+}
+
+/// How far light penetrates the volume, as a multiplier on the scene's opacity reference: the
+/// distance over which a fully opaque voxel absorbs everything is the scene diagonal / 256 at
+/// scale 1, four times that at scale 4. A scene-wide setting, so it is one slider in the page.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DepthScale(f32);
+
+impl DepthScale {
+    pub const MIN: f32 = 0.05;
+    pub const MAX: f32 = 20.0;
+
+    pub fn new(scale: f32) -> Option<Self> {
+        (scale.is_finite() && (Self::MIN..=Self::MAX).contains(&scale)).then_some(Self(scale))
+    }
+
+    pub fn get(self) -> f32 {
+        self.0
+    }
+}
+
+impl Default for DepthScale {
+    fn default() -> Self {
+        Self(1.0)
+    }
 }
 
 /// One image layer's canonical dataset root and parsed NGFF metadata.
@@ -545,6 +571,22 @@ impl LocalSession {
     }
 
     /// Every image layer's channels, in scene order, for the transfer-function panel.
+    /// The scene's see-through depth multiplier (1 by default).
+    pub fn depth_scale(&self) -> f32 {
+        self.depth_scale.get()
+    }
+
+    pub fn set_depth_scale(&mut self, scale: f32) -> Result<(), SessionError> {
+        self.depth_scale = DepthScale::new(scale).ok_or_else(|| {
+            SessionError::LayerSource(format!(
+                "depth scale {scale} is outside {}..={}",
+                DepthScale::MIN,
+                DepthScale::MAX
+            ))
+        })?;
+        Ok(())
+    }
+
     pub fn layer_channels(&self) -> Vec<LayerChannelSummary> {
         self.scene
             .layers()
