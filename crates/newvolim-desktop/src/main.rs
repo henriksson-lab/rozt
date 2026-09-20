@@ -1006,60 +1006,40 @@ fn main() {
 mod tests {
     use super::*;
 
-    /// The shipped webview drives the volume canvas through the scene route — render and pick
-    /// alike — so the demand-driven frame is what users see and what their clicks are tested
-    /// against. Pinned by reading the UI source: a wiring change is a contract change.
+    /// The shipped page (`newvolim-ui`, rebuilt on 2026-09-20 in the style of
+    /// `omezarr_viewers-rs`) talks to `newvolim-server` only: the frame socket, the channel and
+    /// layer routes and the scene packet. It invokes no Tauri command, so this desktop host's
+    /// webview needs an HTTP server behind it; until the host runs the server in-process
+    /// (HANDOVER "Immediate next action"), the desktop's own scene commands are the Rust API the
+    /// page used to call, kept registered for that step. Pinned by reading the sources: a
+    /// wiring change is a contract change.
     #[test]
-    fn webview_volume_canvas_is_wired_to_the_scene_route() {
-        let source = std::fs::read_to_string(
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("../newvolim-ui/index.html"),
-        )
-        .unwrap();
-        assert!(source.contains(
-            "const NEWVOLIM_NATIVE_VOLUME_COMMAND = \"render_native_portable_scene_camera_draw\";"
-        ));
-        assert!(source.contains(
-            "const NEWVOLIM_NATIVE_VOLUME_PICK_COMMAND = \"pick_native_portable_scene_annotation\";"
-        ));
-        assert_eq!(source.matches("newvolimAdmitFrame(NEWVOLIM_NATIVE_VOLUME_COMMAND").count(), 1);
-        assert_eq!(source.matches("newvolimDrawPayload(NEWVOLIM_NATIVE_VOLUME_COMMAND").count(), 1);
-        assert_eq!(source.matches("invoke(NEWVOLIM_NATIVE_VOLUME_PICK_COMMAND").count(), 1);
-        // The direct route is not invoked by the page any more, only named in a comment.
-        for direct in ["\"render_native_portable_camera_draw\"", "\"pick_native_portable_annotation\""] {
-            assert!(
-                !source.contains(direct),
-                "the webview still invokes the direct route: {direct}"
-            );
+    fn webview_talks_to_the_server_routes_and_invokes_no_desktop_command() {
+        let ui = Path::new(env!("CARGO_MANIFEST_DIR")).join("../newvolim-ui");
+        let app = std::fs::read_to_string(ui.join("src/app.rs")).unwrap();
+        let api = std::fs::read_to_string(ui.join("src/api.rs")).unwrap();
+        let shell = std::fs::read_to_string(ui.join("index.html")).unwrap();
+        let webgpu = std::fs::read_to_string(ui.join("scene-webgpu.js")).unwrap();
+        for (name, source) in [("app.rs", &app), ("api.rs", &api), ("index.html", &shell), ("scene-webgpu.js", &webgpu)] {
+            assert!(!source.contains("__TAURI__") && !source.contains("invoke("), "{name} invokes a desktop command");
         }
-        // The desktop registers both scene commands the page names.
+        assert!(api.contains("/v1/frames") && api.contains("/channels") && api.contains("/layers"));
+        assert!(api.contains("/portable/plan?") && api.contains("/portable/chunks"), "the page runs client-side residency against the server's routes");
+        assert!(app.contains("scene_webgpu_dispatch(") && app.contains("ClientResidency::new("), "the page dispatches the scene itself");
+        assert!(webgpu.contains("async function dispatch("));
+        // The desktop still registers the scene render, pick and channel commands.
         let desktop = include_str!("main.rs");
         let handler = &desktop[desktop.find("tauri::generate_handler![").unwrap()..];
         let handler = &handler[..handler.find("])").unwrap()];
-        assert!(handler.contains("render_native_portable_scene_camera_draw,"));
-        assert!(handler.contains("pick_native_portable_scene_annotation,"));
-    }
-
-    /// The page's transfer panel talks to the two channel commands, and both are registered.
-    #[test]
-    fn webview_channel_panel_is_wired_to_the_channel_commands() {
-        let source = std::fs::read_to_string(
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("../newvolim-ui/index.html"),
-        )
-        .unwrap();
-        assert!(source.contains("invoke(\"layer_channels\")"));
-        assert!(source.contains("invoke(\"set_channel_state\", {"));
-        assert!(source.contains("invoke(\"add_portable_image_layer\", {"));
-        let ui = std::fs::read_to_string(
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("../newvolim-ui/src/lib.rs"),
-        )
-        .unwrap();
-        assert!(ui.contains("id=\"newvolim-channels\""));
-        let desktop = include_str!("main.rs");
-        let handler = &desktop[desktop.find("tauri::generate_handler![").unwrap()..];
-        let handler = &handler[..handler.find("])").unwrap()];
-        assert!(handler.contains("layer_channels,") && handler.contains("set_channel_state,"));
-        assert!(handler.contains("add_portable_image_layer,"));
-        assert!(ui.contains("id=\"newvolim-layer-path\""));
+        for command in [
+            "render_native_portable_scene_camera_draw,",
+            "pick_native_portable_scene_annotation,",
+            "layer_channels,",
+            "set_channel_state,",
+            "add_portable_image_layer,",
+        ] {
+            assert!(handler.contains(command), "desktop no longer registers {command}");
+        }
     }
 
     #[test]

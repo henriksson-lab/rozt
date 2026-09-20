@@ -1494,6 +1494,16 @@ impl LocalSession {
     /// Every chunk is checked against the plan's own offsets rather than trusted: a chunk whose
     /// word count or placement disagrees with what was planned is refused, because rendering it
     /// would silently read a neighbour's scalars through the residency map.
+    /// One loaded chunk as X-fastest XYZ words: what a page holds for it. For the client
+    /// residency route, which ships chunk words instead of pages.
+    pub fn chunk_words_xyz(
+        &self,
+        plan: &LocalLayerChunkPlan,
+        loaded: &LoadedLocalChunk,
+    ) -> Result<Vec<u32>, SessionError> {
+        portable_words_xyz(&loaded.bytes, &loaded.address, &plan.request.source)
+    }
+
     pub fn portable_chunk_plan_pages(
         &self,
         plan: &LocalLayerChunkPlan,

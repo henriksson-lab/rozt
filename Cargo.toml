@@ -9,6 +9,7 @@ members = [
     "crates/newvolim-ui",
     "crates/newvolim-decode-bench",
     "crates/newvolim-wgpu-frame",
+    "crates/newvolim-residency",
 ]
 resolver = "2"
 exclude = ["palace-dev"]

@@ -30,8 +30,8 @@ use clap::Parser;
 use newvolim_io::{read_array_info, read_dataset_metadata, LocalSourcePolicy};
 use newvolim_portable::{
     routes::{
-        composite_palace_scene_annotations, demand_scene_levels, full_level_scene_inputs,
-        scene_route_frame, ChannelStateInput, NativePortableDrawRequest, RouteRenderer,
+        composite_palace_scene_annotations, demand_scene_plan, full_level_scene_inputs_fitting, layer_chunk_words,
+        portable_orthogonal_slice_pngs, scene_route_frame, ChannelStateInput, NativePortableDrawRequest, RouteRenderer,
     },
     session::{LayerChannelSummary, LocalSession},
 };
@@ -234,7 +234,14 @@ fn render_volume_frame(
                     palace_png::encode_portable_frame_attachments(&attachments).into_parts();
                 return Ok((png, pfm, renderer));
             }
-            Err(_) => {}
+            Err(portable_error) => {
+                // Vulkan is the last resort; when it fails too, the portable route's reason is
+                // the one worth reading.
+                let attachments = render_local_zarr_with_camera_attachments(root, size, controls)
+                    .map_err(|error| format!("{error} (portable route: {portable_error})"))?;
+                let (png, pfm) = palace_png::encode_attachments(&attachments).into_parts();
+                return Ok((png, pfm, "vulkan"));
+            }
         }
     }
     let attachments = render_local_zarr_with_camera_attachments(root, size, controls)
@@ -424,6 +431,9 @@ fn app_router(
         )
         .route("/v1/datasets/{dataset}/layers", post(add_dataset_layer))
         .route("/v1/datasets/{dataset}/portable/scene", get(browser_scene))
+        .route("/v1/datasets/{dataset}/portable/plan", get(browser_scene_plan))
+        .route("/v1/datasets/{dataset}/portable/rays", get(browser_scene_rays))
+        .route("/v1/datasets/{dataset}/portable/chunks", post(browser_scene_chunks))
         .with_state(state)
         .layer(CorsLayer::new().allow_origin(cors_origins));
     match page_dir {
@@ -536,7 +546,6 @@ fn browser_scene_packet(
     size: FrameSize,
     controls: CameraControls,
 ) -> Result<BrowserScenePacket, String> {
-    let levels = demand_scene_levels(session, size, controls)?;
     let request = NativePortableDrawRequest {
         origin_xyz: [0; 3],
         extent_xyz: [1; 3],
@@ -546,7 +555,8 @@ fn browser_scene_packet(
         orbit_y: controls.orbit_delta[1],
         zoom: controls.zoom,
     };
-    let (input, table, _) = full_level_scene_inputs(session, request, &levels)?;
+    // The camera's levels, stepped coarser until the whole level fits the static pages.
+    let (input, table, _, levels) = full_level_scene_inputs_fitting(session, request)?;
     let dispatch = palace_wgpu::scene_dvr_dispatch(&input, Some(&table), 4_096, 16)?;
     Ok(BrowserScenePacket {
         shader: palace_wgpu::SCENE_DVR_SHADER,
@@ -563,6 +573,131 @@ fn browser_scene_packet(
             .map_err(|_| "output is too large for the wire".to_owned())?,
         workgroups: dispatch.workgroups,
     })
+}
+
+/// Client residency, step one: the plan for a camera — layers, channels, tags, owners,
+/// transfers, step, the levels chosen (or those given as `levels=a,b`) — without pages or rays.
+async fn browser_scene_plan(
+    State(state): State<AppState>,
+    AxumPath(dataset): AxumPath<String>,
+    Query(query): Query<ScenePlanQuery>,
+) -> Result<Json<newvolim_residency::ScenePlan>, (StatusCode, String)> {
+    let (request, levels) = scene_plan_request(&query)?;
+    let root = resolve_frame_dataset(&state.datasets, &dataset)?;
+    let sessions = state.sessions.clone();
+    tokio::task::spawn_blocking(move || {
+        let session = sessions.session_for(&dataset, &root)?;
+        demand_scene_plan(&session, request, levels.as_deref()).map(|(plan, _)| plan)
+    })
+    .await
+    .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "plan task failed".to_owned()))?
+    .map_err(|message| (StatusCode::BAD_REQUEST, message))
+    .map(Json)
+}
+
+/// Client residency, step two: the rays for a camera as little-endian `u32` words, eight per
+/// pixel (origin, direction, near, far as `f32` bits), binary.
+async fn browser_scene_rays(
+    State(state): State<AppState>,
+    AxumPath(dataset): AxumPath<String>,
+    Query(query): Query<ScenePlanQuery>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let (request, levels) = scene_plan_request(&query)?;
+    let root = resolve_frame_dataset(&state.datasets, &dataset)?;
+    let sessions = state.sessions.clone();
+    let words = tokio::task::spawn_blocking(move || {
+        let session = sessions.session_for(&dataset, &root)?;
+        demand_scene_plan(&session, request, levels.as_deref()).map(|(_, rays)| newvolim_residency::ray_words(&rays))
+    })
+    .await
+    .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "rays task failed".to_owned()))?
+    .map_err(|message| (StatusCode::BAD_REQUEST, message))?;
+    Ok(([(header::CONTENT_TYPE, HeaderValue::from_static("application/octet-stream"))], words_le_bytes(&words)))
+}
+
+/// Client residency, step three: the words of the chunks the shader missed. The body names one
+/// layer, level and source channel and the chunk grid coordinates; the reply is binary, in
+/// request order: per chunk a `u32` word count, then the words, little-endian.
+async fn browser_scene_chunks(
+    State(state): State<AppState>,
+    AxumPath(dataset): AxumPath<String>,
+    Json(body): Json<SceneChunksRequest>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    if body.chunks.is_empty() || body.chunks.len() > MAX_SCENE_CHUNKS_PER_REQUEST {
+        return Err((StatusCode::BAD_REQUEST, format!("ask for 1..={MAX_SCENE_CHUNKS_PER_REQUEST} chunks per request")));
+    }
+    let root = resolve_frame_dataset(&state.datasets, &dataset)?;
+    let sessions = state.sessions.clone();
+    let chunks = tokio::task::spawn_blocking(move || {
+        let session = sessions.session_for(&dataset, &root)?;
+        layer_chunk_words(&session, body.layer_id, body.level, body.source_index, &body.chunks)
+    })
+    .await
+    .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "chunks task failed".to_owned()))?
+    .map_err(|message| (StatusCode::BAD_REQUEST, message))?;
+    let mut bytes = Vec::new();
+    for words in &chunks {
+        bytes.extend_from_slice(&(words.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(&words_le_bytes(words));
+    }
+    Ok(([(header::CONTENT_TYPE, HeaderValue::from_static("application/octet-stream"))], bytes))
+}
+
+/// One request's worth of chunks: a bound on the work one client can queue at once.
+const MAX_SCENE_CHUNKS_PER_REQUEST: usize = 256;
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ScenePlanQuery {
+    width: u32,
+    height: u32,
+    #[serde(default)]
+    orbit_x: i32,
+    #[serde(default)]
+    orbit_y: i32,
+    #[serde(default = "default_zoom")]
+    zoom: f32,
+    /// Comma-separated pyramid levels per visible layer; omitted, the camera chooses.
+    #[serde(default)]
+    levels: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SceneChunksRequest {
+    layer_id: u64,
+    level: u32,
+    source_index: u32,
+    chunks: Vec<[u32; 3]>,
+}
+
+fn scene_plan_request(query: &ScenePlanQuery) -> Result<(NativePortableDrawRequest, Option<Vec<u32>>), (StatusCode, String)> {
+    validate_render_extent(query.width, query.height, RenderView::Volume)
+        .map_err(|message| (StatusCode::BAD_REQUEST, message))?;
+    let levels = match &query.levels {
+        None => None,
+        Some(text) => Some(
+            text.split(',')
+                .map(|level| level.trim().parse::<u32>().map_err(|_| (StatusCode::BAD_REQUEST, format!("levels {text:?} are not integers"))))
+                .collect::<Result<Vec<_>, _>>()?,
+        ),
+    };
+    Ok((
+        NativePortableDrawRequest {
+            origin_xyz: [0; 3],
+            extent_xyz: [1; 3],
+            width: query.width,
+            height: query.height,
+            orbit_x: query.orbit_x,
+            orbit_y: query.orbit_y,
+            zoom: query.zoom,
+        },
+        levels,
+    ))
+}
+
+fn words_le_bytes(words: &[u32]) -> Vec<u8> {
+    words.iter().flat_map(|word| word.to_le_bytes()).collect()
 }
 
 async fn browser_scene(
@@ -1116,26 +1251,44 @@ fn start_render(job: FrameJob, completed_tx: &mpsc::UnboundedSender<RenderComple
                     },
                 )
             }
-            RenderView::Orthogonal => dataset_xyz_extent(&job.root).and_then(|shape| {
-                let requested = job
-                    .crosshair
-                    .unwrap_or(std::array::from_fn(|axis| shape[axis] / 2));
-                let crosshair = std::array::from_fn(|axis| requested[axis].min(shape[axis] - 1));
-                render_local_zarr_orthogonal_at_png(
-                    job.root,
-                    job.size,
-                    [crosshair[2], crosshair[1], crosshair[0]],
-                )
-                .map_err(|error| error.to_string())
-                .map(|png| {
-                    RenderOutput::Orthogonal(RenderedOrthogonal {
+            RenderView::Orthogonal => {
+                // The portable session slices the whole base layer on the CPU at the finest
+                // level that fits its pages, on any store it can open; Palace's Vulkan slicer
+                // remains the fallback for a dataset the portable session cannot hold.
+                let portable = job
+                    .sessions
+                    .session_for(&job.dataset, &job.root)
+                    .and_then(|session| portable_orthogonal_slice_pngs(&session, job.crosshair));
+                match portable {
+                    Ok((png, slices)) => Ok(RenderOutput::Orthogonal(RenderedOrthogonal {
                         png,
-                        voxel_shape_xyz: shape,
-                        crosshair_xyz: crosshair,
+                        voxel_shape_xyz: slices.voxel_shape_xyz,
+                        crosshair_xyz: slices.crosshair_xyz,
                         render_ms: started.elapsed().as_secs_f64() * 1_000.0,
-                    })
-                })
-            }),
+                    })),
+                    Err(portable_error) => dataset_xyz_extent(&job.root).and_then(|shape| {
+                        let requested = job
+                            .crosshair
+                            .unwrap_or(std::array::from_fn(|axis| shape[axis] / 2));
+                        let crosshair =
+                            std::array::from_fn(|axis| requested[axis].min(shape[axis] - 1));
+                        render_local_zarr_orthogonal_at_png(
+                            job.root,
+                            job.size,
+                            [crosshair[2], crosshair[1], crosshair[0]],
+                        )
+                        .map_err(|error| format!("{error} (portable slices: {portable_error})"))
+                        .map(|png| {
+                            RenderOutput::Orthogonal(RenderedOrthogonal {
+                                png,
+                                voxel_shape_xyz: shape,
+                                crosshair_xyz: crosshair,
+                                render_ms: started.elapsed().as_secs_f64() * 1_000.0,
+                            })
+                        })
+                    }),
+                }
+            }
         };
         let _ = completed_tx.send(RenderCompletion {
             response: job.response,
@@ -1572,21 +1725,25 @@ mod tests {
     #[test]
     fn webview_dispatches_the_browser_scene_packet_with_the_documented_bindings() {
         let source = std::fs::read_to_string(
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../newvolim-ui/index.html"),
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../newvolim-ui/scene-webgpu.js"),
         )
         .unwrap();
-        assert!(source.contains("/portable/scene?"));
-        let start = source.find("newvolimRenderServerScene = async function").unwrap();
+        let start = source.find("async function dispatch(").unwrap();
         let body = &source[start..];
-        let body = &body[..body.find("window.newvolimSetChannelState = ").unwrap_or(body.len())];
+        let body = &body[..body.find("async function present(").unwrap_or(body.len())];
+        // The page fetches the plan, rays and chunks itself (client-side residency).
+        let api = std::fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../newvolim-ui/src/api.rs")).unwrap();
+        for route in ["/portable/plan?", "/portable/rays?", "/portable/chunks"] {
+            assert!(api.contains(route), "the page does not name {route}");
+        }
         let mut last = 0;
         for (binding, resource) in [
-            (0, "pages[0]"),
-            (1, "pages[1]"),
-            (2, "pages[2]"),
-            (3, "pages[3]"),
-            (4, "sceneData"),
-            (5, "rays"),
+            (0, "pageBuffers[0]"),
+            (1, "pageBuffers[1]"),
+            (2, "pageBuffers[2]"),
+            (3, "pageBuffers[3]"),
+            (4, "sceneBuffer"),
+            (5, "rayBuffer"),
             (6, "output"),
             (7, "uniform"),
             (8, "requests"),
@@ -1596,8 +1753,8 @@ mod tests {
             assert!(at > last, "binding {binding} is out of order");
             last = at;
         }
-        assert!(body.contains("dispatchWorkgroups(packet.workgroups)"));
-        assert!(body.contains("packet.shader"));
+        assert!(body.contains("dispatchWorkgroups(workgroups)"));
+        assert!(body.contains("window.newvolimSceneWebGpu.shader"));
     }
 
     /// A server volume frame is the portable route frame: its PFM decodes to exactly the depth
@@ -2171,21 +2328,6 @@ mod tests {
         assert_eq!(status, StatusCode::NOT_FOUND, "no page without --page-dir");
     }
 
-    /// The page reaches the API on its own origin when the chunk-server box is empty, so the
-    /// single-port deployment (`--page-dir`) needs no configuration in the browser.
-    #[test]
-    fn webview_defaults_the_chunk_server_to_its_own_origin() {
-        let source = std::fs::read_to_string(
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../newvolim-ui/index.html"),
-        )
-        .unwrap();
-        let start = source.find("newvolimChunkServerOrigin = function").unwrap();
-        let body = &source[start..];
-        let body = &body[..body.find("window.newvolimDiscoverBrowserDatasets").unwrap()];
-        assert!(body.contains("window.location.origin"), "empty box falls back to the page's origin");
-        assert!(body.contains("raw === \"\""), "only when the box is empty");
-    }
-
     #[tokio::test]
     async fn named_local_frame_route_renders_a_real_palace_png_without_a_tcp_listener() {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -2323,9 +2465,12 @@ mod tests {
             .png
             .iter()
             .all(|png| png.starts_with(b"\x89PNG\r\n\x1a\n")));
-        assert!(orthogonal
-            .png
-            .iter()
-            .all(|png| png_dimensions(png) == [32, 24]));
+        // The portable session slices the volume at the finest level that fits its pages —
+        // level zero for this fixture — so each plane is at voxel resolution, not the
+        // requested frame size: XY is x by y, XZ is x by z, YZ is y by z. The page stretches
+        // whatever it gets, so the crosshair overlay stays a fraction of the pane.
+        assert_eq!(png_dimensions(&orthogonal.png[0]), [128, 128], "XY");
+        assert_eq!(png_dimensions(&orthogonal.png[1]), [128, 32], "XZ");
+        assert_eq!(png_dimensions(&orthogonal.png[2]), [128, 32], "YZ");
     }
 }

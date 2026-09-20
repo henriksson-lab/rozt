@@ -1,0 +1,13 @@
+[package]
+name = "newvolim-residency"
+version = "0.1.0"
+edition = "2021"
+license = "MPL-2.0"
+description = "The demand-driven residency loop as a client: scene plan, chunk cache, page assembly and dispatch packing, host-independent"
+
+[dependencies]
+palace-core = { path = "../../palace-dev/palace-core", default-features = false }
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+serde_json = "1"

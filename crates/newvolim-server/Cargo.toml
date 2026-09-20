@@ -11,6 +11,7 @@ base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
 newvolim-io = { path = "../newvolim-io" }
 newvolim-portable = { path = "../newvolim-portable" }
+newvolim-residency = { path = "../newvolim-residency" }
 newvolim-scene = { path = "../newvolim-scene" }
 newvolim-render = { path = "../newvolim-render" }
 palace-frame = { path = "../../palace-dev/palace-frame" }

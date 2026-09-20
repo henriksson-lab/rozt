@@ -1074,9 +1074,15 @@ pub fn palace_scene_slice_rgba_with_sampling(
         .flat_map(|pixel| {
             let horizontal = pixel % width as usize;
             let vertical = pixel / width as usize;
+            // The plane's first axis runs across and its second down, matching the declared
+            // `width`/`height`: YZ is y across and z down, XZ is x across and z down, XY is x
+            // across and y down. (Until 2026-09-20 the YZ and XZ planes ran z across with the
+            // other axis down while declaring the opposite extents, so they came out transposed
+            // and truncated; `portable_orthogonal_slice_pixels_map_to_voxels_as_documented`
+            // measures the mapping on a store with one value per voxel.)
             let reference_coordinate = match axis {
-                0 => [index as usize, vertical, horizontal],
-                1 => [vertical, index as usize, horizontal],
+                0 => [index as usize, horizontal, vertical],
+                1 => [horizontal, index as usize, vertical],
                 2 => [horizontal, vertical, index as usize],
                 _ => unreachable!("validated slice axis"),
             };
@@ -1346,24 +1352,30 @@ pub fn scene_route_frame(
     session: &LocalSession,
     request: NativePortableDrawRequest,
 ) -> Result<RouteFrame, String> {
-    if let Ok((attachments, rays)) = demand_driven_scene_camera_draw_with_rays(session, request) {
-        let rays = rays
-            .iter()
-            .map(|ray| {
-                newvolim_render::PickRay::new(
-                    ray.origin().map(f64::from),
-                    ray.direction().map(f64::from),
-                )
-                .map_err(|error| error.to_string())
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        return Ok(RouteFrame {
-            attachments,
-            rays,
-            renderer: RouteRenderer::Demand,
-        });
-    }
-    let packet = native_portable_scene_camera_draw_for_session(request, session)?;
+    let demand_error = match demand_driven_scene_camera_draw_with_rays(session, request) {
+        Ok((attachments, rays)) => {
+            let rays = rays
+                .iter()
+                .map(|ray| {
+                    newvolim_render::PickRay::new(
+                        ray.origin().map(f64::from),
+                        ray.direction().map(f64::from),
+                    )
+                    .map_err(|error| error.to_string())
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            return Ok(RouteFrame {
+                attachments,
+                rays,
+                renderer: RouteRenderer::Demand,
+            });
+        }
+        Err(error) => error,
+    };
+    // The fallbacks need the whole level-zero region in the static pages; when they cannot
+    // have it either, say why the demand route declined first — that is the useful message.
+    let packet = native_portable_scene_camera_draw_for_session(request, session)
+        .map_err(|error| format!("{error} (demand route: {demand_error})"))?;
     let rays = packet
         .rays
         .iter()
@@ -1623,8 +1635,63 @@ pub fn demand_driven_scene_camera_draw_with_rays(
     // Choose each layer's level from the camera before touching any chunk. Level selection is a
     // per-frame decision and must not mutate the session: the source array and its physical
     // transform are pure functions of the dataset metadata and the level index.
-    let levels = demand_scene_levels(session, size, controls)?;
-    demand_driven_scene_camera_draw_with_rays_at_levels(session, request, &levels)
+    let mut levels = demand_scene_levels(session, size, controls)?;
+    // The camera's level can need more chunks than the four static pages hold — a large pane
+    // over a large volume. Rather than hand the frame to Vulkan, step every layer that still
+    // has a coarser level one level up and try again; the frame is then as fine as the pages
+    // allow. Only the page bound is retried; any other failure is reported as it is.
+    loop {
+        match demand_driven_scene_camera_draw_with_rays_at_levels(session, request, &levels) {
+            Ok(frame) => return Ok(frame),
+            Err(error) if error.starts_with(DEMAND_EXCEEDS_PAGE_BOUND) => {
+                let counts = demand_scene_level_counts(session)?;
+                match coarsen_levels(&levels, &counts) {
+                    Some(coarser) => levels = coarser,
+                    None => return Err(format!("{error} at the coarsest levels {levels:?}")),
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+/// The message prefix the demand route uses when a level's working set exceeds the four static
+/// pages; [`demand_driven_scene_camera_draw_with_rays`] retries coarser levels on exactly this.
+pub const DEMAND_EXCEEDS_PAGE_BOUND: &str = "demand-driven scene exceeds the portable page bound";
+
+/// Every visible image layer's pyramid level count, in plan order (the order of
+/// [`demand_scene_levels`]).
+pub fn demand_scene_level_counts(session: &LocalSession) -> Result<Vec<usize>, String> {
+    session
+        .local_layer_render_requests(LayerRenderLimits::new(4, 4))
+        .map_err(|error| error.to_string())?
+        .iter()
+        .map(|request| {
+            session
+                .portable_layer_level_spacings(request.layer.layer_id)
+                .map(|spacings| spacings.len())
+                .map_err(|error| error.to_string())
+        })
+        .collect()
+}
+
+/// One step coarser for every layer that has a coarser level; `None` when no layer does, so a
+/// caller cannot loop forever. Layers already at their coarsest level stay there.
+pub fn coarsen_levels(levels: &[u32], level_counts: &[usize]) -> Option<Vec<u32>> {
+    let mut changed = false;
+    let coarser = levels
+        .iter()
+        .zip(level_counts)
+        .map(|(&level, &count)| {
+            if (level as usize + 1) < count {
+                changed = true;
+                level + 1
+            } else {
+                level
+            }
+        })
+        .collect();
+    changed.then_some(coarser)
 }
 
 /// The demand route with every layer at one explicit pyramid level. The desktop always lets the
@@ -1932,6 +1999,9 @@ pub fn demand_driven_scene_camera_draw_with_rays_at_levels(
                 palace_core::gpu::PortableResidencyStep::Planned => complete = false,
                 // A working set beyond the portable bound is a deterministic Vulkan fallback, and
                 // an exhausted or desynchronized loop must not be presented as a finished frame.
+                palace_core::gpu::PortableResidencyStep::ExceedsPortableBound { required_pages } => {
+                    return Err(format!("{DEMAND_EXCEEDS_PAGE_BOUND}: {required_pages} pages needed"))
+                }
                 other => return Err(format!("demand-driven scene stopped: {other:?}")),
             }
         }
@@ -1974,11 +2044,258 @@ pub fn full_level_scene_inputs(
         {
             palace_core::gpu::PortableResidencyStep::Planned
             | palace_core::gpu::PortableResidencyStep::Complete => {}
+            palace_core::gpu::PortableResidencyStep::ExceedsPortableBound { required_pages } => {
+                return Err(format!("{DEMAND_EXCEEDS_PAGE_BOUND}: {required_pages} pages needed"))
+            }
             other => return Err(format!("full-level planning stopped: {other:?}")),
         }
     }
     let (input, table) = assemble_demand_scene(session, &scene)?;
     Ok((input, table, scene.rays))
+}
+
+/// Orthogonal slices through the whole base image layer, from the portable session.
+///
+/// The finest pyramid level whose entire extent fits the four static pages is admitted and
+/// sliced on the CPU at the crosshair (given in level-zero voxels, scaled to the level), through
+/// the layer's channel transfers — the same slice function the desktop's orthogonal command uses.
+/// Nothing here needs Vulkan, so it works on every store the session can open, compressed
+/// included. Further layers are not sliced yet.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PortableOrthogonalSlices {
+    /// `(width, height, rgba)` for the XY, XZ and YZ planes, at the chosen level's resolution.
+    pub planes: [(u32, u32, Vec<u8>); 3],
+    pub level: u32,
+    /// The base layer's level-zero extent and the crosshair actually used, in those voxels.
+    pub voxel_shape_xyz: [u32; 3],
+    pub crosshair_xyz: [u32; 3],
+}
+
+pub fn portable_orthogonal_slices(
+    session: &LocalSession,
+    crosshair_xyz: Option<[u32; 3]>,
+) -> Result<PortableOrthogonalSlices, String> {
+    let limits = LayerRenderLimits::new(4, 4);
+    let budget_words = u64::from(newvolim_render::PortablePageSubmission::PAGE_COUNT)
+        * newvolim_render::PortablePageSubmission::PAGE_BYTES
+        / 4;
+    let spatial_shape = |request: &LocalLayerRenderRequest| -> Result<[u64; 3], String> {
+        let source = &request.source;
+        Ok(std::array::from_fn(|axis| source.shape[source.spatial_axes_xyz[axis] as usize]))
+    };
+    let base = session
+        .local_layer_render_requests(limits)
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .next()
+        .ok_or_else(|| "no image layer to slice".to_owned())?;
+    let shape0 = spatial_shape(&base)?;
+    let voxel_shape_xyz: [u32; 3] = std::array::from_fn(|axis| u32::try_from(shape0[axis]).unwrap_or(u32::MAX));
+    let channel_count = base.layer.channels.len().max(1) as u64;
+    // The finest level whose whole extent, one word per voxel per channel, fits the pages.
+    let mut chosen = None;
+    for level in 0.. {
+        let Ok(requests) = session.local_layer_render_requests_at_level(limits, level) else { break };
+        let Some(request) = requests.into_iter().next() else { break };
+        let shape = spatial_shape(&request)?;
+        let words = shape.iter().product::<u64>().saturating_mul(channel_count);
+        if words <= budget_words {
+            chosen = Some((level, request, shape));
+            break;
+        }
+    }
+    let (level, request, shape) = chosen.ok_or_else(|| {
+        "no pyramid level of the base layer fits the portable page budget".to_owned()
+    })?;
+    let chunk_shape: [u64; 3] =
+        std::array::from_fn(|axis| request.source.chunk_shape[request.source.spatial_axes_xyz[axis] as usize].max(1));
+    let counts: [u64; 3] = std::array::from_fn(|axis| shape[axis].div_ceil(chunk_shape[axis]));
+    let mut chunks = Vec::with_capacity((counts[0] * counts[1] * counts[2]) as usize);
+    for z in 0..counts[2] {
+        for y in 0..counts[1] {
+            for x in 0..counts[0] {
+                chunks.push([x, y, z]);
+            }
+        }
+    }
+    let layer_id = request.layer.layer_id;
+    let plans = session
+        .local_layer_chunk_plan_for_chunks_at_level(limits, level, &chunks, chunks.len().max(1) * 64)
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .filter(|plan| plan.request.layer.layer_id == layer_id)
+        .collect::<Vec<_>>();
+    let loaded = session
+        .read_local_layer_chunks(&plans, 64 * 1024 * 1024, 256 * 1024 * 1024)
+        .map_err(|error| error.to_string())?;
+    let (descriptors, _) = session.native_layer_admission(limits).map_err(|error| error.to_string())?;
+    let descriptors = descriptors.into_iter().filter(|descriptor| descriptor.layer_id == layer_id).collect::<Vec<_>>();
+    let scene = session
+        .native_portable_scene_page_admission(descriptors, &plans, &loaded)
+        .map_err(|error| error.to_string())?;
+    let first = scene.layers.first().ok_or_else(|| "portable orthogonal scene has no layers".to_owned())?;
+    let requested = crosshair_xyz.unwrap_or(std::array::from_fn(|axis| voxel_shape_xyz[axis] / 2));
+    let crosshair_xyz: [u32; 3] =
+        std::array::from_fn(|axis| requested[axis].min(voxel_shape_xyz[axis].saturating_sub(1)));
+    // Level-zero voxel to this level's voxel: the same fraction along the axis.
+    let local: [u32; 3] = std::array::from_fn(|axis| {
+        let at = u64::from(crosshair_xyz[axis]) * shape[axis] / shape0[axis].max(1);
+        u32::try_from(at).unwrap_or(u32::MAX).min(first.dimensions_xyz[axis].saturating_sub(1))
+    });
+    let xy = palace_scene_slice_rgba(&scene, 2, local[2])?;
+    let xz = palace_scene_slice_rgba(&scene, 1, local[1])?;
+    let yz = palace_scene_slice_rgba(&scene, 0, local[0])?;
+    Ok(PortableOrthogonalSlices { planes: [xy, xz, yz], level, voxel_shape_xyz, crosshair_xyz })
+}
+
+/// [`portable_orthogonal_slices`] encoded as three PNGs, in XY, XZ, YZ order.
+pub fn portable_orthogonal_slice_pngs(
+    session: &LocalSession,
+    crosshair_xyz: Option<[u32; 3]>,
+) -> Result<([Vec<u8>; 3], PortableOrthogonalSlices), String> {
+    let slices = portable_orthogonal_slices(session, crosshair_xyz)?;
+    let encode = |plane: &(u32, u32, Vec<u8>)| -> Result<Vec<u8>, String> {
+        let frame = palace_png::RgbaFrame::new(plane.0, plane.1, plane.2.clone()).map_err(|error| error.to_string())?;
+        Ok(palace_png::encode_rgba(&frame))
+    };
+    let pngs = [encode(&slices.planes[0])?, encode(&slices.planes[1])?, encode(&slices.planes[2])?];
+    Ok((pngs, slices))
+}
+
+/// [`full_level_scene_inputs`] at the camera's levels, stepped coarser until every layer's whole
+/// level fits the four static pages — the same retry the demand route makes — returning the
+/// levels actually used. This is what the browser packet must use: a pane-sized frame over a
+/// real volume asks for a level the pages cannot hold, and a refusal there empties the page's
+/// 3D view.
+pub fn full_level_scene_inputs_fitting(
+    session: &LocalSession,
+    request: NativePortableDrawRequest,
+) -> Result<
+    (
+        palace_core::gpu::PortableDvrSceneFrameInput,
+        palace_core::gpu::PortablePageTable,
+        Vec<palace_core::gpu::PortableRayInterval>,
+        Vec<u32>,
+    ),
+    String,
+> {
+    let size = desktop_frame_size(request.width, request.height, 1)?;
+    let controls = CameraControls {
+        orbit_delta: [request.orbit_x, request.orbit_y],
+        zoom: request.zoom,
+    }
+    .validate()
+    .map_err(|error| error.to_string())?;
+    let mut levels = demand_scene_levels(session, size, controls)?;
+    loop {
+        match full_level_scene_inputs(session, request, &levels) {
+            Ok((input, table, rays)) => return Ok((input, table, rays, levels)),
+            Err(error) if error.starts_with(DEMAND_EXCEEDS_PAGE_BOUND) => {
+                let counts = demand_scene_level_counts(session)?;
+                match coarsen_levels(&levels, &counts) {
+                    Some(coarser) => levels = coarser,
+                    None => return Err(format!("{error} at the coarsest levels {levels:?}")),
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+/// The client residency plan for a camera: `prepare_demand_scene` minus the pages and rays —
+/// what a browser needs to run the residency loop itself and fetch only missed chunks
+/// (`newvolim_residency::ClientResidency`). `levels` overrides the camera's choice, which is
+/// how a client coarsens after `ExceedsPortableBound`.
+pub fn demand_scene_plan(
+    session: &LocalSession,
+    request: NativePortableDrawRequest,
+    levels: Option<&[u32]>,
+) -> Result<(newvolim_residency::ScenePlan, Vec<palace_core::gpu::PortableRayInterval>), String> {
+    let size = desktop_frame_size(request.width, request.height, 1)?;
+    let controls = CameraControls {
+        orbit_delta: [request.orbit_x, request.orbit_y],
+        zoom: request.zoom,
+    }
+    .validate()
+    .map_err(|error| error.to_string())?;
+    let levels = match levels {
+        Some(levels) => levels.to_vec(),
+        None => demand_scene_levels(session, size, controls)?,
+    };
+    let scene = prepare_demand_scene(session, request, &levels)?;
+    let level_counts = demand_scene_level_counts(session)?;
+    let mut layers = Vec::with_capacity(scene.layers.len());
+    let mut loop_index = 0_usize;
+    for layer in &scene.layers {
+        let mut channels = Vec::with_capacity(layer.channels.len());
+        for _ in &layer.channels {
+            let (_, source_index, tag, _) = &scene.loops[loop_index];
+            let transfer = &scene.transfers[loop_index];
+            channels.push(newvolim_residency::PlanChannel {
+                source_index: *source_index,
+                ordinal: palace_core::gpu::PortableResidencyTag::channel(*tag),
+                tag: *tag,
+                owner_base: scene.owners[loop_index],
+                transfer_min: transfer.min(),
+                transfer_max: transfer.max(),
+                transfer_entries: transfer.entries().to_vec(),
+            });
+            loop_index += 1;
+        }
+        layers.push(newvolim_residency::PlanLayer {
+            layer_id: layer.layer_id.0,
+            level: layer.level,
+            dimensions_xyz: layer.dimensions,
+            chunk_shape_xyz: layer.grid.chunk_shape_xyz(),
+            minimum: layer.minimum,
+            maximum: layer.maximum,
+            channels,
+        });
+    }
+    let plan = newvolim_residency::ScenePlan {
+        width: size.width,
+        height: size.height,
+        levels,
+        level_counts,
+        step: scene.step,
+        opacity_reference: scene.opacity_reference,
+        layers,
+    };
+    Ok((plan, scene.rays))
+}
+
+/// The words of the named chunks of one layer, level and source channel, in request order:
+/// what the client residency loop places into its pages. Each chunk is its logical (edge-
+/// clipped) extent, X fastest — the same words `demand_scene_layer_pages` would page.
+pub fn layer_chunk_words(
+    session: &LocalSession,
+    layer_id: u64,
+    level: u32,
+    source_index: u32,
+    chunks_xyz: &[[u32; 3]],
+) -> Result<Vec<Vec<u32>>, String> {
+    if chunks_xyz.is_empty() {
+        return Ok(Vec::new());
+    }
+    let limits = LayerRenderLimits::new(4, 4);
+    let coordinates: Vec<[u64; 3]> = chunks_xyz.iter().map(|chunk| chunk.map(u64::from)).collect();
+    let plan = session
+        .layer_chunk_plan_for_chunks_at_level(limits, newvolim_scene::LayerId(layer_id), level, &coordinates, 4_096)
+        .map_err(|error| error.to_string())?;
+    let loaded = session
+        .read_local_layer_chunks(std::slice::from_ref(&plan), 16 * 1024 * 1024, 256 * 1024 * 1024)
+        .map_err(|error| error.to_string())?;
+    chunks_xyz
+        .iter()
+        .map(|chunk| {
+            let wanted = chunk.map(u64::from);
+            let found = loaded
+                .iter()
+                .find(|loaded| loaded.address.channel == source_index && loaded.address.spatial_chunk_xyz == wanted)
+                .ok_or_else(|| format!("chunk {chunk:?} of channel {source_index} was not read"))?;
+            session.chunk_words_xyz(&plan, found).map_err(|error| error.to_string())
+        })
+        .collect()
 }
 
 /// Owner identifiers reserved per channel, so two channels' planned pages can never alias.
@@ -2551,6 +2868,405 @@ pub fn portable_scene_world_rays(
 mod tests {
     use super::*;
     use palace_frame::render_local_zarr_with_camera_attachments;
+
+    /// The client residency loop assembles, from the plan and fetched chunk words alone, the
+    /// same nine bindings the server's demand route packs for the same demanded chunks —
+    /// pages, residency map, scene data and parameters word for word. Both sides absorb the
+    /// same keys (every other chunk of each channel's grid), so this pins the plan, the chunk
+    /// route and the client's page placement against the server's own assembly.
+    #[test]
+    fn client_residency_assembles_the_servers_dispatch_word_for_word() {
+        // 256×256×64 in 64×64×32 chunks: 32 chunks of 131072 words; every other one demanded
+        // is 16 chunks over two full pages, so placement across pages is exercised.
+        let dir = tempfile::tempdir().unwrap();
+        let root = chunked_two_level_store(dir.path(), [(256, 256, 64), (128, 128, 32)], [1, 32, 64, 64]);
+        let mut session = LocalSession::default();
+        session.open_local_omezarr(&root).unwrap();
+        session.prepare_default_portable_image_layer().unwrap();
+        let request = NativePortableDrawRequest { origin_xyz: [0; 3], extent_xyz: [1; 3], width: 96, height: 64, orbit_x: 12, orbit_y: -7, zoom: 1.3 };
+        let levels = vec![0];
+
+        // Server side: absorb every other chunk into each loop, assemble, pack.
+        let mut scene = prepare_demand_scene(&session, request, &levels).unwrap();
+        let mut demanded_keys = Vec::new();
+        for (layer_index, _, tag, residency) in scene.loops.iter_mut() {
+            let counts = scene.layers[*layer_index].grid.counts_xyz();
+            let keys: Vec<_> = (0..counts[0] * counts[1] * counts[2])
+                .step_by(2)
+                .map(|index| palace_core::gpu::PortableFeedbackKey::new(index, *tag).unwrap())
+                .collect();
+            demanded_keys.extend(keys.iter().map(|key| key.packed()));
+            assert!(matches!(residency.absorb(keys).unwrap(), palace_core::gpu::PortableResidencyStep::Planned));
+        }
+        let (server_input, server_table) = assemble_demand_scene(&session, &scene).unwrap();
+        let server_dispatch = palace_core::gpu::scene_dvr_dispatch(&server_input, Some(&server_table), 4_096, 16).unwrap();
+        assert_eq!(demanded_keys.len(), 16, "half of the 32 level-zero chunks");
+        assert_eq!(server_dispatch.pages.iter().filter(|page| !page.is_empty()).count(), 2, "two pages in use");
+        assert_eq!(server_dispatch.pages.iter().map(Vec::len).sum::<usize>(), 16 * 64 * 64 * 32);
+
+        // Client side: the plan and rays over the wire, the keys through the request buffer,
+        // the chunks through the chunk route, then the page assembly.
+        let (plan, rays) = demand_scene_plan(&session, request, Some(&levels)).unwrap();
+        let plan: newvolim_residency::ScenePlan = serde_json::from_str(&serde_json::to_string(&plan).unwrap()).unwrap();
+        let mut client = newvolim_residency::ClientResidency::new(plan, &newvolim_residency::ray_words(&rays), newvolim_residency::ChunkCache::new(1 << 24)).unwrap();
+        let capacity = newvolim_residency::PAGE_TABLE_CAPACITY;
+        let mut requests = vec![u32::MAX; capacity];
+        for (slot, key) in demanded_keys.iter().enumerate() {
+            requests[slot * 3 % capacity] = *key;
+        }
+        assert_eq!(client.absorb_requests(&requests).unwrap(), newvolim_residency::StepOutcome::Planned);
+        let missing = client.missing_chunks();
+        assert_eq!(missing.len(), demanded_keys.len());
+        for request in &missing {
+            let words = layer_chunk_words(&session, request.layer_id, request.level, request.source_index, &[request.chunk_xyz]).unwrap().remove(0);
+            client.insert_chunk(request, words);
+        }
+        let client_dispatch = client.dispatch().unwrap();
+        assert_eq!(client_dispatch.params, server_dispatch.params, "uniform");
+        assert_eq!(client_dispatch.scene_data, server_dispatch.scene_data, "scene data and residency map");
+        assert_eq!(client_dispatch.rays, server_dispatch.rays, "rays");
+        for page in 0..4 {
+            assert_eq!(client_dispatch.pages[page], server_dispatch.pages[page], "page {page}");
+        }
+        assert_eq!(client_dispatch, server_dispatch);
+        assert_eq!(client.absorb_requests(&vec![u32::MAX; newvolim_residency::PAGE_TABLE_CAPACITY]).unwrap(), newvolim_residency::StepOutcome::Complete);
+    }
+
+    /// The client loop, driven on the local adapter with the session's reads for the chunk
+    /// route, converges to exactly the server's demand frame: colour and depth pixel for pixel,
+    /// and it fetched only the chunks the shader asked for.
+    #[test]
+    #[ignore = "requires a local WGPU adapter"]
+    fn client_residency_loop_renders_the_servers_demand_frame() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../test-data/cells3d-anisotropic.ome.zarr");
+        let mut session = LocalSession::default();
+        session.open_local_omezarr(&root).unwrap();
+        session.prepare_default_portable_image_layer().unwrap();
+        let request = NativePortableDrawRequest { origin_xyz: [0; 3], extent_xyz: [1; 3], width: 96, height: 64, orbit_x: 12, orbit_y: -7, zoom: 1.3 };
+        let size = FrameSize::new(96, 64).unwrap();
+        let controls = CameraControls { orbit_delta: [12, -7], zoom: 1.3 };
+        let levels = demand_scene_levels(&session, size, controls).unwrap();
+        let (server_frame, _) = demand_driven_scene_camera_draw_with_rays_at_levels(&session, request, &levels).unwrap();
+
+        let (plan, rays) = demand_scene_plan(&session, request, Some(&levels)).unwrap();
+        let mut client = newvolim_residency::ClientResidency::new(plan, &newvolim_residency::ray_words(&rays), newvolim_residency::ChunkCache::new(1 << 24)).unwrap();
+        let mut fetched = 0_usize;
+        let mut frame = None;
+        for _ in 0..=newvolim_residency::MAX_ITERATIONS {
+            let (input, table) = client.assemble().unwrap();
+            let (attachments, _, requests) = palace_demand_scene_on_adapter(&session, &input, &table).expect("local adapter");
+            match client.absorb_requests(&requests).unwrap() {
+                newvolim_residency::StepOutcome::Complete => {
+                    frame = Some(attachments);
+                    break;
+                }
+                newvolim_residency::StepOutcome::Planned => {
+                    for missing in client.missing_chunks() {
+                        let words = layer_chunk_words(&session, missing.layer_id, missing.level, missing.source_index, &[missing.chunk_xyz]).unwrap().remove(0);
+                        client.insert_chunk(&missing, words);
+                        fetched += 1;
+                    }
+                }
+                other => panic!("{other:?}"),
+            }
+        }
+        let frame = frame.expect("the client loop converges");
+        assert_eq!(frame.width, server_frame.width);
+        assert_eq!(frame.rgba, server_frame.rgba, "colour");
+        assert_eq!(frame.first_opacity_distance, server_frame.first_opacity_distance, "depth");
+        let total_chunks: usize = client.plan().layers.iter().map(|layer| {
+            let grid = palace_core::gpu::PortableChunkGrid::new(layer.dimensions_xyz, layer.chunk_shape_xyz).unwrap();
+            let counts = grid.counts_xyz();
+            (counts[0] * counts[1] * counts[2]) as usize * layer.channels.len()
+        }).sum();
+        assert!(fetched > 0 && fetched <= total_chunks, "fetched {fetched} of {total_chunks}");
+        eprintln!("client residency fetched {fetched} of {total_chunks} chunks");
+    }
+
+    /// The camera's orbit is a screen drag: a horizontal drag yaws about the screen-vertical
+    /// axis and a vertical drag pitches about the screen-horizontal axis, with the near face
+    /// following the pointer. Measured by projecting physical points through
+    /// `palace_frame`'s camera on the cells3d fixture (128×128×32 voxels at 0.26/0.26/0.29):
+    /// under a yaw the point on the vertical axis stays put and the near point moves right for
+    /// a rightward drag; under a pitch the point on the horizontal axis stays put and the near
+    /// point moves down for a downward drag. Every route derives its rays from this camera,
+    /// so the page's `dx → orbitX, dy → orbitY` is right only if this holds.
+    #[test]
+    fn horizontal_orbit_yaws_and_vertical_orbit_pitches() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../test-data/cells3d-anisotropic.ome.zarr");
+        let size = FrameSize::new(400, 300).unwrap();
+        let project = |orbit: [i32; 2], point: [f32; 3]| -> [f32; 2] {
+            project_point_for_local_zarr(&root, size, CameraControls { orbit_delta: orbit, zoom: 1.0 }, point)
+                .unwrap()
+                .expect("the point is in front of the camera")
+                .pixel
+        };
+        // Physical zyx: the centre and points displaced along image x, image y and toward the
+        // camera (+z is the near side at rest: the fitted eye sits on +z looking at the centre).
+        let centre = [4.64_f32, 16.64, 16.64];
+        let plus_x = [4.64, 16.64, 29.952];
+        let plus_y = [4.64, 29.952, 16.64];
+        let near = [8.352, 16.64, 16.64];
+        let close = |a: [f32; 2], b: [f32; 2]| (a[0] - b[0]).abs() < 0.01 && (a[1] - b[1]).abs() < 0.01;
+        let rest = project([0, 0], centre);
+        assert!(close(rest, [199.5, 149.5]), "the centre is mid-frame: {rest:?}");
+        assert!(close(project([0, 0], near), rest), "the near point is on the view axis at rest");
+        let rest_x = project([0, 0], plus_x);
+        let rest_y = project([0, 0], plus_y);
+        assert!((rest_x[1] - rest[1]).abs() < 0.01 && rest_x[0] > rest[0] + 50.0, "+x is to the right: {rest_x:?}");
+        assert!((rest_y[0] - rest[0]).abs() < 0.01 && rest_y[1] < rest[1] - 50.0, "+y is up: {rest_y:?}");
+
+        // Horizontal drag to the right: a yaw. The vertical-axis point stays; +x moves along the
+        // horizontal axis; the near face moves right.
+        assert!(close(project([200, 0], plus_y), rest_y), "yaw keeps the vertical axis: {:?}", project([200, 0], plus_y));
+        let yawed_x = project([200, 0], plus_x);
+        assert!((yawed_x[1] - rest[1]).abs() < 0.01 && yawed_x[0] < rest_x[0], "yaw moves +x along the horizontal: {yawed_x:?}");
+        let yawed_near = project([200, 0], near);
+        assert!(yawed_near[0] > rest[0] + 10.0 && (yawed_near[1] - rest[1]).abs() < 0.01, "near face follows a right drag: {yawed_near:?}");
+
+        // Vertical drag downward: a pitch. The horizontal-axis point stays; the near face moves down.
+        assert!(close(project([0, 200], plus_x), rest_x), "pitch keeps the horizontal axis: {:?}", project([0, 200], plus_x));
+        let pitched_near = project([0, 200], near);
+        assert!(pitched_near[1] > rest[1] + 10.0 && (pitched_near[0] - rest[0]).abs() < 0.01, "near face follows a down drag: {pitched_near:?}");
+        assert!(close(project([0, 0], centre), project([200, 200], centre)), "the centre never moves");
+
+        // A true rotation, not a nudge: a half turn (π / 0.01 rad per pixel = 314 px) shows the
+        // volume from behind, so +x is mirrored to the left and the near face is now the far
+        // one; a quarter turn puts +x on the view axis. The tilt is clamped short of the poles,
+        // so an absurd vertical drag still yields a camera.
+        let half_turn = project([314, 0], plus_x);
+        assert!(half_turn[0] < rest[0] - 50.0 && (half_turn[1] - rest[1]).abs() < 0.5, "half turn mirrors +x: {half_turn:?}");
+        let quarter_turn = project([157, 0], plus_x);
+        assert!((quarter_turn[0] - rest[0]).abs() < 1.0 && (quarter_turn[1] - rest[1]).abs() < 0.5, "quarter turn puts +x on the view axis: {quarter_turn:?}");
+        let near_behind = project_point_for_local_zarr(&root, size, CameraControls { orbit_delta: [314, 0], zoom: 1.0 }, near).unwrap().unwrap();
+        let near_front = project_point_for_local_zarr(&root, size, CameraControls { orbit_delta: [0, 0], zoom: 1.0 }, near).unwrap().unwrap();
+        assert!(near_behind.ray_distance > near_front.ray_distance + 1.0, "the near face is far after a half turn");
+        assert!(project_point_for_local_zarr(&root, size, CameraControls { orbit_delta: [0, 2000], zoom: 1.0 }, centre).unwrap().is_some(), "tilt is clamped");
+    }
+
+    #[test]
+    fn coarsen_levels_steps_every_layer_that_can_and_stops_at_the_coarsest() {
+        assert_eq!(coarsen_levels(&[0, 1], &[3, 3]), Some(vec![1, 2]));
+        // A layer at its coarsest stays; the other still moves.
+        assert_eq!(coarsen_levels(&[0, 2], &[3, 3]), Some(vec![1, 2]));
+        // Nobody can move: the caller must stop.
+        assert_eq!(coarsen_levels(&[2, 2], &[3, 3]), None);
+        assert_eq!(coarsen_levels(&[0], &[1]), None);
+        assert_eq!(coarsen_levels(&[], &[]), None);
+    }
+
+    /// A two-level store whose level zero needs more than the four static pages while level
+    /// one fits: 1 channel, 512×512×40 uint16 (10.5 M words, 40 MiB) over 256×256×20 (5 MiB).
+    fn oversized_two_level_store(dir: &std::path::Path) -> std::path::PathBuf {
+        chunked_two_level_store(dir, [(512, 512, 40), (256, 256, 20)], [1, 20, 128, 128])
+    }
+
+    /// A two-level single-channel uint16 store of the given (x, y, z) shapes with one chunk
+    /// shape (c, z, y, x), a smooth ramp with a bright core.
+    fn chunked_two_level_store(dir: &std::path::Path, shapes: [(u64, u64, u64); 2], chunk: [u64; 4]) -> std::path::PathBuf {
+        use std::sync::Arc;
+        use zarrs::{array::{codec, ArrayBuilder, DataType, FillValue}, array_subset::ArraySubset, filesystem::FilesystemStore};
+        let root = dir.join("oversized.zarr");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("zarr.json"),
+            r#"{"zarr_format":3,"node_type":"group","attributes":{"multiscales":[{"axes":[{"name":"c","type":"channel"},{"name":"z","type":"space"},{"name":"y","type":"space"},{"name":"x","type":"space"}],"datasets":[{"path":"0","coordinateTransformations":[{"type":"scale","scale":[1.0,1.0,1.0,1.0]}]},{"path":"1","coordinateTransformations":[{"type":"scale","scale":[1.0,2.0,2.0,2.0]}]}]}],"omero":{"channels":[{"active":true,"color":"FFFFFF","window":{"start":0,"end":4000,"min":0,"max":65535}}]}}}"#,
+        )
+        .unwrap();
+        let store = Arc::new(FilesystemStore::new(&root).unwrap());
+        for (path, (sx, sy, sz)) in [("/0", shapes[0]), ("/1", shapes[1])] {
+            let mut builder = ArrayBuilder::new(vec![1, sz, sy, sx], DataType::UInt16, chunk.to_vec().try_into().unwrap(), FillValue::from(0_u16));
+            builder.bytes_to_bytes_codecs(vec![Arc::new(codec::ZstdCodec::new(1, false))]);
+            let array = builder.build(store.clone(), path).unwrap();
+            array.store_metadata().unwrap();
+            // A smooth ramp with a bright core, so the volume is not empty at either level.
+            let mut values = Vec::with_capacity((sx * sy * sz) as usize);
+            for z in 0..sz {
+                for y in 0..sy {
+                    for x in 0..sx {
+                        let dx = x as f64 / sx as f64 - 0.5;
+                        let dy = y as f64 / sy as f64 - 0.5;
+                        let dz = z as f64 / sz as f64 - 0.5;
+                        let r = (dx * dx + dy * dy + dz * dz).sqrt();
+                        values.push(((1.0 - r.min(0.5) * 2.0) * 4000.0) as u16);
+                    }
+                }
+            }
+            array.store_array_subset_elements::<u16>(&ArraySubset::new_with_shape(vec![1, sz, sy, sx]), &values).unwrap();
+        }
+        root
+    }
+
+    /// The browser packet's full-level planning steps coarser the same way: the camera wants
+    /// level zero, level zero alone is refused, and the fitting planner settles on level one.
+    /// CPU only — planning and page assembly touch no adapter.
+    #[test]
+    fn full_level_planning_coarsens_the_level_when_the_pages_cannot_hold_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = oversized_two_level_store(dir.path());
+        let mut session = LocalSession::default();
+        session.open_local_omezarr(&root).unwrap();
+        session.prepare_default_portable_image_layer().unwrap();
+        let request = NativePortableDrawRequest {
+            origin_xyz: [0; 3],
+            extent_xyz: [1; 3],
+            width: 640,
+            height: 480,
+            orbit_x: 30,
+            orbit_y: -20,
+            zoom: 1.0,
+        };
+        let refused = full_level_scene_inputs(&session, request, &[0]).unwrap_err();
+        assert!(refused.starts_with(DEMAND_EXCEEDS_PAGE_BOUND), "{refused}");
+        let (_, _, rays, levels) = full_level_scene_inputs_fitting(&session, request).unwrap();
+        assert_eq!(levels, vec![1]);
+        assert_eq!(rays.len(), 640 * 480);
+    }
+
+    /// At a pane-sized frame the camera picks level zero, whose working set exceeds the four
+    /// pages; the demand route must step to level one and render there rather than decline.
+    #[test]
+    #[ignore = "requires a local WGPU adapter"]
+    fn demand_route_coarsens_the_level_when_the_pages_cannot_hold_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = oversized_two_level_store(dir.path());
+        let mut session = LocalSession::default();
+        session.open_local_omezarr(&root).unwrap();
+        session.prepare_default_portable_image_layer().unwrap();
+        let request = NativePortableDrawRequest {
+            origin_xyz: [0; 3],
+            extent_xyz: [1; 3],
+            width: 640,
+            height: 480,
+            orbit_x: 0,
+            orbit_y: 0,
+            zoom: 1.0,
+        };
+        let size = FrameSize::new(640, 480).unwrap();
+        let controls = CameraControls { orbit_delta: [0, 0], zoom: 1.0 };
+        assert_eq!(demand_scene_levels(&session, size, controls).unwrap(), vec![0], "the camera wants level zero");
+        let at_zero = demand_driven_scene_camera_draw_with_rays_at_levels(&session, request, &[0]).unwrap_err();
+        assert!(at_zero.starts_with(DEMAND_EXCEEDS_PAGE_BOUND), "{at_zero}");
+        let (attachments, rays) = demand_driven_scene_camera_draw_with_rays(&session, request).unwrap();
+        assert_eq!(rays.len(), 640 * 480);
+        let hits = attachments.first_opacity_distance.iter().filter(|d| d.is_finite()).count();
+        assert!(hits > 640 * 480 / 10, "the coarser level still renders the volume: {hits} hits");
+        let frame = scene_route_frame(&session, request).unwrap();
+        assert_eq!(frame.renderer, RouteRenderer::Demand);
+    }
+
+    /// A store whose every voxel has a unique value: `v = 256 * (x + 8 * y + 64 * z)` for an
+    /// 8×8×4 volume, one channel, white, window 0..65535, so a slice pixel's red byte is the
+    /// voxel index and the mapping from pixel to voxel is read straight off the image.
+    fn unique_voxel_store(dir: &std::path::Path) -> std::path::PathBuf {
+        use std::sync::Arc;
+        use zarrs::{array::{ArrayBuilder, DataType, FillValue}, array_subset::ArraySubset, filesystem::FilesystemStore};
+        let root = dir.join("unique.zarr");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("zarr.json"),
+            r#"{"zarr_format":3,"node_type":"group","attributes":{"multiscales":[{"axes":[{"name":"c","type":"channel"},{"name":"z","type":"space"},{"name":"y","type":"space"},{"name":"x","type":"space"}],"datasets":[{"path":"0","coordinateTransformations":[{"type":"scale","scale":[1.0,1.0,1.0,1.0]}]}]}],"omero":{"channels":[{"active":true,"color":"FFFFFF","window":{"start":0,"end":65535,"min":0,"max":65535}}]}}}"#,
+        )
+        .unwrap();
+        let (sx, sy, sz) = (8_u64, 8_u64, 4_u64);
+        let mut values = Vec::new();
+        for z in 0..sz {
+            for y in 0..sy {
+                for x in 0..sx {
+                    values.push((256 * (x + sx * y + sx * sy * z)) as u16);
+                }
+            }
+        }
+        let store = Arc::new(FilesystemStore::new(&root).unwrap());
+        let array = ArrayBuilder::new(vec![1, sz, sy, sx], DataType::UInt16, vec![1, 2, 4, 4].try_into().unwrap(), FillValue::from(0_u16))
+            .build(store, "/0")
+            .unwrap();
+        array.store_metadata().unwrap();
+        array.store_array_subset_elements::<u16>(&ArraySubset::new_with_shape(vec![1, sz, sy, sx]), &values).unwrap();
+        root
+    }
+
+    /// Pixel → voxel of the portable orthogonal slices, measured, not assumed.
+    #[test]
+    fn portable_orthogonal_slice_pixels_map_to_voxels_as_documented() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = unique_voxel_store(dir.path());
+        let mut session = LocalSession::default();
+        session.open_local_omezarr(&root).unwrap();
+        session.prepare_default_portable_image_layer().unwrap();
+        let slices = portable_orthogonal_slices(&session, Some([2, 5, 3])).unwrap();
+        assert_eq!(slices.voxel_shape_xyz, [8, 8, 4]);
+        // The slice is straight-alpha: RGB is the channel colour (white) and alpha the
+        // windowed value, `round(256·index · 255 / 65535)`, so the alpha byte decodes to the
+        // voxel index `x + 8y + 64z` after undoing that scale.
+        let voxel_of = |rgba: &[u8], width: u32, col: u32, row: u32| -> (u32, u32, u32) {
+            let at = ((row * width + col) * 4) as usize;
+            assert_eq!(&rgba[at..at + 3], &[255, 255, 255], "white channel colour");
+            let index = (rgba[at + 3] as f64 * 65535.0 / 255.0 / 256.0).round() as u32;
+            (index % 8, (index / 8) % 8, index / 64)
+        };
+        let [(xy_w, xy_h, ref xy), (xz_w, xz_h, ref xz), (yz_w, yz_h, ref yz)] = slices.planes;
+        // The documented contract: XY is x across and y down at the crosshair z; XZ is x across
+        // and z down at the crosshair y; YZ is y across and z down at the crosshair x.
+        assert_eq!((xy_w, xy_h, xz_w, xz_h, yz_w, yz_h), (8, 8, 8, 4, 8, 4));
+        for row in 0..8 {
+            for col in 0..8 {
+                assert_eq!(voxel_of(xy, xy_w, col, row), (col, row, 3), "XY pixel ({col},{row})");
+            }
+        }
+        for row in 0..4 {
+            for col in 0..8 {
+                assert_eq!(voxel_of(xz, xz_w, col, row), (col, 5, row), "XZ pixel ({col},{row})");
+                assert_eq!(voxel_of(yz, yz_w, col, row), (2, col, row), "YZ pixel ({col},{row})");
+            }
+        }
+    }
+
+    /// The three orthogonal slices agree with one another voxel for voxel: the XY slice's row
+    /// at the crosshair y and the XZ slice's row at the crosshair z both sample the voxels
+    /// (x, y_c, z_c), so they must be the same pixels; likewise XZ/YZ along z at x_c. The
+    /// planes have the level's dimensions and the crosshair is clamped into the volume.
+    #[test]
+    fn portable_orthogonal_slices_agree_across_planes_and_report_their_level() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../test-data/two-channel-gradient.ome.zarr");
+        let mut session = LocalSession::default();
+        session.open_local_omezarr(&root).unwrap();
+        session.prepare_default_portable_image_layer().unwrap();
+        let slices = portable_orthogonal_slices(&session, Some([5, 7, 3])).unwrap();
+        let shape = slices.voxel_shape_xyz;
+        assert_eq!(slices.level, 0, "the fixture's level zero fits the page budget");
+        assert_eq!(slices.crosshair_xyz, [5, 7, 3]);
+        let [(xy_w, xy_h, ref xy), (xz_w, xz_h, ref xz), (yz_w, yz_h, ref yz)] = slices.planes;
+        assert_eq!((xy_w, xy_h), (shape[0], shape[1]));
+        assert_eq!((xz_w, xz_h), (shape[0], shape[2]));
+        assert_eq!((yz_w, yz_h), (shape[1], shape[2]));
+        let pixel = |rgba: &[u8], width: u32, x: u32, y: u32| {
+            let at = ((y * width + x) * 4) as usize;
+            rgba[at..at + 4].to_vec()
+        };
+        let mut distinct = std::collections::HashSet::new();
+        for x in 0..shape[0] {
+            // (x, 7, 3): XY slice at z=3 row 7; XZ slice at y=7 row 3.
+            assert_eq!(pixel(xy, xy_w, x, 7), pixel(xz, xz_w, x, 3), "x={x}: XY and XZ disagree");
+            distinct.insert(pixel(xy, xy_w, x, 7));
+        }
+        for z in 0..shape[2] {
+            // (5, 7, z): XZ slice at y=7 column 5; YZ slice at x=5 column 7.
+            assert_eq!(pixel(xz, xz_w, 5, z), pixel(yz, yz_w, 7, z), "z={z}: XZ and YZ disagree");
+        }
+        assert!(distinct.len() > 1, "a gradient row is not one colour");
+        // A crosshair beyond the volume is clamped, not refused; omitted, it is the centre.
+        let clamped = portable_orthogonal_slices(&session, Some([u32::MAX; 3])).unwrap();
+        assert_eq!(clamped.crosshair_xyz, [shape[0] - 1, shape[1] - 1, shape[2] - 1]);
+        let centred = portable_orthogonal_slices(&session, None).unwrap();
+        assert_eq!(centred.crosshair_xyz, [shape[0] / 2, shape[1] / 2, shape[2] / 2]);
+        let (pngs, _) = portable_orthogonal_slice_pngs(&session, Some([5, 7, 3])).unwrap();
+        for png in &pngs {
+            assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
+        }
+        assert_eq!(u32::from_be_bytes(pngs[0][16..20].try_into().unwrap()), shape[0], "XY PNG width");
+        assert_eq!(u32::from_be_bytes(pngs[1][20..24].try_into().unwrap()), shape[2], "XZ PNG height");
+    }
     #[test]
     fn desktop_frame_budget_bounds_colour_and_optional_depth_payloads() {
         assert_eq!(desktop_frame_size(4096, 4096, 1).unwrap().width, 4096);

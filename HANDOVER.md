@@ -44,6 +44,37 @@ under half a second at 256×192 (release). STAGE0 "Compressed and NGFF 0.5 store
 `zarrs`". The frame API is camelCase (`orbitX`, `orbitY`); snake_case keys are silently
 ignored. Remote (`http`/`s3`) opening is still not built.
 
+**2026-09-20: the web interface is rebuilt** in the style of `omezarr_viewers-rs` (Leptos,
+Rust; `crates/newvolim-ui/src/{api,cube,app}.rs`, `scene-webgpu.js`, `style.css`): dataset
+browser, 2×2 slice grid with crosshair and orientation box, 3D pane (server frames or the
+browser's own WebGPU render), layer cards with channel controls, `?dataset=` deep links. It
+talks only to `newvolim-server`. On the way three backend defects were fixed: orthogonal
+frames now come from the portable session (CPU slices at the finest level that fits the
+pages) instead of Vulkan; the CPU slicer's XZ/YZ planes were transposed and truncated; and the
+demand route now coarsens its level instead of refusing panes larger than ~256 px. STAGE0
+"The web interface, rebuilt". Build the page with `trunk build --release` in
+`crates/newvolim-ui` (no `wasm-opt` offline; `data-wasm-opt="0"`). Verify in a browser with
+the other repo's CDP driver (`scratchpad/shoot.py` pattern), not with `--virtual-time-budget`.
+
+**Camera:** `orbit_delta` is `[dx, dy]` of a screen drag and `camera_for_volume` (palace-frame)
+is a turntable — `dx` spins about the volume's vertical axis at 0.01 rad/px, `dy` tilts,
+clamped to ±89°. It replaced Palace's additive `pan_around` nudge, which also read the drag in
+`(y, x)` order (STAGE0 "Orbit axes were swapped", "A turntable camera"); pinned by
+`horizontal_orbit_yaws_and_vertical_orbit_pitches`.
+
+**Client-side residency (2026-09-20):** the page's "WebGPU" renderer runs the demand loop itself
+(`crates/newvolim-residency`, pure; `palace-core` now builds for wasm32; the scene dispatch
+code lives in `palace_core::gpu`) against `GET …/portable/plan`, `GET …/portable/rays` and
+`POST …/portable/chunks`, fetching only missed chunks and caching them across frames. Pinned
+by a CPU oracle (client dispatch == server dispatch, word for word) and an adapter parity test
+(client loop frame == server demand frame). The browser leg itself is unverified on this host
+(headless Chrome has no WebGPU adapter); it falls back to server frames with a notice. STAGE0
+"Client-side residency". Next there: rays generated in the page; reuse GPU buffers per pass.
+
+**Both the demand route and the browser packet coarsen their level** until it fits the four
+pages (`coarsen_levels`, `full_level_scene_inputs_fitting`); a pane-sized browser frame is
+tens of MB of packet per camera move (STAGE0 "The browser packet coarsens its level too").
+
 **Single port:** `newvolim-server --page-dir crates/newvolim-ui/dist` serves the page beside
 the API; the page defaults its server URL to its own origin. No Python anywhere in the
 deployment. STAGE0 "One port: the server serves the page".
@@ -62,7 +93,13 @@ resample with explicit rounding, affine and border, held to Vulkan's `resample_t
 
 Nothing is blocked. Ordered by value:
 
-0. **Remote stores** (TODO2 item 1). The read path is `zarrs` now, so `zarrs_opendal` or
+0. **The Tauri desktop must host the server.** The page invokes no Tauri command any more
+   (`webview_talks_to_the_server_routes_and_invokes_no_desktop_command`), so the desktop
+   webview shows the new page but has no backend. Run `newvolim-server`'s router in-process
+   in `newvolim-desktop` (bind `127.0.0.1:0`, point the webview at it, or serve through a
+   custom protocol) and delete the page-side Tauri commands that then have no caller. Until
+   then use the browser against `newvolim-server --page-dir`.
+0b. **Remote stores** (TODO2 item 1). The read path is `zarrs` now, so `zarrs_opendal` or
    `zarrs_object_store` behind a feature gives `http(s)://` and `s3://` without touching the
    session; the metadata readers for remote and S3 already exist in `newvolim-io`. Until then
    the mirror script in the session scratchpad (`mirror.py <store-url> <dir>`) is how a public

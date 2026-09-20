@@ -3,3 +3,6 @@
 # CMake honours this as an environment variable and configures it anyway.
 [env]
 CMAKE_POLICY_VERSION_MINIMUM = "3.5"
+
+[target.wasm32-unknown-unknown]
+rustflags = ['--cfg', 'getrandom_backend="wasm_js"']

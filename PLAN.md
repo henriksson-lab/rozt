@@ -87,6 +87,9 @@ tables, our GUI) stays in newvolim.
 - **GUI: Leptos**, and therefore **Tauri** for the desktop build.
 - **2D slice and orthogonal views** as in `omezarr_viewers-rs`, but driven by palace rather
   than reimplemented.
+- **Web interface** (rebuilt 2026-09-20 after `omezarr_viewers-rs`; Leptos + one WebGPU
+  script; talks to `newvolim-server` only — the desktop must host that server next). Its
+  WebGPU renderer runs client-side residency (`crates/newvolim-residency`).
 - **IO via `zarrs`** (chunk decoding does since 2026-09-19: `newvolim_io::read_array_region`;
   remote backends still to add) with the same reach as `omezarr_viewers-rs`: local files, HTTP, S3, and
   an SSH remote agent, under an allow-list permission model.

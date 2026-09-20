@@ -9,6 +9,7 @@ description = "Portable-renderer session and routes shared by the newvolim deskt
 base64 = "0.22"
 newvolim-io = { path = "../newvolim-io" }
 newvolim-render = { path = "../newvolim-render" }
+newvolim-residency = { path = "../newvolim-residency" }
 newvolim-wgpu-frame = { path = "../newvolim-wgpu-frame" }
 newvolim-scene = { path = "../newvolim-scene" }
 palace-frame = { path = "../../palace-dev/palace-frame" }

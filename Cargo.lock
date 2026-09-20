@@ -4075,6 +4075,7 @@ dependencies = [
  "base64 0.22.1",
  "newvolim-io",
  "newvolim-render",
+ "newvolim-residency",
  "newvolim-scene",
  "newvolim-wgpu-frame",
  "palace-core",
@@ -4098,6 +4099,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "newvolim-residency"
+version = "0.1.0"
+dependencies = [
+ "palace-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "newvolim-scene"
 version = "0.1.0"
 dependencies = [
@@ -4114,6 +4124,7 @@ dependencies = [
  "newvolim-io",
  "newvolim-portable",
  "newvolim-render",
+ "newvolim-residency",
  "newvolim-scene",
  "palace-frame",
  "palace-png",
@@ -4132,10 +4143,16 @@ dependencies = [
 name = "newvolim-ui"
 version = "0.1.0"
 dependencies = [
+ "getrandom 0.3.4",
+ "gloo-net",
  "js-sys",
  "leptos",
- "newvolim-decode-bench",
+ "newvolim-residency",
+ "palace-core",
+ "serde",
+ "serde_json",
  "wasm-bindgen",
+ "wasm-bindgen-futures",
  "web-sys",
 ]
 

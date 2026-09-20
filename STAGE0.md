@@ -5371,3 +5371,274 @@ and a CORS allow-list between them. The user wants a Rust deployment on a single
 - Live: one process on `0.0.0.0:9876` serves `/` (130 KB HTML), the 34 KB JS, the 15.9 MB
   wasm as `application/wasm`, and `/v1/datasets`, checked from the host address; the Python
   server is stopped and port 8080 is closed.
+
+## The web interface, rebuilt (2026-09-20)
+
+The user asked for a total overhaul of the GUI in the style of `omezarr_viewers-rs`, which
+already had a mature Yew viewer. Its frontend was studied first (layout, stylesheet, panel
+components, state model, the pure-Rust orientation box, its API contract), and the parts that
+are backend-agnostic were ported to `newvolim-ui` (Leptos 0.8 CSR, Rust, one small JavaScript
+file for the WebGPU API). The 2189-line `index.html` of page JavaScript with 95 `window.*`
+functions is gone.
+
+**What the page is now** (`crates/newvolim-ui`):
+
+- `src/api.rs` — the server's wire vocabulary (frame and channel requests, the four socket
+  replies, layer summaries, channel input), the origin rule (empty box = the page's own
+  origin over http(s); `file:`/`tauri:` must name the server) and the route URLs. Pure serde,
+  tested natively with JSON recorded from the live server.
+- `src/cube.rs` — the orientation box from `omezarr_viewers-rs` (`CubeView`: near-isometric
+  orthographic camera, plane hit test, drag-to-fraction), pure Rust with native tests.
+- `src/app.rs` — `Session` (signals; latest-only request discipline per kind: a newer camera
+  or crosshair while a frame is in flight only marks it dirty and the reply sends the next
+  request), the frame socket, and the components: front page (dataset browser, server URL),
+  tab strip, tool strip (Grid / XY / 3D view modes; Server / WebGPU renderer; reset), the 2×2
+  grid of XY, XZ, YZ slices with crosshair overlays (click moves the crosshair, wheel steps
+  the perpendicular axis) and the 3D pane (drag orbits, wheel zooms) with the orientation box
+  inset (drag a plane to scrub its axis), axis sliders, a status line, and the sidebar of
+  layer cards with per-channel checkbox, colour, contrast dual-range and opacity, plus "Add
+  layer". `?dataset=name` deep-links straight into a dataset.
+- `scene-webgpu.js` — the browser-side renderer: fetch the scene packet, dispatch the
+  desktop's WGSL on WebGPU with the nine documented bindings, blit. Called from Rust.
+- `style.css` — the other viewer's stylesheet with its literals lifted into variables.
+- Release wasm 2.6 MB (`trunk build --release`, `data-wasm-opt="0"` because `wasm-opt` is
+  not installed and cannot be fetched offline); the previous dev build was 17 MB.
+
+**Three backend defects the new page exposed, all fixed:**
+
+1. **Orthogonal frames went through Palace's Vulkan slicer**, which fails on the compressed
+   mirrors ("array metadata is missing"). `portable_orthogonal_slices` /
+   `portable_orthogonal_slice_pngs` (routes) slice the base layer on the CPU from the portable
+   session at the finest pyramid level whose whole extent fits the four static pages; the
+   server's orthogonal branch uses it, Vulkan is the fallback, and the fallback's error now
+   carries the portable reason. Planes come at the level's own resolution (the page stretches
+   them; the crosshair overlay is a fraction of the pane). Further layers are not sliced yet.
+2. **The CPU slicer's XZ and YZ planes were transposed and truncated**: `palace_scene_slice_rgba_with_sampling`
+   ran z across and the other axis down while declaring the opposite width and height, so the
+   desktop's side panes had been wrong all along and nothing pinned them. Measured on a store
+   with one unique value per voxel and fixed; the guard is the measured mapping.
+3. **The demand route refused any pane larger than about 256 px on real data**: the camera
+   chose a finer level than the four pages hold (`ExceedsPortableBound`, 17 pages for the IDR
+   image, 128 for backpack) and the frame fell to Vulkan, which fails on those stores. The
+   route now steps every layer one level coarser and retries until the level fits or none is
+   left (`coarsen_levels`, `DEMAND_EXCEEDS_PAGE_BOUND`), and the scene route reports the demand
+   route's reason when every fallback fails.
+
+Also found and recorded: the socket's discriminator is `type`, not `kind` (the server renames
+its `kind` field on the wire); my first page rejected every reply and my first unit test had
+only confirmed my own assumption — the tests now use recorded server JSON.
+
+**Not in this pass:** the Tauri desktop. The page no longer invokes Tauri commands, so the
+desktop host's webview needs an HTTP server behind it; running `newvolim-server` in-process
+is the next step (HANDOVER). The desktop's scene commands stay registered for that. Also not
+built: annotations in the page (the server has no annotation API), picking in the browser,
+labels layers, physical aspect ratio of the side slices, per-layer visibility (the server has
+only per-channel enable).
+
+### Evidence
+
+- `newvolim-ui` native (CPU): 9 tests — camelCase request keys (`orbitX`…), the flattened
+  channel edit, the four replies from recorded server JSON with the old `kind` guess rejected,
+  the origin rule, route URLs, colour hex; cube fit / no edge-on axis / slab refuses a z drag,
+  press grabs the nearest plane, a full-span drag moves a cut face to face and a perpendicular
+  drag does not move it.
+- `newvolim-portable` (CPU): `portable_orthogonal_slice_pixels_map_to_voxels_as_documented`
+  (8×8×4 store, `v = 256·(x+8y+64z)`, every pixel of all three planes decoded from alpha to
+  its voxel: XY (x across, y down) at z=3, XZ (x, z) at y=5, YZ (y, z) at x=2);
+  `portable_orthogonal_slices_agree_across_planes_and_report_their_level` (gradient fixture:
+  XY row y_c equals XZ row z_c, XZ column x_c equals YZ column y_c, level 0, clamped and
+  centred crosshairs, PNG headers and dimensions); `coarsen_levels_…`.
+- `newvolim-portable` (adapter, `--ignored`): `demand_route_coarsens_the_level_when_the_pages_cannot_hold_it`
+  — a two-level zstd store, 512×512×40 uint16 over 256×256×20; at 640×480 the camera wants
+  level 0, level 0 alone fails with the bound message, the route renders (Demand) with more
+  than a tenth of the rays hitting.
+- `newvolim-server` (CPU): the bindings pin now reads `scene-webgpu.js`; the orthogonal test
+  expects per-plane voxel dimensions (128×128, 128×32, 128×32 for cells3d). Desktop: the two
+  page-wiring tests replaced by `webview_talks_to_the_server_routes_and_invokes_no_desktop_command`.
+- **Mutations:** raw session reads → both codec tests fail (earlier entry); the old transposed
+  sampling → both slice tests fail (`(0,5,1)` vs `(1,5,0)`); coarsening disabled → the adapter
+  test fails with "11 pages needed at the coarsest levels [0]".
+- Suites, all `--test-threads=1`, debug, relocated target: portable 53 default + 18 adapter,
+  server 22 + 2 adapter, ui 9, io 25, desktop 2; `trunk build --release` succeeds; `git diff
+  --check` clean.
+- **Live, release server, Chrome 2026-09-20 driven over the DevTools protocol** (the other
+  repo's `tests/browser/cdp.py`; screenshots in the session scratchpad `final-1..3.png`):
+  `?dataset=idr6001240` opens to the grid with slices at level 2 (67×68, 67×236, 68×236) in
+  88–100 ms and the volume frame in 388 ms at 559×406; a click in XY moves the crosshair
+  (135,137,118 → 80,164,118) and the slices follow; a 120×−60 drag orbits and the volume
+  returns in 362 ms. Volume frames over the socket, orbit 30/−20: IDR 105 ms at 256×192,
+  ~300 ms at 560×406, ~0.9–1.0 s at 1120×810; backpack 40 / 170 / 710 ms. Before the
+  coarsening fix every size above 256×192 was an error.
+- Headless-Chrome screenshots with `--virtual-time-budget` are unreliable for this page (the
+  budget does not wait for the network); the CDP driver with a real settle is what works.
+
+## Orbit axes were swapped (2026-09-20)
+
+The user noticed that dragging in the 3D view mixed up x and y. Measured by projecting physical
+points through `palace_frame`'s camera on the cells3d fixture: a horizontal drag left the point
+on the screen-horizontal axis fixed (a pitch) and a vertical drag left the vertical-axis point
+fixed (a yaw). Cause: `camera_for_volume` handed `orbit_delta` (`[dx, dy]`) to the trackball's
+`pan_around` as a Palace `Vector<D2>`, which is stored `(y, x)` like Palace's `(z, y, x)`
+volumes — so `dx` became the vertical component. Every route derives its rays from this one
+camera, so the desktop, the server frames, the browser packet and the old page all had it.
+
+Fix in `palace-dev/palace-frame/src/lib.rs`: `pan_around([-dy, dx])` — `dx` is the trackball's
+x (a yaw whose near face follows a rightward drag) and the trackball's vertical component moves
+the near face up for a positive value, so a screen-down drag is its negative.
+
+### Evidence
+
+- `horizontal_orbit_yaws_and_vertical_orbit_pitches` (portable, CPU): on cells3d
+  (128×128×32 at 0.26/0.26/0.29) the centre projects to (199.5, 149.5) under every orbit; at
+  rest +x is right and +y is up; under orbit [200, 0] the vertical-axis point stays, +x moves
+  along the horizontal and the near point moves right; under [0, 200] the horizontal-axis point
+  stays and the near point moves down.
+- **Mutation:** the old order — the test fails at "yaw keeps the vertical axis: [199.5, 84.7]".
+- Sweep, all `--test-threads=1`, debug: palace-frame 13, portable 54 + 18 adapter, server 22 +
+  2, desktop 2, wgpu-frame 3 + 5, render 25; the route-comparison and picker tests pass
+  unchanged because every route shares the corrected camera; `git diff --check` clean.
+- Release server, backpack at 320×240: orbit [300, 0] turns the volume about the screen-vertical
+  axis (the scanner's cylinder axis goes horizontal), [0, 300] tilts it; before the fix the two
+  were the other way round (`scratchpad/orbit-montage.png` vs `orbit2-montage.png`).
+
+## The browser packet coarsens its level too (2026-09-20)
+
+The user pressed "WebGPU" and the object vanished. The scene packet route
+(`/portable/scene`) planned the camera's level with `full_level_scene_inputs` and, at pane
+size over a real volume, stopped at the four-page bound (`ExceedsPortableBound`, 17 pages
+for the IDR image, 128 for backpack) — the same refusal the volume route had until the
+coarsening fix, which had not been applied here. The page then had an empty canvas and the
+error only in the status line.
+
+`full_level_scene_inputs_fitting` (routes) chooses the camera's levels and steps every layer
+coarser until the whole level fits, returning the levels used; `browser_scene_packet` uses it.
+`full_level_scene_inputs` now reports the bound with the `DEMAND_EXCEEDS_PAGE_BOUND` prefix so
+the retry keys off a known condition.
+
+### Evidence
+
+- `full_level_planning_coarsens_the_level_when_the_pages_cannot_hold_it` (portable, CPU — the
+  packet's planning and page assembly touch no adapter): on the oversized two-level store at
+  640×480 level 0 alone is refused with the bound message and the fitting planner returns
+  levels `[1]` with one ray per pixel.
+- **Mutation:** coarsening disabled — the test fails with "11 pages needed at the coarsest
+  levels [0]".
+- Portable 55 default + 18 adapter, server 22 + 2, `git diff --check` clean.
+- Release server: the packet for IDR and backpack at 560×406 returns in 0.34 s (21–26 MB of
+  JSON, level 2) and at 1120×810 in 0.8–0.9 s (50–55 MB); both were HTTP 400 before. The
+  packet carries the rays and pages as base64 words, so a pane-sized browser frame is tens of
+  megabytes per camera move — the price of the page computing nothing itself; client-side
+  residency (TODO2) is the way past it.
+
+## A turntable camera, and XZ / YZ views (2026-09-20)
+
+After the axis swap was fixed the user still found the horizontal drag wrong. The remaining
+cause was the camera model: the server applied Palace's `pan_around` once with the *total*
+drag. That nudges the look vector additively — right for one mouse event, but as a function of
+the whole drag it saturates at 90° and turns about a drifting axis, so a long horizontal drag
+stopped reading as a turn about the vertical.
+
+`camera_for_volume` (palace-frame) is now a turntable: the total horizontal drag spins the
+fitted eye about the volume's vertical axis (image y) at 0.01 rad per pixel, the vertical drag
+tilts it, clamped to ±89° so `up` stays defined; zoom still moves the eye in and out. It is one
+function every route derives its rays from, so the desktop, the server frames, the browser
+packet and the projections all share it.
+
+The page gained XZ and YZ single-pane modes beside XY, Grid and 3D; the orthogonal request is
+sized by whichever slice pane is visible and is skipped while none is.
+
+### Evidence
+
+- `horizontal_orbit_yaws_and_vertical_orbit_pitches` (portable, CPU) extended: a 314-pixel
+  drag (π) shows the volume from behind — +x mirrored to the left, the near face now farther
+  than at rest by ray distance — a 157-pixel drag puts +x on the view axis, and a 2000-pixel
+  vertical drag still yields a camera.
+- **Mutation:** the previous camera (the fixed-order nudge) — fails at "half turn mirrors +x:
+  [247.6, 149.5]" (it never crosses the centre).
+- Sweep, all `--test-threads=1`, debug: palace-frame 13, portable 55 + 18 adapter, server 22
+  + 2, desktop 2, wgpu-frame 3 + 5; `git diff --check` clean.
+- Live, release server, Chrome over CDP on backpack: a 160 px right drag turns the scan a
+  quarter turn about the vertical (the lid stays on top, the side comes round), a 100 px down
+  drag tilts it (`scratchpad/turn-montage.png`); XZ mode shows one 1120 px pane with the
+  crosshair and slices in 110 ms.
+
+## Client-side residency (2026-09-20)
+
+The user asked for it. Until now the browser's own renderer received the *whole* level in the
+packet (tens of MB per camera move) and could show only a level that fits the four pages. Now
+the page runs the demand-driven residency loop itself and fetches only the chunks the shader
+missed, keeping them across camera moves.
+
+**Enablers.** `palace-core` builds for wasm32 once `gpu-allocator` is a native-only dependency
+(the Vulkan modules that use it were already `cfg(not(wasm32))`); its portable `gpu` module
+imports nothing but `std::ops`. The scene dispatch packing, the output decoding and the WGSL
+(`SceneDvrDispatch`, `scene_dvr_dispatch`, `scene_frame_from_output`, `SCENE_DVR_SHADER`,
+the trace labels) moved from `palace-wgpu` into `palace-core::gpu` — 350 lines that touch no
+wgpu type — and `palace-wgpu` re-exports them. A wasm build also needs `getrandom` 0.3's
+`wasm_js` backend (feature + `.cargo/config.toml` cfg for the wasm target).
+
+**`crates/newvolim-residency`** (new, pure): `ScenePlan` (per layer: id, level, extent, chunk
+shape, box; per channel: source index, scene ordinal, residency tag, owner base, transfer),
+`ChunkRequest` (layer, level, channel, chunk index and grid coordinate), `ChunkCache` (words
+by ordinal/level/chunk, bounded, oldest out first, the newest never starved), and
+`ClientResidency`: one `PortableResidencyLoop` per channel, `absorb_requests` decoding the
+shader's request table exactly as the server does, `missing_chunks`, `insert_chunk`,
+`assemble` (the server's `assemble_demand_scene` + `demand_scene_layer_pages` +
+`portable_chunk_plan_pages`, with the cache for the disk: placeholder page when a channel has
+nothing yet, chunks placed at the plan's `first_word`, page lengths and owners from the plan)
+and `dispatch` (the recorder's nine bindings). `coarser_levels` for the page-bound retry.
+
+**Server** (`newvolim-portable` + `newvolim-server`): `demand_scene_plan` (the prepared scene
+minus pages and rays) and `layer_chunk_words` (the words of named chunks, X-fastest logical
+extent, via the session's chunk planner and `zarrs` reads), behind
+`GET /v1/datasets/{d}/portable/plan?width&height&orbitX&orbitY&zoom[&levels=a,b]` (JSON),
+`GET …/portable/rays?…` (binary LE words, eight per pixel) and
+`POST …/portable/chunks {layerId, level, sourceIndex, chunks:[[x,y,z]…]}` (binary: per chunk a
+word count then the words, up to 256 per request).
+
+**Page** (`newvolim-ui`): "WebGPU" now runs the loop — plan and rays for the camera, then
+dispatch, absorb, fetch the missing chunks grouped by (layer, level, channel), dispatch again
+until complete; `ExceedsPortableBound` re-fetches the plan one level coarser with the cache
+kept; the cache (256 MiB) persists across frames. `scene-webgpu.js` is now only `dispatch`
+(one pass, returning output and request words) and `present`; the shader is the page's own
+copy of `SCENE_DVR_SHADER` from palace-core, installed into the script once. When WebGPU is
+unavailable the page says so in a sticky notice and falls back to server frames instead of
+leaving the 3D pane empty.
+
+### Evidence
+
+- `newvolim-residency` (CPU): a frame starts with a placeholder page and an empty map; missed
+  keys plan chunks in ascending order once each; dispatch before fetching is refused; two
+  fetched chunks land back to back at the plan's placement (a full 4×4×1 chunk then the 2×4×1
+  edge chunk); an empty request table completes; a key for a channel the frame lacks is an
+  error; a chunk larger than a page reports the bound; the cache evicts oldest first and keeps
+  an over-budget newcomer; rays round-trip through their words; the plan is camelCase JSON.
+- `client_residency_assembles_the_servers_dispatch_word_for_word` (portable, CPU): a
+  256×256×64 store in 64×64×32 chunks (32 chunks); both sides absorb every other chunk
+  (16 chunks over two full pages); the client's `dispatch()` — pages, scene data with the
+  residency map, rays, uniform — equals the server's `scene_dvr_dispatch` of its own assembly,
+  with the plan having gone through JSON and the chunks through `layer_chunk_words`.
+  **Mutation:** chunks paged in reverse plan order — fails ("chunk 30 is placed at word 917504
+  but the page holds 0"). (On the cells3d fixture this mutant passed, because each channel
+  planned one chunk; hence the 32-chunk store.)
+- `client_residency_loop_renders_the_servers_demand_frame` (portable, adapter): the client loop
+  driven with the session's reads and the local adapter converges to the server's demand frame,
+  colour and depth pixel for pixel, having fetched only what the shader asked for.
+- `newvolim-ui` (CPU): the three route URLs, the chunk request body and the binary chunk reply
+  decoder, including short and trailing input.
+- Sweep, all `--test-threads=1`, debug: residency 4, ui 10, io 25, render 25, portable 56 +
+  19 adapter, server 22 + 2, desktop 2, wgpu-frame 3 + 5, palace-frame 13, palace-wgpu 16
+  (own directory), palace-core 91 native and a clean wasm32 build; `trunk build --release`
+  (wasm 2.85 MB); `git diff --check` clean.
+- Release server, IDR image at 560×406: the plan is 8 KB in 46 ms, the rays 7.3 MB in 67 ms,
+  three level-0 chunks (one z-slice each, 74 525 words) 894 KB in 20 ms.
+- **Not verified here:** the page's WebGPU leg. Headless Chrome on this host grants no WebGPU
+  adapter (hardware Vulkan flags or SwiftShader), so the loop in the browser was exercised only
+  as far as the adapter request; it then fell back to server frames with the notice "WebGPU is
+  present but no adapter was granted", which is the intended fallback. The dispatch glue is
+  the same shape as the previous packet renderer's. It needs a browser with WebGPU.
+
+**Left open:** the rays are still fetched (7 MB per pane-sized move); generating them in the
+page from the camera would leave only chunks and an 8 KB plan on the wire. GPU buffers are
+recreated per pass. Only image layers; the per-pass fetch is serial per (layer, level,
+channel) group.

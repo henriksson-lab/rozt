@@ -3,14 +3,28 @@ name = "newvolim-ui"
 version = "0.1.0"
 edition = "2021"
 license = "MPL-2.0"
-description = "CSR Leptos canvas UI for newvolim"
+description = "CSR Leptos web interface for newvolim: server frames, browser WebGPU scene, layer controls"
 
 [lib]
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# `palace-core` reaches getrandom 0.3 transitively; the browser backend is opt-in (plus the
+# `getrandom_backend="wasm_js"` cfg in .cargo/config.toml).
+getrandom = { version = "0.3", features = ["wasm_js"] }
+gloo-net = { version = "0.6", default-features = false, features = ["http", "json"] }
 js-sys = "0.3"
 leptos = { version = "0.8.19", features = ["csr"] }
-newvolim-decode-bench = { path = "../newvolim-decode-bench" }
+newvolim-residency = { path = "../newvolim-residency" }
+palace-core = { path = "../../palace-dev/palace-core", default-features = false }
 wasm-bindgen = "0.2"
-web-sys = { version = "0.3", features = ["Window"] }
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = [
+  "CanvasRenderingContext2d", "CloseEvent", "console", "DomRect", "Element", "ErrorEvent", "Event",
+  "HtmlCanvasElement", "HtmlElement", "HtmlInputElement", "HtmlSelectElement", "KeyboardEvent", "Location",
+  "MessageEvent", "MouseEvent", "PointerEvent", "WebSocket", "WheelEvent", "Window",
+] }
