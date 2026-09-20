@@ -26,6 +26,7 @@ use newvolim_scene::{
 };
 use serde::{Deserialize, Serialize};
 use std::sync::{
+    Mutex,
     Arc, OnceLock,
     atomic::{AtomicUsize, Ordering},
 };
@@ -45,6 +46,117 @@ pub struct LocalSession {
     next_annotation_id: u64,
     portable_device: Arc<OnceLock<Option<(wgpu::Device, wgpu::Queue)>>>,
     depth_scale: DepthScale,
+    /// Decoded chunk words, kept across frames and shared by every clone of the session (the
+    /// server hands out clones), so a frame reads from disk only what no frame has read yet.
+    chunk_words: Arc<Mutex<SessionChunkCache>>,
+    /// Finished page packing for a channel's exact chunk plan. Pages are immutable and their
+    /// scalar storage is shared across frames, while each frame keeps its own camera and LUT.
+    packed_pages: Arc<Mutex<SessionPageCache>>,
+}
+
+#[derive(Debug)]
+struct SessionPageCache {
+    entries: HashMap<(PathBuf, u64, u32, u32), (palace_core::gpu::PortableChunkPlan, Vec<palace_core::gpu::PortableTensorPage>)>,
+    order: std::collections::VecDeque<(PathBuf, u64, u32, u32)>,
+    total_words: usize,
+    hits: u64,
+    misses: u64,
+}
+
+impl SessionPageCache {
+    const BUDGET_WORDS: usize = 64 * 1024 * 1024; // 256 MiB, separate from decoded chunks.
+
+    fn get(&mut self, key: &(PathBuf, u64, u32, u32), plan: &palace_core::gpu::PortableChunkPlan) -> Option<Vec<palace_core::gpu::PortableTensorPage>> {
+        let pages = self.entries.get(key)
+            .and_then(|(cached_plan, pages)| (cached_plan == plan).then(|| pages.clone()));
+        if pages.is_some() {
+            self.hits += 1;
+            self.order.retain(|held| held != key);
+            self.order.push_back(key.clone());
+        } else {
+            self.misses += 1;
+        }
+        pages
+    }
+
+    fn insert(&mut self, key: (PathBuf, u64, u32, u32), plan: &palace_core::gpu::PortableChunkPlan, pages: &[palace_core::gpu::PortableTensorPage]) {
+        if let Some((_, old)) = self.entries.remove(&key) {
+            self.total_words -= old.iter().map(|page| page.words().len()).sum::<usize>();
+            self.order.retain(|held| *held != key);
+        }
+        self.total_words += pages.iter().map(|page| page.words().len()).sum::<usize>();
+        self.entries.insert(key.clone(), (plan.clone(), pages.to_vec()));
+        self.order.push_back(key);
+        while self.total_words > Self::BUDGET_WORDS && self.order.len() > 1 {
+            let Some(oldest) = self.order.pop_front() else { break };
+            if let Some((_, old)) = self.entries.remove(&oldest) {
+                self.total_words -= old.iter().map(|page| page.words().len()).sum::<usize>();
+            }
+        }
+    }
+
+    fn stats(&self) -> (u64, u64, usize, usize) {
+        (self.hits, self.misses, self.entries.len(), self.total_words)
+    }
+}
+
+impl Default for SessionPageCache {
+    fn default() -> Self {
+        Self { entries: HashMap::new(), order: Default::default(), total_words: 0, hits: 0, misses: 0 }
+    }
+}
+
+/// Chunk words by (layer, level, source channel, chunk index), bounded in words, oldest out
+/// first; the newest chunk always lands so a frame can never starve.
+#[derive(Debug)]
+pub struct SessionChunkCache {
+    words: HashMap<(u64, u32, u32, u32), Arc<Vec<u32>>>,
+    order: std::collections::VecDeque<(u64, u32, u32, u32)>,
+    total_words: usize,
+    budget_words: usize,
+    hits: u64,
+    misses: u64,
+}
+
+impl SessionChunkCache {
+    /// 128 M words: 512 MiB of decoded chunks per dataset session.
+    pub const DEFAULT_BUDGET_WORDS: usize = 128 * 1024 * 1024;
+
+    pub fn new(budget_words: usize) -> Self {
+        Self { words: HashMap::new(), order: Default::default(), total_words: 0, budget_words, hits: 0, misses: 0 }
+    }
+
+    fn get(&mut self, key: (u64, u32, u32, u32)) -> Option<Arc<Vec<u32>>> {
+        let found = self.words.get(&key).cloned();
+        if found.is_some() { self.hits += 1 } else { self.misses += 1 }
+        found
+    }
+
+    fn insert(&mut self, key: (u64, u32, u32, u32), words: Arc<Vec<u32>>) {
+        if let Some(previous) = self.words.insert(key, words.clone()) {
+            self.total_words -= previous.len();
+            self.order.retain(|k| *k != key);
+        }
+        self.total_words += words.len();
+        self.order.push_back(key);
+        while self.total_words > self.budget_words && self.order.len() > 1 {
+            let Some(oldest) = self.order.pop_front() else { break };
+            if let Some(evicted) = self.words.remove(&oldest) {
+                self.total_words -= evicted.len();
+            }
+        }
+    }
+
+    /// `(hits, misses, chunks held, words held)`.
+    pub fn stats(&self) -> (u64, u64, usize, usize) {
+        (self.hits, self.misses, self.words.len(), self.total_words)
+    }
+}
+
+impl Default for SessionChunkCache {
+    fn default() -> Self {
+        Self::new(Self::DEFAULT_BUDGET_WORDS)
+    }
 }
 
 /// How far light penetrates the volume, as a multiplier on the scene's opacity reference: the
@@ -55,7 +167,7 @@ pub struct DepthScale(f32);
 
 impl DepthScale {
     pub const MIN: f32 = 0.05;
-    pub const MAX: f32 = 20.0;
+    pub const MAX: f32 = 100.0;
 
     pub fn new(scale: f32) -> Option<Self> {
         (scale.is_finite() && (Self::MIN..=Self::MAX).contains(&scale)).then_some(Self(scale))
@@ -533,6 +645,12 @@ impl LocalSession {
                         ])
                     })
             });
+        // A reopened session can reuse layer IDs; its decoded chunks and packed pages belong
+        // to the previous root and must not follow those IDs into the new dataset.
+        self.chunk_words = Arc::new(Mutex::new(SessionChunkCache::default()));
+        self.packed_pages = Arc::new(Mutex::new(SessionPageCache::default()));
+        self.layer_sources.clear();
+        self.layer_datasets.clear();
         self.dataset_root = Some(root);
         self.metadata = Some(metadata);
         self.voxel_shape_xyz = voxel_shape_xyz;
@@ -1536,6 +1654,120 @@ impl LocalSession {
     /// Every chunk is checked against the plan's own offsets rather than trusted: a chunk whose
     /// word count or placement disagrees with what was planned is refused, because rendering it
     /// would silently read a neighbour's scalars through the residency map.
+    /// The chunk cache's `(hits, misses, chunks, words)`.
+    pub fn chunk_cache_stats(&self) -> (u64, u64, usize, usize) {
+        self.chunk_words.lock().map(|cache| cache.stats()).unwrap_or((0, 0, 0, 0))
+    }
+
+    pub fn packed_pages_for_plan(
+        &self,
+        layer_id: LayerId,
+        level: u32,
+        channel: u32,
+        plan: &palace_core::gpu::PortableChunkPlan,
+    ) -> Result<Option<Vec<palace_core::gpu::PortableTensorPage>>, SessionError> {
+        let key = (self.layer_dataset(layer_id)?.0.to_path_buf(), layer_id.0, level, channel);
+        self.packed_pages.lock()
+            .map_err(|_| SessionError::LayerSource("page cache lock was poisoned".into()))
+            .map(|mut cache| cache.get(&key, plan))
+    }
+
+    pub fn remember_packed_pages(
+        &self,
+        layer_id: LayerId,
+        level: u32,
+        channel: u32,
+        plan: &palace_core::gpu::PortableChunkPlan,
+        pages: &[palace_core::gpu::PortableTensorPage],
+    ) -> Result<(), SessionError> {
+        let key = (self.layer_dataset(layer_id)?.0.to_path_buf(), layer_id.0, level, channel);
+        let mut cache = self.packed_pages.lock()
+            .map_err(|_| SessionError::LayerSource("page cache lock was poisoned".into()))?;
+        cache.insert(key, plan, pages);
+        Ok(())
+    }
+
+    pub fn page_cache_stats(&self) -> (u64, u64, usize, usize) {
+        self.packed_pages.lock().map(|cache| cache.stats()).unwrap_or((0, 0, 0, 0))
+    }
+
+    /// The words of the named chunks (grid indices, X fastest) of one layer, level and source
+    /// channel, in request order, from the cache — only chunks no frame has read yet touch the
+    /// disk. Words are shared (`Arc`) so a page assembly copies once.
+    pub fn layer_chunk_words_cached(
+        &self,
+        limits: LayerRenderLimits,
+        layer_id: LayerId,
+        level: u32,
+        channel: u32,
+        chunk_indices: &[u32],
+    ) -> Result<Vec<Arc<Vec<u32>>>, SessionError> {
+        let key = |index: u32| (layer_id.0, level, channel, index);
+        let mut found: HashMap<u32, Arc<Vec<u32>>> = HashMap::new();
+        let mut missing: Vec<u32> = Vec::new();
+        {
+            let mut cache = self
+                .chunk_words
+                .lock()
+                .map_err(|_| SessionError::LayerSource("chunk cache lock was poisoned".into()))?;
+            for &index in chunk_indices {
+                if found.contains_key(&index) || missing.contains(&index) {
+                    continue;
+                }
+                match cache.get(key(index)) {
+                    Some(words) => {
+                        found.insert(index, words);
+                    }
+                    None => missing.push(index),
+                }
+            }
+        }
+        if !missing.is_empty() {
+            let request = self
+                .local_layer_render_requests_at_level(limits, level)?
+                .into_iter()
+                .find(|request| request.layer.layer_id == layer_id)
+                .ok_or_else(|| SessionError::LayerSource(format!("layer {} is not in the render plan", layer_id.0)))?;
+            let source = &request.source;
+            let spatial: [usize; 3] = source.spatial_axes_xyz.map(|axis| axis as usize);
+            let counts: [u64; 3] = std::array::from_fn(|axis| {
+                source.shape[spatial[axis]].div_ceil(source.chunk_shape[spatial[axis]].max(1))
+            });
+            let coordinates: Vec<[u64; 3]> = missing
+                .iter()
+                .map(|&index| {
+                    let index = u64::from(index);
+                    [index % counts[0], (index / counts[0]) % counts[1], index / (counts[0] * counts[1])]
+                })
+                .collect();
+            let plan = self.layer_chunk_plan_for_chunks_at_level(limits, layer_id, level, &coordinates, 4_096)?;
+            let loaded = self.read_local_layer_chunks(std::slice::from_ref(&plan), 16 * 1024 * 1024, 256 * 1024 * 1024)?;
+            let [x_count, y_count, _] = counts.map(|count| count as u32);
+            let mut cache = self
+                .chunk_words
+                .lock()
+                .map_err(|_| SessionError::LayerSource("chunk cache lock was poisoned".into()))?;
+            for entry in &loaded {
+                if entry.address.channel != channel {
+                    continue;
+                }
+                let Some(index) = linear_chunk_index(entry.address.spatial_chunk_xyz, x_count, y_count) else { continue };
+                let words = Arc::new(portable_words_xyz(&entry.bytes, &entry.address, source)?);
+                cache.insert(key(index), words.clone());
+                found.insert(index, words);
+            }
+        }
+        chunk_indices
+            .iter()
+            .map(|index| {
+                found
+                    .get(index)
+                    .cloned()
+                    .ok_or_else(|| SessionError::LayerSource(format!("chunk {index} of channel {channel} was not read")))
+            })
+            .collect()
+    }
+
     /// One loaded chunk as X-fastest XYZ words: what a page holds for it. For the client
     /// residency route, which ships chunk words instead of pages.
     pub fn chunk_words_xyz(

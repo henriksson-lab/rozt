@@ -22,6 +22,7 @@ use palace_core::gpu::{
     PortableResidencyLoop, PortableResidencyStep, PortableResidencyTag, PortableTensorPage,
     PortableTransferFunction, SceneDvrDispatch,
 };
+use palace_core::{data::Vector, dim::D3};
 use serde::{Deserialize, Serialize};
 
 /// The residency map the demand route builds: 4096 slots, 16 probes.
@@ -39,6 +40,8 @@ pub const RAY_WORDS: usize = 8;
 pub struct ScenePlan {
     pub width: u32,
     pub height: u32,
+    /// Fitted camera and scene box, enough to produce the exact ray table locally.
+    pub camera: RayCamera,
     /// The pyramid level of each visible image layer, in plan order.
     pub levels: Vec<u32>,
     /// How many levels each layer has, so the client can coarsen when a level's working set
@@ -47,6 +50,21 @@ pub struct ScenePlan {
     pub step: f32,
     pub opacity_reference: f32,
     pub layers: Vec<PlanLayer>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RayCamera {
+    /// Palace's fitted camera uses the source array's ZYX axis order.
+    pub origin_zyx: [f32; 3],
+    pub forward_zyx: [f32; 3],
+    pub right_zyx: [f32; 3],
+    pub up_zyx: [f32; 3],
+    pub focal_scale: f32,
+    /// NGFF translation is f64; addition to the f32 fitted origin happens before rounding.
+    pub translation_xyz: [f64; 3],
+    pub minimum: [f32; 3],
+    pub maximum: [f32; 3],
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -310,30 +328,10 @@ impl ClientResidency {
                 .map(|page| vec![page])
                 .ok_or_else(|| "placeholder page is invalid".to_owned());
         }
-        let mut pages: Vec<Vec<u32>> = plan.page_words().iter().map(|words| Vec::with_capacity(*words as usize)).collect();
-        for chunk in plan.chunks() {
-            let request = self.request_for(channel_loop, chunk.chunk_index);
-            let words = self
-                .cache
-                .get(&request)
-                .ok_or_else(|| format!("chunk {} of channel {} is planned but not fetched", chunk.chunk_index, channel.ordinal))?;
-            let expected = chunk.logical_xyz.iter().map(|&extent| extent as usize).product::<usize>();
-            if words.len() != expected {
-                return Err(format!("chunk {} has {} words, its logical extent needs {expected}", chunk.chunk_index, words.len()));
-            }
-            let page = pages
-                .get_mut(chunk.page as usize)
-                .ok_or_else(|| format!("chunk {} is planned into page {}, beyond the plan", chunk.chunk_index, chunk.page))?;
-            if page.len() != chunk.first_word as usize {
-                return Err(format!("chunk {} is placed at word {} but the page holds {}", chunk.chunk_index, chunk.first_word, page.len()));
-            }
-            page.extend_from_slice(words);
-        }
-        for (page, &planned) in pages.iter().zip(plan.page_words()) {
-            if page.len() != planned as usize {
-                return Err(format!("page holds {} words, the plan says {planned}", page.len()));
-            }
-        }
+        let pages = assemble_pages(plan, |chunk_index| {
+            let request = self.request_for(channel_loop, chunk_index);
+            self.cache.get(&request)
+        })?;
         pages
             .into_iter()
             .zip(plan.page_owners())
@@ -396,6 +394,38 @@ impl ClientResidency {
     }
 }
 
+/// The pages of one channel from its plan and a source of chunk words: chunks in plan order,
+/// each placed at the plan's `first_word` of its page (the placement is checked, not
+/// trusted), page lengths as planned. Shared by the server's demand route (words from the
+/// session cache) and the browser (words from its own cache), so the two cannot pack
+/// differently.
+pub fn assemble_pages<'a>(
+    plan: &palace_core::gpu::PortableChunkPlan,
+    words_for: impl Fn(u32) -> Option<&'a [u32]>,
+) -> Result<Vec<Vec<u32>>, String> {
+    let mut pages: Vec<Vec<u32>> = plan.page_words().iter().map(|words| Vec::with_capacity(*words as usize)).collect();
+    for chunk in plan.chunks() {
+        let words = words_for(chunk.chunk_index).ok_or_else(|| format!("chunk {} is planned but not available", chunk.chunk_index))?;
+        let expected = chunk.logical_xyz.iter().map(|&extent| extent as usize).product::<usize>();
+        if words.len() != expected {
+            return Err(format!("chunk {} has {} words, its logical extent needs {expected}", chunk.chunk_index, words.len()));
+        }
+        let page = pages
+            .get_mut(chunk.page as usize)
+            .ok_or_else(|| format!("chunk {} is planned into page {}, beyond the plan", chunk.chunk_index, chunk.page))?;
+        if page.len() != chunk.first_word as usize {
+            return Err(format!("chunk {} is placed at word {} but the page holds {}", chunk.chunk_index, chunk.first_word, page.len()));
+        }
+        page.extend_from_slice(words);
+    }
+    for (page, &planned) in pages.iter().zip(plan.page_words()) {
+        if page.len() != planned as usize {
+            return Err(format!("page holds {} words, the plan says {planned}", page.len()));
+        }
+    }
+    Ok(pages)
+}
+
 /// Rays as the server sends them: 8 `f32` bit patterns per pixel.
 pub fn rays_from_words(words: &[u32]) -> Result<Vec<PortableRayInterval>, String> {
     if words.len() % RAY_WORDS != 0 {
@@ -414,6 +444,49 @@ pub fn rays_from_words(words: &[u32]) -> Result<Vec<PortableRayInterval>, String
 
 pub fn ray_words(rays: &[PortableRayInterval]) -> Vec<u32> {
     rays.iter().flat_map(|ray| ray.words()).collect()
+}
+
+/// Expand the plan's fitted camera into the same clipped world rays as the server's demand route.
+pub fn ray_words_for_plan(plan: &ScenePlan) -> Result<Vec<u32>, String> {
+    let camera = &plan.camera;
+    if plan.width == 0 || plan.height == 0 || !camera.focal_scale.is_finite()
+        || camera.origin_zyx.iter().chain(&camera.forward_zyx).chain(&camera.right_zyx)
+            .chain(&camera.up_zyx).chain(&camera.minimum).chain(&camera.maximum)
+            .any(|value| !value.is_finite())
+        || camera.translation_xyz.iter().any(|value| !value.is_finite())
+        || camera.minimum.iter().zip(camera.maximum).any(|(min, max)| *min >= max)
+    {
+        return Err("plan has an invalid ray camera".into());
+    }
+    let count = (plan.width as usize).checked_mul(plan.height as usize)
+        .and_then(|pixels| pixels.checked_mul(RAY_WORDS))
+        .ok_or("plan ray count overflows usize")?;
+    let forward: Vector<D3, f32> = camera.forward_zyx.into();
+    let right: Vector<D3, f32> = camera.right_zyx.into();
+    let up: Vector<D3, f32> = camera.up_zyx.into();
+    let origin: [f32; 3] = std::array::from_fn(|axis| {
+        (f64::from(camera.origin_zyx[2 - axis]) + camera.translation_xyz[axis]) as f32
+    });
+    let aspect = plan.width as f32 / plan.height as f32;
+    let mut words = Vec::with_capacity(count);
+    for y in 0..plan.height {
+        let vertical = 1.0 - (2.0 * (y as f32 + 0.5) / plan.height as f32);
+        for x in 0..plan.width {
+            let horizontal = (2.0 * (x as f32 + 0.5) / plan.width as f32) - 1.0;
+            let direction = (forward
+                + right.scale(horizontal * aspect * camera.focal_scale)
+                + up.scale(vertical * camera.focal_scale))
+                .normalized();
+            let direction_xyz = [direction[2], direction[1], direction[0]];
+            let ray = PortableRayInterval::new(origin, direction_xyz, 0.0, f32::MAX)
+                .ok_or("plan generated an invalid ray")?;
+            let ray = ray.clipped_to_aabb(camera.minimum, camera.maximum)
+                .or_else(|| PortableRayInterval::new(origin, direction_xyz, 0.0, 0.0))
+                .ok_or("plan generated an invalid transparent ray")?;
+            words.extend_from_slice(&ray.words());
+        }
+    }
+    Ok(words)
 }
 
 /// Every layer one level coarser where it can be; `None` when none can.
@@ -442,6 +515,16 @@ mod tests {
         ScenePlan {
             width,
             height,
+            camera: RayCamera {
+                origin_zyx: [3.0, 2.0, -1.0],
+                forward_zyx: [0.0, 0.0, 1.0],
+                right_zyx: [1.0, 0.0, 0.0],
+                up_zyx: [0.0, 1.0, 0.0],
+                focal_scale: 0.2679492,
+                translation_xyz: [0.0; 3],
+                minimum: [0.0; 3],
+                maximum: [6.0, 4.0, 2.0],
+            },
             levels: vec![0],
             level_counts: vec![2],
             step: 0.5,

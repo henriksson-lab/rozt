@@ -721,8 +721,10 @@ fn render_open_dataset_camera(
         .ok_or_else(|| "open a local OME-Zarr dataset before requesting a frame".to_owned())?;
     let size = desktop_frame_size(width, height, 1)?;
     let controls = CameraControls {
+        focus_xyz: None,
         orbit_delta: [orbit_x, orbit_y],
         zoom,
+        orientation: None,
     };
     let attachments = render_local_zarr_with_camera_attachments(&root, size, controls)
         .map_err(|error| error.to_string())?;
@@ -744,8 +746,10 @@ fn project_open_dataset_annotations(
 ) -> Result<Vec<u32>, String> {
     let size = desktop_frame_size(width, height, 1)?;
     let controls = CameraControls {
+        focus_xyz: None,
         orbit_delta: [orbit_x, orbit_y],
         zoom,
+        orientation: None,
     }
     .validate()
     .map_err(|error| error.to_string())?;
@@ -771,6 +775,8 @@ fn pick_open_dataset_annotation(
 ) -> Result<Option<AnnotationPickPayload>, String> {
     let size = desktop_frame_size(request.width, request.height, 1)?;
     let controls = CameraControls {
+        focus_xyz: None,
+        orientation: None,
         orbit_delta: [request.orbit_x, request.orbit_y],
         zoom: request.zoom,
     };
@@ -902,6 +908,8 @@ fn smoke_local_dataset(root: &Path) -> Result<(), String> {
         &root,
         size,
         CameraControls {
+            focus_xyz: None,
+            orientation: None,
             orbit_delta: [24, -12],
             zoom: 1.1,
         },

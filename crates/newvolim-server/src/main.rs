@@ -30,8 +30,8 @@ use clap::Parser;
 use newvolim_io::{read_array_info, read_dataset_metadata, LocalSourcePolicy};
 use newvolim_portable::{
     routes::{
-        composite_palace_scene_annotations, demand_scene_plan, full_level_scene_inputs_fitting, layer_chunk_words,
-        portable_orthogonal_slice_pngs, scene_route_frame, ChannelStateInput, NativePortableDrawRequest, RouteRenderer,
+        composite_palace_scene_annotations, demand_scene_plan, demand_scene_plan_only, full_level_scene_inputs_fitting, layer_chunk_words,
+        portable_orthogonal_slice_pngs, scene_route_frame_for_display, ChannelStateInput, NativePortableDrawRequest, RouteRenderer,
     },
     session::{LayerChannelSummary, LocalSession},
 };
@@ -41,6 +41,8 @@ use palace_frame::{
     FrameSize,
 };
 use serde::{Deserialize, Serialize};
+#[cfg(test)]
+use newvolim_portable::routes::scene_route_frame;
 use tokio::sync::{mpsc, oneshot};
 use tower_http::{cors::CorsLayer, services::ServeDir};
 
@@ -223,6 +225,8 @@ fn render_volume_frame(
 ) -> Result<(Vec<u8>, Option<Vec<u8>>, &'static str), String> {
     if let Some(session) = session {
         let request = NativePortableDrawRequest {
+            orientation: controls.orientation,
+            focus_xyz: controls.focus_xyz,
             origin_xyz: [0; 3],
             extent_xyz: [1; 3],
             width: size.width,
@@ -231,18 +235,18 @@ fn render_volume_frame(
             orbit_y: controls.orbit_delta[1],
             zoom: controls.zoom,
         };
-        match scene_route_frame(session, request) {
-            Ok(frame) => {
-                let renderer = match frame.renderer {
+        match scene_route_frame_for_display(session, request) {
+            Ok((attachments, route)) => {
+                let renderer = match route {
                     RouteRenderer::Demand => "portable-demand",
                     RouteRenderer::Palace => "portable-palace",
                     RouteRenderer::Native => "portable-native",
                 };
-                let attachments = match frame.renderer {
+                let attachments = match route {
                     RouteRenderer::Demand | RouteRenderer::Palace => {
-                        composite_palace_scene_annotations(session, request, frame.attachments)?
+                        composite_palace_scene_annotations(session, request, attachments)?
                     }
-                    RouteRenderer::Native => frame.attachments,
+                    RouteRenderer::Native => attachments,
                 };
                 let (png, pfm) =
                     palace_png::encode_portable_frame_attachments(&attachments).into_parts();
@@ -308,12 +312,22 @@ struct FrameRequest {
     orbit_y: i32,
     #[serde(default = "default_zoom")]
     zoom: f32,
+    /// Camera target normalized to the reference volume's physical extent.
+    #[serde(default)]
+    focus_xyz: Option<[f32; 3]>,
+    /// Camera-local trackball orientation for 3D frames, XYZW. Legacy orbit remains accepted.
+    #[serde(default)]
+    orientation: Option<[f32; 4]>,
     /// Opaque client sequence number echoed in WebSocket replies. It lets clients drop an old
     /// final frame without assigning semantic meaning to the server's renderer generation.
     #[serde(default)]
     request_id: u64,
     #[serde(default)]
     view: RenderView,
+    /// Socket volume frames carry the ray-distance PFM only when asked: it is 888 KB of base64
+    /// per frame at pane size and the page does not read it.
+    #[serde(default)]
+    depth: bool,
     #[serde(default)]
     x: Option<u32>,
     #[serde(default)]
@@ -548,7 +562,7 @@ async fn set_dataset_settings(
 }
 
 /// The camera for a browser scene packet; the same controls a frame request carries.
-#[derive(Clone, Copy, Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct SceneQuery {
     width: u32,
@@ -559,6 +573,10 @@ struct SceneQuery {
     orbit_y: i32,
     #[serde(default = "default_zoom")]
     zoom: f32,
+    #[serde(default)]
+    orientation: Option<String>,
+    #[serde(default)]
+    focus_xyz: Option<String>,
 }
 
 /// Everything a browser uploads to run the desktop's scene shader itself, byte for byte what
@@ -599,6 +617,8 @@ fn browser_scene_packet(
     controls: CameraControls,
 ) -> Result<BrowserScenePacket, String> {
     let request = NativePortableDrawRequest {
+        orientation: controls.orientation,
+        focus_xyz: controls.focus_xyz,
         origin_xyz: [0; 3],
         extent_xyz: [1; 3],
         width: size.width,
@@ -639,7 +659,7 @@ async fn browser_scene_plan(
     let sessions = state.sessions.clone();
     tokio::task::spawn_blocking(move || {
         let session = sessions.session_for(&dataset, &root)?;
-        demand_scene_plan(&session, request, levels.as_deref()).map(|(plan, _)| plan)
+        demand_scene_plan_only(&session, request, levels.as_deref())
     })
     .await
     .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "plan task failed".to_owned()))?
@@ -709,6 +729,10 @@ struct ScenePlanQuery {
     orbit_y: i32,
     #[serde(default = "default_zoom")]
     zoom: f32,
+    #[serde(default)]
+    orientation: Option<String>,
+    #[serde(default)]
+    focus_xyz: Option<String>,
     /// Comma-separated pyramid levels per visible layer; omitted, the camera chooses.
     #[serde(default)]
     levels: Option<String>,
@@ -743,9 +767,35 @@ fn scene_plan_request(query: &ScenePlanQuery) -> Result<(NativePortableDrawReque
             orbit_x: query.orbit_x,
             orbit_y: query.orbit_y,
             zoom: query.zoom,
+            orientation: parse_orientation_query(query.orientation.as_deref())?,
+            focus_xyz: parse_focus_query(query.focus_xyz.as_deref())?,
         },
         levels,
     ))
+}
+
+fn parse_orientation_query(value: Option<&str>) -> Result<Option<[f32; 4]>, (StatusCode, String)> {
+    let Some(value) = value else { return Ok(None) };
+    let components = value.split(',').map(str::parse::<f32>).collect::<Result<Vec<_>, _>>()
+        .map_err(|_| (StatusCode::BAD_REQUEST, "orientation must be four finite XYZW numbers".to_owned()))?;
+    let quaternion: [f32; 4] = components.try_into()
+        .map_err(|_| (StatusCode::BAD_REQUEST, "orientation must have four XYZW components".to_owned()))?;
+    if quaternion.iter().any(|component| !component.is_finite()) {
+        return Err((StatusCode::BAD_REQUEST, "orientation must be finite".to_owned()));
+    }
+    Ok(Some(quaternion))
+}
+
+fn parse_focus_query(value: Option<&str>) -> Result<Option<[f32; 3]>, (StatusCode, String)> {
+    let Some(value) = value else { return Ok(None) };
+    let components = value.split(',').map(str::parse::<f32>).collect::<Result<Vec<_>, _>>()
+        .map_err(|_| (StatusCode::BAD_REQUEST, "focusXyz must be three normalized XYZ numbers".to_owned()))?;
+    let focus: [f32; 3] = components.try_into()
+        .map_err(|_| (StatusCode::BAD_REQUEST, "focusXyz must have three XYZ components".to_owned()))?;
+    if focus.iter().any(|value| !value.is_finite() || !(0.0..=1.0).contains(value)) {
+        return Err((StatusCode::BAD_REQUEST, "focusXyz must be within 0..=1".to_owned()));
+    }
+    Ok(Some(focus))
 }
 
 fn words_le_bytes(words: &[u32]) -> Vec<u8> {
@@ -764,6 +814,8 @@ async fn browser_scene(
     let controls = CameraControls {
         orbit_delta: [query.orbit_x, query.orbit_y],
         zoom: query.zoom,
+        orientation: parse_orientation_query(query.orientation.as_deref())?,
+        focus_xyz: parse_focus_query(query.focus_xyz.as_deref())?,
     }
     .validate()
     .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
@@ -987,6 +1039,8 @@ async fn enqueue_render(
     let controls = CameraControls {
         orbit_delta: [request.orbit_x, request.orbit_y],
         zoom: request.zoom,
+        orientation: request.orientation,
+        focus_xyz: request.focus_xyz,
     }
     .validate()
     .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
@@ -1168,8 +1222,12 @@ async fn serve_frame_socket(mut socket: WebSocket, state: AppState, session_id: 
         };
         let request_id = request.request_id;
         let (width, height) = (request.width, request.height);
+        let wants_depth = request.depth;
         match enqueue_render(&state, session_id, request).await {
-            Ok(RenderOutput::Volume(rendered)) => {
+            Ok(RenderOutput::Volume(mut rendered)) => {
+                if !wants_depth {
+                    rendered.ray_distance_pfm = None;
+                }
                 let frame = SocketFrame {
                     kind: "frame",
                     request_id,
@@ -1586,6 +1644,8 @@ mod tests {
         let session = store.session_for("cells3d", &root).unwrap();
         let size = FrameSize::new(96, 64).unwrap();
         let controls = CameraControls {
+            focus_xyz: None,
+            orientation: None,
             orbit_delta: [12, -7],
             zoom: 1.3,
         }
@@ -1756,6 +1816,8 @@ mod tests {
         let desktop = scene_route_frame(
             &session,
             NativePortableDrawRequest {
+                focus_xyz: None,
+                orientation: None,
                 origin_xyz: [0; 3],
                 extent_xyz: [1; 3],
                 width: 96,
@@ -1783,11 +1845,14 @@ mod tests {
         let start = source.find("async function dispatch(").unwrap();
         let body = &source[start..];
         let body = &body[..body.find("async function present(").unwrap_or(body.len())];
-        // The page fetches the plan, rays and chunks itself (client-side residency).
+        // The page fetches a fitted camera plan and chunks, then expands the rays locally.
         let api = std::fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../newvolim-ui/src/api.rs")).unwrap();
-        for route in ["/portable/plan?", "/portable/rays?", "/portable/chunks"] {
+        for route in ["/portable/plan?", "/portable/chunks"] {
             assert!(api.contains(route), "the page does not name {route}");
         }
+        let app = std::fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../newvolim-ui/src/app.rs")).unwrap();
+        assert!(app.contains("ray_words_for_plan(&plan)"));
+        assert!(!app.contains("scene_rays_url("));
         let mut last = 0;
         for (binding, resource) in [
             (0, "pageBuffers[0]"),
@@ -1820,6 +1885,8 @@ mod tests {
         let session = store.session_for("cells3d", &root).unwrap();
         let size = FrameSize::new(48, 32).unwrap();
         let controls = CameraControls {
+            focus_xyz: None,
+            orientation: None,
             orbit_delta: [3, -2],
             zoom: 1.2,
         }
@@ -1843,6 +1910,8 @@ mod tests {
         let frame = scene_route_frame(
             &session,
             NativePortableDrawRequest {
+                focus_xyz: None,
+                orientation: None,
                 origin_xyz: [0; 3],
                 extent_xyz: [1; 3],
                 width: 48,
@@ -1930,6 +1999,29 @@ mod tests {
         );
         assert_eq!(controlled.request_id, 0);
 
+        let quaternion: FrameRequest = serde_json::from_str(
+            r#"{"dataset":"cells3d","width":32,"height":24,"orientation":[0,-0.47942555,0,0.87758255]}"#,
+        ).unwrap();
+        assert!(quaternion.orientation.is_some());
+        assert!(CameraControls {
+            focus_xyz: None,
+            orientation: quaternion.orientation,
+            orbit_delta: [0, 0],
+            zoom: 1.0,
+        }.validate().is_ok());
+        assert!(parse_orientation_query(Some("0,-0.47942555,0,0.87758255")).is_ok());
+        assert!(parse_orientation_query(Some("0,0,0")).is_err());
+        let focused: FrameRequest = serde_json::from_str(
+            r#"{"dataset":"cells3d","width":32,"height":24,"focusXyz":[0.25,0.5,0.75]}"#,
+        ).unwrap();
+        assert_eq!(focused.focus_xyz, Some([0.25, 0.5, 0.75]));
+        assert_eq!(parse_focus_query(Some("0.25,0.5,0.75")).unwrap(), focused.focus_xyz);
+        assert!(parse_focus_query(Some("1.01,0.5,0.5")).is_err());
+        assert!(CameraControls {
+            focus_xyz: None,
+            orientation: Some([0.0; 4]), orbit_delta: [0, 0], zoom: 1.0,
+        }.validate().is_err());
+
         let socket_request: FrameRequest =
             serde_json::from_str(r#"{"dataset":"cells3d","width":32,"height":24,"requestId":73}"#)
                 .unwrap();
@@ -1952,24 +2044,32 @@ mod tests {
     #[test]
     fn frame_controls_are_rejected_before_renderer_admission() {
         assert!(CameraControls {
+            focus_xyz: None,
+            orientation: None,
             orbit_delta: [10_000, -10_000],
             zoom: 0.25,
         }
         .validate()
         .is_ok());
         assert!(CameraControls {
+            focus_xyz: None,
+            orientation: None,
             orbit_delta: [10_001, 0],
             zoom: 1.0,
         }
         .validate()
         .is_err());
         assert!(CameraControls {
+            focus_xyz: None,
+            orientation: None,
             orbit_delta: [0, 0],
             zoom: f32::NAN,
         }
         .validate()
         .is_err());
         assert!(CameraControls {
+            focus_xyz: None,
+            orientation: None,
             orbit_delta: [0, 0],
             zoom: 4.01,
         }
@@ -1980,14 +2080,17 @@ mod tests {
     #[test]
     fn frame_crosshair_is_all_or_nothing_and_orthogonal_only() {
         let request = |view, x, y, z| FrameRequest {
+            focus_xyz: None,
             dataset: "cells3d".to_owned(),
             width: 32,
             height: 24,
             orbit_x: 0,
             orbit_y: 0,
             zoom: 1.0,
+            orientation: None,
             request_id: 0,
             view,
+            depth: false,
             x,
             y,
             z,
@@ -2412,7 +2515,27 @@ mod tests {
         let (status, body) = call(app.clone(), "GET", "/v1/datasets/cells3d/settings", None).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(serde_json::from_str::<serde_json::Value>(&body).unwrap(), serde_json::json!({"depthScale": 1.0}));
-        let plan_at_one: serde_json::Value = serde_json::from_str(&call(app.clone(), "GET", "/v1/datasets/cells3d/portable/plan?width=32&height=24", None).await.1).unwrap();
+        let (status, plan_body) = call(app.clone(), "GET", "/v1/datasets/cells3d/portable/plan?width=32&height=24", None).await;
+        assert_eq!(status, StatusCode::OK);
+        let plan_at_one: serde_json::Value = serde_json::from_str(&plan_body).unwrap();
+        assert_eq!(plan_at_one["camera"]["forwardZyx"].as_array().unwrap().len(), 3);
+        assert!(plan_body.len() < 20_000, "the plan should carry a fitted camera, not 768 pixel rays");
+        let (status, oriented_body) = call(
+            app.clone(), "GET",
+            "/v1/datasets/cells3d/portable/plan?width=32&height=24&orientation=0,-0.47942555,0,0.87758255",
+            None,
+        ).await;
+        assert_eq!(status, StatusCode::OK, "{oriented_body}");
+        let oriented: serde_json::Value = serde_json::from_str(&oriented_body).unwrap();
+        assert_ne!(oriented["camera"]["originZyx"], plan_at_one["camera"]["originZyx"]);
+        let (status, focused_body) = call(
+            app.clone(), "GET",
+            "/v1/datasets/cells3d/portable/plan?width=32&height=24&focusXyz=0.25,0.5,0.75",
+            None,
+        ).await;
+        assert_eq!(status, StatusCode::OK, "{focused_body}");
+        let focused: serde_json::Value = serde_json::from_str(&focused_body).unwrap();
+        assert_ne!(focused["camera"]["originZyx"], plan_at_one["camera"]["originZyx"]);
         let (status, body) = call(app.clone(), "POST", "/v1/datasets/cells3d/settings", Some(r#"{"depthScale": 2.5}"#.into())).await;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(serde_json::from_str::<serde_json::Value>(&body).unwrap(), serde_json::json!({"depthScale": 2.5}));
@@ -2420,9 +2543,32 @@ mod tests {
         assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
         let (_, body) = call(app.clone(), "GET", "/v1/datasets/cells3d/settings", None).await;
         assert_eq!(serde_json::from_str::<serde_json::Value>(&body).unwrap()["depthScale"], 2.5, "a refused write leaves the old scale");
-        let plan_at_two_and_a_half: serde_json::Value = serde_json::from_str(&call(app, "GET", "/v1/datasets/cells3d/portable/plan?width=32&height=24", None).await.1).unwrap();
+        let plan_at_two_and_a_half: serde_json::Value = serde_json::from_str(&call(app.clone(), "GET", "/v1/datasets/cells3d/portable/plan?width=32&height=24", None).await.1).unwrap();
         let ratio = plan_at_two_and_a_half["opacityReference"].as_f64().unwrap() / plan_at_one["opacityReference"].as_f64().unwrap();
         assert!((ratio - 2.5).abs() < 1e-4, "the plan's opacity reference scales: {ratio}");
+        let (status, body) = call(app.clone(), "POST", "/v1/datasets/cells3d/settings", Some(r#"{"depthScale":100}"#.into())).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let plan_at_hundred: serde_json::Value = serde_json::from_str(&call(app.clone(), "GET", "/v1/datasets/cells3d/portable/plan?width=32&height=24", None).await.1).unwrap();
+        let ratio = plan_at_hundred["opacityReference"].as_f64().unwrap() / plan_at_one["opacityReference"].as_f64().unwrap();
+        assert!((ratio - 100.0).abs() < 1e-3, "the plan reaches the slider maximum: {ratio}");
+        let (status, _) = call(app, "POST", "/v1/datasets/cells3d/settings", Some(r#"{"depthScale":100.01}"#.into())).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    /// A socket frame request carries the ray-distance PFM only when it asks (`depth: true`);
+    /// the page never asks, which saves 888 KB of base64 per pane-sized frame.
+    #[test]
+    fn socket_frame_requests_ask_for_depth_explicitly() {
+        let plain = serde_json::from_str::<SocketRequest>(r#"{"dataset":"d","width":2,"height":1,"requestId":1,"view":"volume"}"#).unwrap();
+        let SocketRequest::Frame(plain) = plain else { panic!("a frame request") };
+        assert!(!plain.depth);
+        let with = serde_json::from_str::<SocketRequest>(r#"{"dataset":"d","width":2,"height":1,"requestId":1,"view":"volume","depth":true}"#).unwrap();
+        let SocketRequest::Frame(with) = with else { panic!("a frame request") };
+        assert!(with.depth);
+        // The socket branch drops the PFM unless asked: pinned by reading the branch itself.
+        let source = include_str!("main.rs");
+        let branch = &source[source.find("let wants_depth = request.depth;").unwrap()..];
+        assert!(branch[..600].contains("rendered.ray_distance_pfm = None;"));
     }
 
     #[tokio::test]
@@ -2505,14 +2651,17 @@ mod tests {
             &state,
             SessionId(1),
             FrameRequest {
+                focus_xyz: None,
                 dataset: "cells3d".to_owned(),
                 width: 32,
                 height: 24,
                 orbit_x: 0,
                 orbit_y: 0,
                 zoom: 1.0,
+                orientation: None,
                 request_id: 1,
                 view: RenderView::Volume,
+                depth: false,
                 x: None,
                 y: None,
                 z: None,
@@ -2535,14 +2684,17 @@ mod tests {
             &state,
             SessionId(2),
             FrameRequest {
+                focus_xyz: None,
                 dataset: "cells3d".to_owned(),
                 width: 32,
                 height: 24,
                 orbit_x: 0,
                 orbit_y: 0,
                 zoom: 1.0,
+                orientation: None,
                 request_id: 2,
                 view: RenderView::Orthogonal,
+                depth: false,
                 // Deliberately outside the fixture extent: the shared renderer boundary must
                 // clamp all three linked panes before it reaches Palace.
                 x: Some(u32::MAX),

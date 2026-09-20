@@ -19,8 +19,8 @@ use crate::api::*;
 use crate::cube::CubeView;
 
 const MAX_FRAME_SIDE: u32 = 4096;
-const MAX_ORBIT: i32 = 10_000;
 const ZOOM_RANGE: (f32, f32) = (0.25, 4.0);
+const INTERACTION_SETTLE_MS: u32 = 180;
 
 #[wasm_bindgen]
 extern "C" {
@@ -90,14 +90,13 @@ pub enum Renderer {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Camera {
-    pub orbit_x: i32,
-    pub orbit_y: i32,
+    pub orientation: [f32; 4],
     pub zoom: f32,
 }
 
 impl Default for Camera {
     fn default() -> Self {
-        Self { orbit_x: 0, orbit_y: 0, zoom: 1.0 }
+        Self { orientation: [0.0, 0.0, 0.0, 1.0], zoom: 1.0 }
     }
 }
 
@@ -175,6 +174,8 @@ pub struct Session {
     next_request: StoredValue<u64>,
     volume_inflight: StoredValue<Option<u64>>,
     volume_dirty: StoredValue<bool>,
+    volume_preview: StoredValue<bool>,
+    volume_preview_generation: StoredValue<u64>,
     ortho_inflight: StoredValue<Option<u64>>,
     ortho_dirty: StoredValue<bool>,
     browser_busy: StoredValue<bool>,
@@ -221,6 +222,8 @@ impl Session {
             next_request: StoredValue::new(1),
             volume_inflight: StoredValue::new(None),
             volume_dirty: StoredValue::new(false),
+            volume_preview: StoredValue::new(false),
+            volume_preview_generation: StoredValue::new(0),
             ortho_inflight: StoredValue::new(None),
             ortho_dirty: StoredValue::new(false),
             browser_busy: StoredValue::new(false),
@@ -299,6 +302,8 @@ impl Session {
     }
 
     pub fn close(self) {
+        self.volume_preview_generation.update_value(|generation| *generation = generation.wrapping_add(1));
+        self.volume_preview.set_value(false);
         if let Some(socket) = self.socket.get_value() {
             let _ = socket.borrow().ws.close();
         }
@@ -471,9 +476,11 @@ impl Session {
             dataset,
             width,
             height,
-            orbit_x: camera.orbit_x,
-            orbit_y: camera.orbit_y,
+            orbit_x: 0,
+            orbit_y: 0,
             zoom: camera.zoom,
+            focus_xyz: None,
+            orientation: None,
             request_id,
             view: RenderView::Orthogonal,
             x: crosshair.map(|c| c[0]),
@@ -497,8 +504,9 @@ impl Session {
             self.volume_dirty.set_value(true);
             return;
         }
-        let (width, height) = self.volume_pane.get_untracked().map(|pane| physical_size(&pane)).unwrap_or((256, 256));
+        let (width, height) = self.volume_pane.get_untracked().map(|pane| preview_size(physical_size(&pane), self.volume_preview.get_value())).unwrap_or((256, 256));
         let camera = self.camera.get_untracked();
+        let focus_xyz = self.voxel_shape.get_untracked().map(|shape| normalized_focus_xyz(self.focus.get_untracked(), shape));
         let request_id = self.next_request_id();
         self.volume_inflight.set_value(Some(request_id));
         self.volume_dirty.set_value(false);
@@ -507,9 +515,11 @@ impl Session {
             dataset,
             width,
             height,
-            orbit_x: camera.orbit_x,
-            orbit_y: camera.orbit_y,
+            orbit_x: 0,
+            orbit_y: 0,
             zoom: camera.zoom,
+            focus_xyz,
+            orientation: Some(camera.orientation),
             request_id,
             view: RenderView::Volume,
             x: None,
@@ -525,15 +535,16 @@ impl Session {
             return;
         }
         let Some(canvas) = self.volume_canvas.get_untracked() else { return };
-        let (width, height) = self.volume_pane.get_untracked().map(|pane| physical_size(&pane)).unwrap_or((256, 256));
+        let (width, height) = self.volume_pane.get_untracked().map(|pane| preview_size(physical_size(&pane), self.volume_preview.get_value())).unwrap_or((256, 256));
         let camera = self.camera.get_untracked();
+        let focus_xyz = self.voxel_shape.get_untracked().map(|shape| normalized_focus_xyz(self.focus.get_untracked(), shape));
         let origin = self.origin.get_untracked();
         self.browser_busy.set_value(true);
         self.browser_dirty.set_value(false);
         self.update_busy();
         spawn_local(async move {
             let canvas: web_sys::HtmlCanvasElement = canvas.clone();
-            let outcome = self.browser_frame(&origin, &dataset, &canvas, width, height, camera).await;
+            let outcome = self.browser_frame(&origin, &dataset, &canvas, width, height, camera, focus_xyz).await;
             self.browser_busy.set_value(false);
             self.update_busy();
             match outcome {
@@ -556,7 +567,7 @@ impl Session {
         });
     }
 
-    /// One frame by client-side residency: the plan and rays for the camera, then dispatch,
+    /// One frame by client-side residency: the plan and its locally expanded rays, then dispatch,
     /// read the misses, fetch only those chunks, and dispatch again until nothing is missed;
     /// a level whose working set exceeds the pages is replaced by a coarser one. The chunk
     /// cache survives into the next frame.
@@ -568,12 +579,12 @@ impl Session {
         width: u32,
         height: u32,
         camera: Camera,
+        focus_xyz: Option<[f32; 3]>,
     ) -> Result<String, String> {
         use newvolim_residency::{ChunkCache, ClientResidency, ScenePlan, StepOutcome};
         install_shader()?;
-        let plan: ScenePlan = get_json(&scene_plan_url(origin, dataset, width, height, camera.orbit_x, camera.orbit_y, camera.zoom, None)).await?;
-        let ray_bytes = get_bytes(&scene_rays_url(origin, dataset, width, height, camera.orbit_x, camera.orbit_y, camera.zoom)).await?;
-        let ray_words = words_from_le_bytes(&ray_bytes)?;
+        let plan: ScenePlan = get_json(&scene_plan_url(origin, dataset, width, height, 0, 0, camera.zoom, Some(camera.orientation), focus_xyz, None)).await?;
+        let mut ray_words = newvolim_residency::ray_words_for_plan(&plan)?;
         let cache = self.chunk_cache.get_value().unwrap_or_else(|| ChunkCache::new(CHUNK_CACHE_WORDS));
         self.chunk_cache.set_value(None);
         let mut client = ClientResidency::new(plan, &ray_words, cache)?;
@@ -613,7 +624,8 @@ impl Session {
                     let plan = client.plan();
                     let coarser = newvolim_residency::coarser_levels(&plan.levels, &plan.level_counts)
                         .ok_or_else(|| format!("the coarsest levels {:?} still need {required_pages} pages", plan.levels))?;
-                    let plan: ScenePlan = get_json(&scene_plan_url(origin, dataset, width, height, camera.orbit_x, camera.orbit_y, camera.zoom, Some(&coarser))).await?;
+                    let plan: ScenePlan = get_json(&scene_plan_url(origin, dataset, width, height, 0, 0, camera.zoom, Some(camera.orientation), focus_xyz, Some(&coarser))).await?;
+                    ray_words = newvolim_residency::ray_words_for_plan(&plan)?;
                     client = ClientResidency::new(plan, &ray_words, client.into_cache())?;
                     coarsened += 1;
                 }
@@ -646,6 +658,7 @@ impl Session {
                         self.crosshair.set(crosshair_xyz);
                         self.focus.set(crosshair_xyz.map(|v| v as f64 + 0.5));
                         self.zoom_2d.set([1.0; 3]);
+                        self.request_volume();
                     }
                     self.slices.set(Some(Slices {
                         xy: format!("data:image/png;base64,{xy_base64}"),
@@ -679,11 +692,14 @@ impl Session {
     pub fn move_crosshair(self, next: [u32; 3]) {
         let Some(shape) = self.voxel_shape.get_untracked() else { return };
         let clamped = [next[0].min(shape[0].saturating_sub(1)), next[1].min(shape[1].saturating_sub(1)), next[2].min(shape[2].saturating_sub(1))];
-        self.focus.set(clamped.map(|v| v as f64 + 0.5));
+        let next_focus = clamped.map(|v| v as f64 + 0.5);
+        let moved = self.focus.get_untracked() != next_focus;
+        self.focus.set(next_focus);
         if clamped != self.crosshair.get_untracked() {
             self.crosshair.set(clamped);
             self.request_orthogonal();
         }
+        if moved { self.request_interactive_volume(); }
     }
 
     /// Move the focus continuously (a pan): the crosshair follows as its floor, and the slices
@@ -691,25 +707,39 @@ impl Session {
     pub fn set_focus(self, next: [f64; 3]) {
         let Some(shape) = self.voxel_shape.get_untracked() else { return };
         let clamped: [f64; 3] = std::array::from_fn(|axis| next[axis].clamp(0.0, shape[axis].max(1) as f64));
+        let moved = self.focus.get_untracked() != clamped;
         self.focus.set(clamped);
         let crosshair: [u32; 3] = std::array::from_fn(|axis| (clamped[axis].floor() as u32).min(shape[axis].saturating_sub(1)));
         if crosshair != self.crosshair.get_untracked() {
             self.crosshair.set(crosshair);
             self.request_orthogonal();
         }
+        if moved { self.request_interactive_volume(); }
     }
 
     pub fn orbit_by(self, dx: i32, dy: i32) {
-        self.camera.update(|camera| {
-            camera.orbit_x = (camera.orbit_x + dx).clamp(-MAX_ORBIT, MAX_ORBIT);
-            camera.orbit_y = (camera.orbit_y + dy).clamp(-MAX_ORBIT, MAX_ORBIT);
-        });
-        self.request_volume();
+        if dx == 0 && dy == 0 { return; }
+        self.camera.update(|camera| camera.orientation = drag_orientation(camera.orientation, dx, dy));
+        self.request_interactive_volume();
     }
 
     pub fn zoom_by(self, factor: f32) {
         self.camera.update(|camera| camera.zoom = (camera.zoom * factor).clamp(ZOOM_RANGE.0, ZOOM_RANGE.1));
+        self.request_interactive_volume();
+    }
+
+    fn request_interactive_volume(self) {
+        self.volume_preview.set_value(true);
+        let generation = self.volume_preview_generation.get_value().wrapping_add(1);
+        self.volume_preview_generation.set_value(generation);
         self.request_volume();
+        spawn_local(async move {
+            gloo_timers::future::TimeoutFuture::new(INTERACTION_SETTLE_MS).await;
+            if self.volume_preview_generation.get_value() == generation {
+                self.volume_preview.set_value(false);
+                self.request_volume();
+            }
+        });
     }
 
     pub fn set_renderer(self, renderer: Renderer) {
@@ -881,14 +911,6 @@ fn js_error(error: JsValue) -> String {
 
 // ---- HTTP -------------------------------------------------------------------------------
 
-async fn get_bytes(url: &str) -> Result<Vec<u8>, String> {
-    let response = gloo_net::http::Request::get(url).send().await.map_err(|error| format!("GET {url}: {error}"))?;
-    if !response.ok() {
-        return Err(format!("GET {url}: {} {}", response.status(), response.text().await.unwrap_or_default()));
-    }
-    response.binary().await.map_err(|error| format!("GET {url}: {error}"))
-}
-
 async fn post_bytes<B: serde::Serialize>(url: &str, body: &B) -> Result<Vec<u8>, String> {
     let request = gloo_net::http::Request::post(url).json(body).map_err(|error| format!("POST {url}: {error}"))?;
     let response = request.send().await.map_err(|error| format!("POST {url}: {error}"))?;
@@ -930,6 +952,10 @@ fn physical_size(element: &web_sys::Element) -> (u32, u32) {
     let scale = window().device_pixel_ratio().max(0.5);
     let size = |css: i32| ((css.max(1) as f64 * scale).floor() as u32).clamp(1, MAX_FRAME_SIDE);
     (size(element.client_width()), size(element.client_height()))
+}
+
+fn preview_size(size: (u32, u32), preview: bool) -> (u32, u32) {
+    if preview { (size.0.div_ceil(2), size.1.div_ceil(2)) } else { size }
 }
 
 
@@ -1076,7 +1102,7 @@ fn ViewerShell() -> impl IntoView {
                         None => String::new(),
                     }
                 }}</span>
-                <span class="readout">{move || { let cam = session.camera.get(); format!("orbit {} {} zoom {:.2}", cam.orbit_x, cam.orbit_y, cam.zoom) }}</span>
+                <span class="readout">{move || format!("3D zoom {:.2}", session.camera.get().zoom)}</span>
                 <Show when=move || session.notice.get().is_some()>
                     <span class="error">{move || session.notice.get().unwrap_or_default()}</span>
                 </Show>
@@ -1229,7 +1255,8 @@ fn VolumePane() -> impl IntoView {
     let on_up = move |_: web_sys::PointerEvent| last.set_value(None);
     let on_wheel = move |ev: web_sys::WheelEvent| {
         ev.prevent_default();
-        session.zoom_by(if ev.delta_y() < 0.0 { 1.1 } else { 1.0 / 1.1 });
+        // Camera zoom scales eye distance: smaller values bring the volume closer.
+        session.zoom_by(if ev.delta_y() < 0.0 { 1.0 / 1.1 } else { 1.1 });
     };
     view! {
         <div
@@ -1448,7 +1475,7 @@ fn Sidebar() -> impl IntoView {
                     <input
                         type="range"
                         min="-1"
-                        max="1"
+                        max="2"
                         step="0.02"
                         prop:value=move || slider_from_depth_scale(session.depth_scale.get()).to_string()
                         on:input=move |ev| {

@@ -5678,7 +5678,7 @@ the scene diagonal / 256; channels and layers composite front to back and the ra
 0.95. The per-channel opacity scales alpha linearly, so it cannot make a ray see much deeper;
 the reference can, exponentially, and it was hard-coded.
 
-Now: `LocalSession::depth_scale` (`DepthScale`, 0.05..=20, default 1), a multiplier on the
+At introduction: `LocalSession::depth_scale` (`DepthScale`, 0.05..=20, default 1), a multiplier on the
 opacity reference in `scene_opacity_reference`, which both the demand route and the direct
 route take their reference from (so the browser plan carries it too). Server:
 `GET`/`POST /v1/datasets/{d}/settings` with `{depthScale}`. Page: a "Scene" block in the
@@ -5703,3 +5703,249 @@ volume re-renders; slices are unaffected. The early-termination threshold stays 
   `{"depthScale":10.0}`, the volume re-renders in 486 ms, and the 3D pane's mean luminance
   falls from 91 to 50: the yellow cytoplasm haze becomes see-through and the ring of nuclei
   inside is visible (`scratchpad/depth-montage.png`).
+
+The later depth-range correction extends the session's upper bound from 20× to 100× and the
+logarithmic slider from 10× to 100×. The lower slider endpoint stays at 0.1×. Portable, server,
+and UI tests check that 100× is accepted and reaches the render plan; 100.01× is rejected.
+
+## Why the 3D renderers are slow, and a far-face bug found on the way (2026-09-20)
+
+The user asked why both 3D renderers are slow. Measured with `measure_demand_frame_phases`
+(portable, ignored, release profile, local adapter) at the page's pane size 560×406, orbit
+30/−20, on the two mirrored stores:
+
+| phase, IDR 6001240 (2 ch, 271×275×236, one z-slice per chunk) | ms |
+|---|---|
+| level choice from the camera → level 0 | 0.1 |
+| level 0: prepare (camera rays for 227 k pixels, loop setup) | 27 |
+| level 0: bootstrap dispatch, 472 misses → 17 pages needed, refused | 6 + 37 (133 on the very first dispatch of the process) |
+| level 1: prepare + bootstrap dispatch → 5 pages needed, refused | 21 + 2 + 15 |
+| level 2: prepare | 23 |
+| level 2: bootstrap dispatch, 472 misses | 2 + 13 |
+| level 2: read + decompress 472 chunks (8.2 MiB) and assemble pages | 65 |
+| level 2: dispatch + readback | 22 |
+| PNG 255 KB + PFM 888 KB encode | 2 |
+| **whole frame** | **258** (server reports 275–300 over HTTP) |
+
+Backpack (1 ch, 512×512×373, 47×128×128 chunks): the same shape, 225 ms, of which 31 ms
+reading 16 chunks (11.6 MiB) at level 2 and ~60 ms spent refusing levels 0 and 1. The same
+full-level dispatch repeated costs 18–21 ms, so the GPU pass is not the problem.
+
+**Where the time goes, server:**
+1. ~110 ms (IDR) / ~60 ms (backpack) refusing levels that cannot fit: the camera's level
+   choice ignores the page budget, so every frame tries level 0, then 1, each with fresh rays,
+   a loop setup and a bootstrap dispatch, before settling on level 2.
+2. ~65 ms re-reading and decompressing every planned chunk from disk on every frame (and on
+   every iteration within a frame): nothing is cached between frames on the server.
+3. ~25 ms per `prepare` generating 227 k camera rays on the CPU, three times per frame.
+4. The socket frame carries an 888 KB PFM depth image (1.2 MB base64) that the page never
+   reads, on top of the 255 KB PNG.
+5. The first dispatch of a process pays ~100 ms of pipeline compilation.
+
+**Where the time goes, browser (WebGPU):** the same loop over HTTP: the plan (20–25 ms
+server-side) is fetched once per level attempt (three times here), the rays once (7.3 MB —
+70 ms on localhost, seconds on a remote link), one WebGPU pass per attempt plus two at the
+final level, and the chunks (8 MiB for IDR level 2, in two requests). Each pass uploads all
+pages again and creates a new pipeline; the browser's shader-compile cache decides what that
+costs. On the IDR store residency cannot save anything: a chunk is a whole z-slice, so a
+camera that sees the volume needs every chunk of the level. Backpack's 47×128×128 chunks do
+allow partial residency when zoomed in.
+
+**What would fix it** (not done; the user asked for the investigation): choose the level with
+the page budget in hand — the finest level whose whole extent fits when the camera sees the
+whole box (skips the refused attempts: −110 ms IDR, −60 ms backpack; the plan route likewise);
+a chunk-word cache in the session keyed like the browser's (−65 ms per frame, −reads per
+iteration); generate rays once per camera and reuse across attempts and iterations; send the
+PFM only when a client asks; generate rays in the page from the camera (−7 MB per move); keep
+the WebGPU pipeline and page buffers across passes. Together the server frame should land
+near 60 ms and the browser frame near one pass plus chunks.
+
+**The bug:** the measurement's level-1 pass on the IDR image recorded chunk 236 of a 236-chunk
+grid — one past the far face — and the demand route refused the frame ("scene shader demanded
+a chunk outside its own channel"), which is why `POST /v1/frame` for the IDR image at 560×406
+was a 500 on the live server. The shader's box test passes for a point just inside the far
+face, but `floor((p − min) / (max − min) · dims)` rounds up to `dims` in f32; the CPU oracle
+had always clamped to `dims − 1`, the WGSL had not. Fixed by the same clamp in
+`SCENE_DVR_SHADER`.
+
+### Evidence
+
+- `scene_shader_requests_only_chunks_inside_the_grid` (portable, adapter): every key the
+  bootstrap pass records lies inside its channel's grid, over six cameras (including the
+  page's 560×406 at orbit 30/−20) and every level of cells3d, a synthetic 32-chunk store and,
+  when mirrored, the IDR and backpack stores — 10 128 keys. **Mutation:** the unclamped line —
+  fails on the IDR mirror at "level 1 orbit [30, -20] zoom 1: chunk 236 of 236". (Without the
+  mirrored store the case does not arise on the stores in the repository; the test then
+  passes either way, which is stated in its docs.)
+- palace-wgpu 16 (the WGSL-versus-CPU-oracle pins), spike 27, portable 57 + 22 adapter,
+  server 23 + 2; `git diff --check` clean.
+- Live, release server: the IDR image at 560×406 orbit 30/−20 is 200 again, route
+  `portable-demand`, 275–280 ms after the first frame; backpack 236–245 ms.
+
+## The renderers, faster (2026-09-20)
+
+The four largest items from the investigation, done:
+
+- **Budget-aware level choice** — `demand_scene_levels_fitting`: the camera's levels, stepped
+  coarser up front while a layer's whole level cannot fit the four pages and the camera sees
+  the whole box (zoom ≥ 1). Zoomed in, the camera's level stands and the loop's own
+  refusal-and-coarsen handles a working set that does not fit. Used by the demand route, the
+  browser packet and the browser plan.
+- **A session chunk cache** — `SessionChunkCache` in `LocalSession`, decoded chunk words by
+  (layer, level, channel, chunk), 512 MiB per dataset, oldest out first, shared by every
+  clone of the session (the server hands out clones). `layer_chunk_words_cached` reads from
+  disk only what no frame has read; the demand route's pages and the browser's chunk route go
+  through it. Pages are placed by `newvolim_residency::assemble_pages`, which the browser's
+  own assembly now uses too, so the two cannot pack differently.
+- **The depth image on request** — a socket frame carries the ray-distance PFM only with
+  `depth: true`; the page never asks.
+- **One WebGPU pipeline per device** in `scene-webgpu.js` instead of one per pass.
+
+### Evidence
+
+- `chunk_cache_serves_repeat_frames_and_level_choice_skips_levels_that_cannot_fit` (portable,
+  CPU): on a 256×256×96 store in 64×64×32 chunks the first frame's pages read 8 chunks
+  (786 432 words), the second frame's pages are identical and read nothing (packed-page hit;
+  decoded-chunk cache remains at 0 hits, 8 misses),
+  a clone of the session reads nothing either, the chunk route serves chunk 3 from the same
+  cache and refuses a coordinate outside the grid; at zoom 1 the level choice is `[1]`
+  (level 0 is 6.3 M words, beyond 4.2 M) where the camera alone says `[0]`, and at zoom 0.4
+  it stays `[0]`. **Mutations:** the cache never storing — fails at "(0, 8, 0, 0) vs
+  (0, 8, 8, 786432)"; the level choice ignoring the budget — fails at "[0] vs [1]".
+- `socket_frame_requests_ask_for_depth_explicitly` (server, CPU): `depth` defaults to false and
+  the socket branch drops the PFM unless it is true.
+- Suites, all `--test-threads=1`, debug: residency 4, portable 58 + 22 adapter, server 24 + 2,
+  ui 11; `git diff --check` clean; release server and `trunk build --release` rebuilt.
+- `measure_demand_frame_phases` (release, local adapter), 560×406, orbit 30/−20: the level
+  choice is `[2]` at once — no refused attempts; IDR whole first frame 188 ms (was 258), of
+  which 71 ms reading 472 chunks cold; the second frame through the route with the cache warm
+  72 ms (472 hits, 0 new reads). Backpack 104 ms cold, 74 ms warm.
+- Live, release server, `POST /v1/frame` at 560×406: IDR 468 ms for the first frame of the
+  process, then 90–103 ms (was 275–300); backpack 259 ms then 85–89 ms (was 236–245). The
+  socket message for a pane-sized frame is 340 KB without depth, 1524 KB with (was always the
+  latter).
+
+The browser now expands the fitted camera in the plan into clipped per-pixel rays in wasm. The
+plan route fits the camera without making the ray table, and the browser no longer fetches the
+7 MB ray response per camera move. The `/portable/rays` route remains as a compatibility and
+comparison endpoint. The browser's GPU storage and readback buffers persist across passes and
+camera moves, growing only when an input exceeds capacity; device loss clears the buffers and
+pipeline. A mocked WebGPU run confirmed that a repeat pass allocates no buffers and a larger
+page replaces only its own buffer. Browser GPU execution still needs an adapter-equipped host.
+The plan's locally expanded ray words equal the demand route's words after a JSON round trip for
+three orbit/zoom settings at two levels on the anisotropic fixture; the client dispatch oracle
+also uses these local rays. A two-layer scene verifies clipping to the union box. The wasm
+target, release page bundle (`trunk build --release`) and release server build pass.
+An approved localhost smoke run of the rebuilt server served a 4,653-byte plan with the camera,
+the legacy 42,656-byte ray response for 43×31 pixels, and the rebuilt page and renderer script.
+The temporary server was stopped after the check.
+
+## 3D drag camera uses a quaternion (2026-09-20)
+
+The 3D pane now stores one unit XYZW orientation and zoom. Each pointer move composes a rotation
+around an axis in the current camera's screen plane. The eye and up vectors rotate together, so
+horizontal motion stays horizontal even after a vertical half-turn; there is no pitch stop or
+fixed yaw axis. The fitted camera accepts that orientation alongside its legacy orbit fields, and
+the server frame, scene packet, and browser plan routes carry it to the same camera calculation.
+The browser expands rays from the oriented plan. Slice panes keep their existing controls.
+
+`drag_orientation_composes_camera_local_rotations_without_a_pitch_limit` checks composition,
+half-turns, and unit length after 10,000 moves. The portable camera test checks projected drag
+direction and a horizontal turn beyond the pole. The plan test verifies local rays exactly match
+the server rays after an oriented plan's JSON round trip. Server request and plan route tests cover
+the optional orientation field. Legacy requests without it retain their previous camera path.
+
+## Faster 3D interaction and wheel direction (2026-09-20)
+
+The 3D wheel factor now follows the fitted camera's actual convention: `zoom` multiplies eye
+distance, so a wheel movement toward the screen lowers it and brings the volume closer. Slice
+wheel handling is separate and unchanged. During 3D drag and wheel input, both renderers request
+half the pane's physical width and height. The image fills the pane while input is active; a
+full-size frame is requested 180 ms after the last input. A generation counter makes older
+settle timers harmless, and the existing latest-only request queue coalesces camera moves.
+
+The native demand route now expands rays by scanline on up to eight workers for larger frames.
+For a fitted or farther camera whose chosen levels fit the four pages, it plans the whole level
+and dispatches once, skipping the GPU pass that only discovered missing chunks. Closer cameras
+retain shader-driven partial residency. The page budget gate was corrected for the camera's
+distance convention (`zoom >= 1` means farther). Exact browser/server ray words are checked
+above the parallel threshold, and an adapter test compares full-level and feedback output.
+
+At 560×406, the previous live warm baseline was 75 ms (IDR) and 65 ms (Backpack) per frame.
+The release adapter probe after these changes measured full-size warm frames at 53 and 47 ms;
+the 280×203 interaction previews took 26 and 22 ms, respectively (2.9× and 3.0× faster than
+that baseline). The full-size frame still completes after interaction stops.
+The rebuilt server remained on `0.0.0.0:9876`; repeated live requests with an identity quaternion
+measured warm preview medians of 18 ms (IDR) and 21 ms (Backpack). Headless Chromium sent a
+230×203 frame with zoom 0.909 after one wheel-up event in a 460×406 pane, then a 460×406 frame
+with the same camera after the settle delay. This checks the direction, preview size and final
+render sequence through the actual page and socket.
+
+## Full-resolution frame cost and image transport (2026-09-20)
+
+At 560×406, the demand route now reuses packed pages across frames and session clones. Page
+storage is reference-counted, so reusing a page does not copy its words; the GPU upload casts
+those words to bytes without another allocation. The display route skips the per-pixel pick-ray
+conversion, and annotation compositing returns immediately for an unannotated scene. The packed
+page cache is bounded to 256 MiB and keyed by dataset, layer, level, channel, and exact chunk
+plan. Reopening a session clears both caches. The chunk-cache test checks page reuse through a
+clone, unchanged words, and reset on reopen; an adapter test compares the display and pick
+attachments. Portable, server, and wasm builds/tests passed.
+
+Alternating warm HTTP requests to the previous and new release binaries used identical cameras
+and datasets. For IDR, old/new median wall time was 55.5/35.5 ms (1.57×); for Backpack it was
+45.1/35.9 ms (1.25×). Both PNG hashes matched their previous binary. The server's render header
+and HTTP wall time differed by about 1.4–1.8 ms on localhost. The release phase probe placed
+GPU dispatch at roughly 15–23 ms and planning/pages at 12–17 ms; which dominates varies with
+host load. Removing display-only pick-ray conversion saved another 2.9 ms (IDR) or 8.7 ms
+(Backpack) in that probe.
+
+The first Python WebSocket benchmark appeared to show 80–100 ms of transfer after rendering,
+but that was the client's receive loop: a raw socket received the full 349 KB message within
+about 5 ms of renderer completion, and the server's write returned in under 1 ms. DevTools
+network event reporting showed similar false delay. Timing `send` to `onmessage` inside
+Chromium gave about 3–5 ms beyond the server's render time for full-size IDR and Backpack
+frames. A trial of `TCP_NODELAY` did not improve this and was removed.
+
+The current PNGs are about 261 KB (IDR) and 199 KB (Backpack); JSON/base64 expands them to
+about 349 KB and 266 KB. PNG encoding in the server probe is only a few milliseconds. Lossless
+WebP did shrink these particular images (about 117 KB and 60 KB at method 1), but a standalone
+Pillow encoder took about 73 ms and 37 ms, respectively, versus about 21 ms and 13 ms for its
+PNG encoder. This is a codec comparison, not a Rust encoder measurement. On the measured local
+path, the extra encode cost outweighs the few milliseconds available in transport. The server
+continues to send lossless PNG so image output remains bit-for-bit identical.
+
+## Zoomed-in 3D frames (2026-09-20)
+
+The previous full-size timing hid a close-camera cost. At 560×406 and zoom 0.5, the warm
+server render took about 147 ms on IDR and 112 ms on Backpack, versus about 34 ms at zoom 1.
+The close-camera level chooser started at level 0, then the demand loop dispatched a full-size
+placeholder frame and found it needed more than four pages; level 1 did the same. The fitting
+level 2 then needed a placeholder and final dispatch. The trace showed IDR's rejected levels
+needed 17 and 5 pages (first channel), and Backpack's needed 123 and 16 pages at zoom 0.5.
+
+For close views whose whole selected level cannot fit, the server now probes every eighth
+pixel using rays taken from the actual full-size ray table. If those rays alone need more than
+four pages, the full frame necessarily fails the same page bound, so the route coarsens before
+the expensive full-size feedback pass. A probe that fits leaves the normal full feedback loop
+in charge, preserving partial residency. When the whole selected level fits, the route plans
+it up front and renders it once even at close zoom. The latter removes the placeholder pass
+at the fitting level. Both changes preserve the renderer and its full-resolution image.
+
+Alternating old/new release servers on the same GPU, with identical 560×406 cameras, measured
+warm render medians at zoom 0.5 of 169.7→129.7 ms (IDR) and 126.7→82.3 ms (Backpack); at
+zoom 0.25, 168.0→123.0 ms and 157.4→85.8 ms. GPU load varied during the comparison. The PNG
+SHA-256 matched between builds at zoom 1, 0.75, 0.5 and 0.25 for both stores. The adapter
+parity test also compares the one-pass close path against feedback at zoom 0.5 and 0.25.
+HTTP wall time exceeded renderer time by about 2 ms in these local measurements, so the zoom
+slowdown came from render passes rather than image transfer.
+
+## Linked 3D center (2026-09-20)
+
+The 3D orbit target now follows the same continuous level-0 voxel focus as the orthogonal
+panes. The UI divides XYZ focus by the reference shape and sends `focusXyz` with each socket
+volume request and browser scene plan. The camera maps this fraction through physical spacing
+and ZYX axis order before applying quaternion orientation and zoom. Slice slider moves and
+continuous 2D pans update the 3D frame; the latter use the existing half-size interaction
+preview and issue a full-size frame after the drag settles. Omitting `focusXyz` preserves the
+previous volume-centered view for other API callers.

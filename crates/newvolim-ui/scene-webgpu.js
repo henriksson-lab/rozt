@@ -4,7 +4,7 @@
 // the request table, and blit a colour buffer to a canvas. The nine bindings are the recorder's
 // order, pinned by a server test that reads this file.
 window.newvolimSceneWebGpu = (function () {
-  let gpu = null; // { adapter, device }
+  let gpu = null; // { adapter, device, pipeline, buffers, buffersBusy }
 
   async function adapter() {
     if (gpu && gpu.adapter) return gpu.adapter;
@@ -20,7 +20,13 @@ window.newvolimSceneWebGpu = (function () {
     if (!gpu.device) {
       const created = await found.requestDevice();
       const owner = gpu;
-      created.lost.then(() => { if (gpu === owner) owner.device = null; });
+      created.lost.then(() => {
+        if (gpu === owner && owner.device === created) {
+          owner.device = null;
+          owner.pipeline = null;
+          owner.buffers = null;
+        }
+      });
       gpu.device = created;
     }
     return gpu.device;
@@ -32,55 +38,88 @@ window.newvolimSceneWebGpu = (function () {
   async function dispatch(pages, sceneData, rays, params, requestCapacity, outputWords, workgroups) {
     if (!Array.isArray(pages) || pages.length !== 4 || params.length !== 16) throw new Error("scene dispatch inputs are malformed");
     const gpuDevice = await device();
-    const storage = (label, data, writable) => {
-      const buffer = gpuDevice.createBuffer({
-        label, size: Math.max(4, data.byteLength),
-        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | (writable ? GPUBufferUsage.COPY_SRC : 0),
-      });
-      if (data.byteLength) gpuDevice.queue.writeBuffer(buffer, 0, data);
-      return buffer;
+    const owner = gpu;
+    // The residency loop dispatches serially. A concurrent caller gets its own temporary set
+    // so neither pass can overwrite a buffer while the GPU is reading it.
+    const reusable = !owner.buffersBusy;
+    if (reusable) owner.buffersBusy = true;
+    const buffers = reusable ? (owner.buffers || (owner.buffers = {})) : {};
+    const buffer = (key, label, size, usage) => {
+      const needed = Math.max(4, size);
+      const previous = buffers[key];
+      if (!previous || previous.size < needed) {
+        if (previous) previous.value.destroy();
+        buffers[key] = { value: gpuDevice.createBuffer({ label, size: needed, usage }), size: needed };
+      }
+      return buffers[key].value;
     };
-    const pageBuffers = pages.map((page, index) => storage(`scene page ${index}`, page, false));
-    const sceneBuffer = storage("scene data", sceneData, false);
-    const rayBuffer = storage("scene rays", rays, false);
-    const output = storage("scene output", new Uint32Array(outputWords), true);
-    const uniform = gpuDevice.createBuffer({ label: "scene params", size: 64, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-    gpuDevice.queue.writeBuffer(uniform, 0, params);
-    const requests = storage("scene requests", new Uint32Array(requestCapacity).fill(0xffffffff), true);
-    const module = gpuDevice.createShaderModule({ label: "scene shader", code: window.newvolimSceneWebGpu.shader });
-    const pipeline = gpuDevice.createComputePipeline({ label: "scene pipeline", layout: "auto", compute: { module, entryPoint: "main" } });
-    const group = gpuDevice.createBindGroup({
-      layout: pipeline.getBindGroupLayout(0),
-      entries: [
-        { binding: 0, resource: { buffer: pageBuffers[0] } },
-        { binding: 1, resource: { buffer: pageBuffers[1] } },
-        { binding: 2, resource: { buffer: pageBuffers[2] } },
-        { binding: 3, resource: { buffer: pageBuffers[3] } },
-        { binding: 4, resource: { buffer: sceneBuffer } },
-        { binding: 5, resource: { buffer: rayBuffer } },
-        { binding: 6, resource: { buffer: output } },
-        { binding: 7, resource: { buffer: uniform } },
-        { binding: 8, resource: { buffer: requests } },
-      ],
-    });
-    const outputReadback = gpuDevice.createBuffer({ label: "scene output readback", size: outputWords * 4, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
-    const requestReadback = gpuDevice.createBuffer({ label: "scene request readback", size: requestCapacity * 4, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ });
-    const encoder = gpuDevice.createCommandEncoder();
-    const pass = encoder.beginComputePass();
-    pass.setPipeline(pipeline);
-    pass.setBindGroup(0, group);
-    pass.dispatchWorkgroups(workgroups);
-    pass.end();
-    encoder.copyBufferToBuffer(output, 0, outputReadback, 0, outputWords * 4);
-    encoder.copyBufferToBuffer(requests, 0, requestReadback, 0, requestCapacity * 4);
-    gpuDevice.queue.submit([encoder.finish()]);
-    await Promise.all([outputReadback.mapAsync(GPUMapMode.READ), requestReadback.mapAsync(GPUMapMode.READ)]);
-    const outputCopy = new Uint32Array(outputReadback.getMappedRange().slice(0));
-    const requestCopy = new Uint32Array(requestReadback.getMappedRange().slice(0));
-    outputReadback.unmap();
-    requestReadback.unmap();
-    for (const buffer of [...pageBuffers, sceneBuffer, rayBuffer, output, uniform, requests, outputReadback, requestReadback]) buffer.destroy();
-    return { output: outputCopy, requests: requestCopy };
+    const storage = (key, label, data, writable) => {
+      const usage = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | (writable ? GPUBufferUsage.COPY_SRC : 0);
+      const result = buffer(key, label, data.byteLength, usage);
+      if (data.byteLength) gpuDevice.queue.writeBuffer(result, 0, data);
+      return result;
+    };
+    let mappedOutput = false;
+    let mappedRequests = false;
+    let succeeded = false;
+    try {
+      const pageBuffers = pages.map((page, index) => storage(`page${index}`, `scene page ${index}`, page, false));
+      const sceneBuffer = storage("scene", "scene data", sceneData, false);
+      const rayBuffer = storage("rays", "scene rays", rays, false);
+      const output = buffer("output", "scene output", outputWords * 4, GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC);
+      const uniform = buffer("uniform", "scene params", 64, GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST);
+      gpuDevice.queue.writeBuffer(uniform, 0, params);
+      const requests = storage("requests", "scene requests", new Uint32Array(requestCapacity).fill(0xffffffff), true);
+      if (!owner.pipeline) {
+        const module = gpuDevice.createShaderModule({ label: "scene shader", code: window.newvolimSceneWebGpu.shader });
+        owner.pipeline = gpuDevice.createComputePipeline({ label: "scene pipeline", layout: "auto", compute: { module, entryPoint: "main" } });
+      }
+      const pipeline = owner.pipeline;
+      const outputReadback = buffer("outputReadback", "scene output readback", outputWords * 4, GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ);
+      const requestReadback = buffer("requestReadback", "scene request readback", requestCapacity * 4, GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ);
+      const group = gpuDevice.createBindGroup({
+        layout: pipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: pageBuffers[0] } },
+          { binding: 1, resource: { buffer: pageBuffers[1] } },
+          { binding: 2, resource: { buffer: pageBuffers[2] } },
+          { binding: 3, resource: { buffer: pageBuffers[3] } },
+          { binding: 4, resource: { buffer: sceneBuffer } },
+          { binding: 5, resource: { buffer: rayBuffer } },
+          { binding: 6, resource: { buffer: output } },
+          { binding: 7, resource: { buffer: uniform } },
+          { binding: 8, resource: { buffer: requests } },
+        ],
+      });
+      const encoder = gpuDevice.createCommandEncoder();
+      const pass = encoder.beginComputePass();
+      pass.setPipeline(pipeline);
+      pass.setBindGroup(0, group);
+      pass.dispatchWorkgroups(workgroups);
+      pass.end();
+      encoder.copyBufferToBuffer(output, 0, outputReadback, 0, outputWords * 4);
+      encoder.copyBufferToBuffer(requests, 0, requestReadback, 0, requestCapacity * 4);
+      gpuDevice.queue.submit([encoder.finish()]);
+      await Promise.all([outputReadback.mapAsync(GPUMapMode.READ), requestReadback.mapAsync(GPUMapMode.READ)]);
+      mappedOutput = true;
+      mappedRequests = true;
+      const outputCopy = new Uint32Array(outputReadback.getMappedRange(0, outputWords * 4).slice(0));
+      const requestCopy = new Uint32Array(requestReadback.getMappedRange(0, requestCapacity * 4).slice(0));
+      outputReadback.unmap();
+      mappedOutput = false;
+      requestReadback.unmap();
+      mappedRequests = false;
+      succeeded = true;
+      return { output: outputCopy, requests: requestCopy };
+    } finally {
+      if (mappedOutput) buffers.outputReadback.value.unmap();
+      if (mappedRequests) buffers.requestReadback.value.unmap();
+      if (!succeeded || !reusable || owner.device !== gpuDevice) {
+        for (const entry of Object.values(buffers)) entry.value.destroy();
+        if (reusable && owner.buffers === buffers) owner.buffers = null;
+      }
+      if (reusable) owner.buffersBusy = false;
+    }
   }
 
   // Blit RGBA bytes to the canvas through its WebGPU context.

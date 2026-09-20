@@ -91,6 +91,10 @@ pub struct FrameRequest {
     pub orbit_x: i32,
     pub orbit_y: i32,
     pub zoom: f32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub focus_xyz: Option<[f32; 3]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub orientation: Option<[f32; 4]>,
     pub request_id: u64,
     pub view: RenderView,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -204,7 +208,7 @@ pub fn layers_url(origin: &str, dataset: &str) -> String {
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SceneSettings {
-    /// See-through depth: a multiplier on the opacity reference, 1 by default, 0.05..=20.
+    /// See-through depth: a multiplier on the opacity reference, 1 by default, 0.05..=100.
     pub depth_scale: f32,
 }
 
@@ -212,18 +216,18 @@ pub fn settings_url(origin: &str, dataset: &str) -> String {
     format!("{origin}/v1/datasets/{}/settings", encode_path(dataset))
 }
 
-/// The depth slider is logarithmic: position −1..1 is scale 0.1..10.
+/// The depth slider is logarithmic: position −1..2 is scale 0.1..100.
 pub fn depth_scale_from_slider(position: f32) -> f32 {
-    10_f32.powf(position.clamp(-1.0, 1.0))
+    10_f32.powf(position.clamp(-1.0, 2.0))
 }
 
 pub fn slider_from_depth_scale(scale: f32) -> f32 {
-    scale.max(1e-6).log10().clamp(-1.0, 1.0)
+    scale.max(1e-6).log10().clamp(-1.0, 2.0)
 }
 
-/// The client residency routes: the plan (JSON), the rays (binary words) and the chunk words
-/// (binary) for a camera; `levels` overrides the camera's level choice after a page-bound refusal.
-pub fn scene_plan_url(origin: &str, dataset: &str, width: u32, height: u32, orbit_x: i32, orbit_y: i32, zoom: f32, levels: Option<&[u32]>) -> String {
+/// The client residency routes: the plan (including the fitted camera) and chunk words.
+/// `levels` overrides the camera's level choice after a page-bound refusal.
+pub fn scene_plan_url(origin: &str, dataset: &str, width: u32, height: u32, orbit_x: i32, orbit_y: i32, zoom: f32, orientation: Option<[f32; 4]>, focus_xyz: Option<[f32; 3]>, levels: Option<&[u32]>) -> String {
     let mut url = format!(
         "{origin}/v1/datasets/{}/portable/plan?width={width}&height={height}&orbitX={orbit_x}&orbitY={orbit_y}&zoom={zoom}",
         encode_path(dataset)
@@ -232,14 +236,41 @@ pub fn scene_plan_url(origin: &str, dataset: &str, width: u32, height: u32, orbi
         url.push_str("&levels=");
         url.push_str(&levels.iter().map(u32::to_string).collect::<Vec<_>>().join(","));
     }
+    if let Some(quaternion) = orientation {
+        url.push_str("&orientation=");
+        url.push_str(&quaternion.iter().map(f32::to_string).collect::<Vec<_>>().join(","));
+    }
+    if let Some(focus) = focus_xyz {
+        url.push_str("&focusXyz=");
+        url.push_str(&focus.iter().map(f32::to_string).collect::<Vec<_>>().join(","));
+    }
     url
 }
 
-pub fn scene_rays_url(origin: &str, dataset: &str, width: u32, height: u32, orbit_x: i32, orbit_y: i32, zoom: f32) -> String {
-    format!(
-        "{origin}/v1/datasets/{}/portable/rays?width={width}&height={height}&orbitX={orbit_x}&orbitY={orbit_y}&zoom={zoom}",
-        encode_path(dataset)
-    )
+/// The 2D panes keep a continuous voxel-space focus; the 3D camera expects the same point as
+/// a fraction of the reference layer's physical extent.
+pub fn normalized_focus_xyz(focus: [f64; 3], shape: [u32; 3]) -> [f32; 3] {
+    std::array::from_fn(|axis| (focus[axis] / f64::from(shape[axis].max(1))).clamp(0.0, 1.0) as f32)
+}
+
+/// Compose a pointer drag in the current camera's screen plane. XYZW unit quaternions keep
+/// eye and up together, including through a vertical half-turn where a yaw/pitch camera locks.
+pub fn drag_orientation(orientation: [f32; 4], dx: i32, dy: i32) -> [f32; 4] {
+    let length = (dx as f32).hypot(dy as f32);
+    if length == 0.0 { return orientation; }
+    let half = length * 0.005;
+    let sine = half.sin() / length;
+    let delta = [-dy as f32 * sine, -dx as f32 * sine, 0.0, half.cos()];
+    let [ax, ay, az, aw] = orientation;
+    let [bx, by, bz, bw] = delta;
+    let next = [
+        aw * bx + ax * bw + ay * bz - az * by,
+        aw * by - ax * bz + ay * bw + az * bx,
+        aw * bz + ax * by - ay * bx + az * bw,
+        aw * bw - ax * bx - ay * by - az * bz,
+    ];
+    let reciprocal = 1.0 / next.iter().map(|component| component * component).sum::<f32>().sqrt();
+    next.map(|component| component * reciprocal)
 }
 
 pub fn scene_chunks_url(origin: &str, dataset: &str) -> String {
@@ -316,12 +347,14 @@ mod tests {
     #[test]
     fn frame_request_uses_the_servers_camel_case_keys() {
         let volume = serde_json::to_value(FrameRequest {
+            focus_xyz: None,
             dataset: "demo".into(),
             width: 256,
             height: 192,
             orbit_x: 30,
             orbit_y: -20,
             zoom: 1.5,
+            orientation: None,
             request_id: 7,
             view: RenderView::Volume,
             x: None,
@@ -334,12 +367,14 @@ mod tests {
             serde_json::json!({"dataset":"demo","width":256,"height":192,"orbitX":30,"orbitY":-20,"zoom":1.5,"requestId":7,"view":"volume"})
         );
         let orthogonal = serde_json::to_value(FrameRequest {
+            focus_xyz: None,
             dataset: "demo".into(),
             width: 64,
             height: 48,
             orbit_x: 0,
             orbit_y: 0,
             zoom: 1.0,
+            orientation: None,
             request_id: 8,
             view: RenderView::Orthogonal,
             x: Some(1),
@@ -350,6 +385,18 @@ mod tests {
         assert_eq!(orthogonal["view"], "orthogonal");
         assert_eq!((orthogonal["x"].as_u64(), orthogonal["y"].as_u64(), orthogonal["z"].as_u64()), (Some(1), Some(2), Some(3)));
         assert!(orthogonal.get("orbit_x").is_none());
+        let mut volume_with_rotation = volume.clone();
+        volume_with_rotation["orientation"] = serde_json::json!([0.0, 0.0, 0.0, 1.0]);
+        let request = FrameRequest {
+            focus_xyz: None,
+            dataset: "demo".into(), width: 256, height: 192,
+            orbit_x: 0, orbit_y: 0, zoom: 1.0,
+            orientation: Some([0.0, 0.0, 0.0, 1.0]), request_id: 9,
+            view: RenderView::Volume, x: None, y: None, z: None,
+        };
+        assert_eq!(serde_json::to_value(&request).unwrap()["orientation"], volume_with_rotation["orientation"]);
+        let focused = FrameRequest { focus_xyz: Some([0.25, 0.5, 0.75]), ..request };
+        assert_eq!(serde_json::to_value(focused).unwrap()["focusXyz"], serde_json::json!([0.25, 0.5, 0.75]));
     }
 
     #[test]
@@ -429,11 +476,13 @@ mod tests {
     #[test]
     fn residency_routes_and_binary_replies_follow_the_server() {
         assert_eq!(
-            scene_plan_url("http://h", "d", 4, 3, 1, -2, 1.5, None),
+            scene_plan_url("http://h", "d", 4, 3, 1, -2, 1.5, None, None, None),
             "http://h/v1/datasets/d/portable/plan?width=4&height=3&orbitX=1&orbitY=-2&zoom=1.5"
         );
-        assert!(scene_plan_url("http://h", "d", 4, 3, 0, 0, 1.0, Some(&[2, 1])).ends_with("&levels=2,1"));
-        assert!(scene_rays_url("http://h", "d", 4, 3, 0, 0, 1.0).contains("/portable/rays?"));
+        assert!(scene_plan_url("http://h", "d", 4, 3, 0, 0, 1.0, None, None, Some(&[2, 1])).ends_with("&levels=2,1"));
+        assert!(scene_plan_url("http://h", "d", 4, 3, 0, 0, 1.0, Some([0.0, 0.0, 0.0, 1.0]), None, None).ends_with("&orientation=0,0,0,1"));
+        assert!(scene_plan_url("http://h", "d", 4, 3, 0, 0, 1.0, None, Some([0.25, 0.5, 0.75]), None).ends_with("&focusXyz=0.25,0.5,0.75"));
+        assert_eq!(normalized_focus_xyz([50.5, 25.5, 7.5], [100, 100, 30]), [0.505, 0.255, 0.25]);
         assert_eq!(scene_chunks_url("http://h", "d"), "http://h/v1/datasets/d/portable/chunks");
         let body = serde_json::to_value(SceneChunksRequest { layer_id: 1, level: 2, source_index: 0, chunks: vec![[0, 0, 5]] }).unwrap();
         assert_eq!(body, serde_json::json!({"layerId":1,"level":2,"sourceIndex":0,"chunks":[[0,0,5]]}));
@@ -449,6 +498,22 @@ mod tests {
     }
 
     #[test]
+    fn drag_orientation_composes_camera_local_rotations_without_a_pitch_limit() {
+        let identity = [0.0, 0.0, 0.0, 1.0];
+        let right_then_down = drag_orientation(drag_orientation(identity, 120, 0), 0, 120);
+        let down_then_right = drag_orientation(drag_orientation(identity, 0, 120), 120, 0);
+        assert_ne!(right_then_down, down_then_right, "drag order must compose");
+        let flipped = drag_orientation(identity, 0, 314);
+        assert!(flipped[0].abs() > 0.99 && flipped[3].abs() < 0.01, "vertical half-turn is admitted");
+        let mut orientation = identity;
+        for _ in 0..10_000 {
+            orientation = drag_orientation(orientation, 1, 1);
+        }
+        let norm: f32 = orientation.iter().map(|value| value * value).sum();
+        assert!((norm - 1.0).abs() < 1e-5, "drag rotation must stay unit length");
+    }
+
+    #[test]
     fn settings_are_camel_case_and_the_depth_slider_is_logarithmic() {
         assert_eq!(settings_url("http://h", "d"), "http://h/v1/datasets/d/settings");
         assert_eq!(serde_json::to_value(SceneSettings { depth_scale: 2.5 }).unwrap(), serde_json::json!({"depthScale": 2.5}));
@@ -456,7 +521,9 @@ mod tests {
         assert!((depth_scale_from_slider(1.0) - 10.0).abs() < 1e-5);
         assert!((depth_scale_from_slider(-1.0) - 0.1).abs() < 1e-6);
         assert!((slider_from_depth_scale(depth_scale_from_slider(0.3)) - 0.3).abs() < 1e-5);
-        assert_eq!(slider_from_depth_scale(1000.0), 1.0, "clamped into the slider");
+        assert!((depth_scale_from_slider(2.0) - 100.0).abs() < 1e-4);
+        assert_eq!(slider_from_depth_scale(100.0), 2.0);
+        assert_eq!(slider_from_depth_scale(1000.0), 2.0, "clamped into the slider");
     }
 
     #[test]

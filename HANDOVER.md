@@ -64,20 +64,68 @@ route; `GET/POST /v1/datasets/{d}/settings {depthScale}`; the page's "Scene → 
 (`focus`, continuous; `crosshair` its floor) and is not drawn (STAGE0 "Slice panes are 2-D
 cameras"). Depth moves via the axis sliders, the orientation box or another pane's pan.
 
-**Camera:** `orbit_delta` is `[dx, dy]` of a screen drag and `camera_for_volume` (palace-frame)
-is a turntable — `dx` spins about the volume's vertical axis at 0.01 rad/px, `dy` tilts,
-clamped to ±89°. It replaced Palace's additive `pan_around` nudge, which also read the drag in
-`(y, x)` order (STAGE0 "Orbit axes were swapped", "A turntable camera"); pinned by
-`horizontal_orbit_yaws_and_vertical_orbit_pitches`.
+**3D camera:** the page accumulates a unit XYZW quaternion. Each pointer move rotates around
+the camera's current screen axes at 0.01 rad/px, so vertical turns pass the poles and later
+horizontal drags still work. The same orientation reaches socket frames and browser residency
+plans; slice panes keep their separate pan and zoom controls. Older clients can still use the
+`orbitX`/`orbitY` turntable controls (STAGE0 "The 3D camera uses local rotations").
+The 3D wheel now lowers camera distance when scrolled toward the screen. A drag or wheel burst
+uses a half-width, half-height preview; a full-size frame follows 180 ms after input stops.
 
 **Client-side residency (2026-09-20):** the page's "WebGPU" renderer runs the demand loop itself
 (`crates/newvolim-residency`, pure; `palace-core` now builds for wasm32; the scene dispatch
-code lives in `palace_core::gpu`) against `GET …/portable/plan`, `GET …/portable/rays` and
-`POST …/portable/chunks`, fetching only missed chunks and caching them across frames. Pinned
+code lives in `palace_core::gpu`) against `GET …/portable/plan` and
+`POST …/portable/chunks`, expanding the plan's fitted camera into rays locally, fetching only
+missed chunks and caching them across frames. Pinned
 by a CPU oracle (client dispatch == server dispatch, word for word) and an adapter parity test
 (client loop frame == server demand frame). The browser leg itself is unverified on this host
 (headless Chrome has no WebGPU adapter); it falls back to server frames with a notice. STAGE0
-"Client-side residency". Next there: rays generated in the page; reuse GPU buffers per pass.
+"Client-side residency". GPU storage and readback buffers now survive browser passes and camera
+moves, growing only when needed; a lost device clears them with its pipeline.
+
+**Performance (2026-09-20, STAGE0 "Why the 3D renderers are slow" and "The renderers, faster"):**
+a 560×406 server frame on the IDR image went from ~275 ms to ~90 ms: the level choice is
+budget-aware (`demand_scene_levels_fitting`), decoded chunks are cached per session
+(`SessionChunkCache`, 512 MiB), the socket PFM is sent only with `depth: true`, and the page
+keeps one WebGPU pipeline and reuses its buffers. The browser now generates rays from the plan;
+the plan route skips the server's per-pixel ray generation and the 7 MB ray response. A
+far-face rounding bug in the shader (chunk index `dims`) was found and clamped.
+The fitted camera basis lives in the nested `palace-dev/palace-frame` working tree; keep that
+change with the outer tree. Exact ray-word parity is pinned after JSON for three cameras at two
+levels on the anisotropic fixture.
+
+**Latest full-size optimization (2026-09-20, STAGE0 "Full-resolution frame cost and image
+transport"):** demand frames cache packed pages (256 MiB) and reuse their word storage; GPU
+upload avoids a ~19 MB CPU copy; display frames skip pick-ray conversion and empty annotation
+composition. Alternating warm 560×406 HTTP requests measured 55.5→35.5 ms for IDR and
+45.1→35.9 ms for Backpack, with identical PNG hashes. Chromium's own `send`→`onmessage` timing
+puts socket delivery about 3–5 ms beyond rendering locally. Python WebSocket and CDP network
+events had falsely suggested an 80–100 ms transfer delay. Lossless WebP compressed these images
+further but encoded much more slowly in a standalone codec comparison, so PNG remains the
+measured choice for this local path. The server should stay on `0.0.0.0:9876`.
+
+**Depth control:** the 3D scene's logarithmic Depth slider now reaches 100× (session accepts
+0.05×–100×); its prior 10× slider ceiling was too shallow. The slice-axis sliders are separate.
+
+**Close-camera speed (STAGE0 "Zoomed-in 3D frames"):** zoom 0.5 previously ran two rejected
+full-size feedback passes before the fitting level's two passes. A sparse probe using exact
+full-frame rays now rejects levels only when that subset alone exceeds four pages; a whole
+level that fits renders in one pass even when zoomed in. At 560×406, alternating old/new
+servers measured 169.7→129.7 ms (IDR) and 126.7→82.3 ms (Backpack) at zoom 0.5, with
+identical PNGs. The remaining close-view cost is render work, not localhost transfer.
+The default server renderer now plans a whole level up front when it fits, skipping one feedback
+GPU pass; native ray generation is parallel above 65,536 pixels. On the release adapter, a warm
+560×406 frame is 53 ms IDR / 47 ms Backpack, and its 280×203 interaction preview is 26 / 22 ms
+(from 75 / 65 ms before this pass; STAGE0 "Faster 3D interaction and wheel direction").
+Live preview medians were 18 / 21 ms; a headless browser wheel-up event sent a half-size frame
+at zoom 0.909 then a full-size frame at the same camera after the settle delay.
+
+**3D center follows 2D focus:** `Session.focus` is a continuous XYZ voxel point used by the
+slice panes. The UI sends it as normalized `focusXyz` for both socket frames and browser scene
+plans. `camera_for_volume` converts it to physical ZYX coordinates using the reference volume's
+shape and spacing, then orbits around that point with the existing quaternion orientation.
+Changing a slider or panning a 2D pane updates the 3D view; continuous pans use the interactive
+preview and settle at full size. Older clients that omit `focusXyz` retain the volume center.
 
 **Both the demand route and the browser packet coarsen their level** until it fits the four
 pages (`coarsen_levels`, `full_level_scene_inputs_fitting`); a pane-sized browser frame is
