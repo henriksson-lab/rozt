@@ -34,7 +34,7 @@ use newvolim_io::{read_array_info, read_dataset_metadata, LocalSourcePolicy};
 use newvolim_portable::{
     routes::{
         composite_palace_scene_annotations, demand_scene_plan, demand_scene_plan_only, full_level_scene_inputs_fitting, layer_chunk_words,
-        portable_orthogonal_slice_pngs_for_view, scene_route_frame_for_display, ChannelStateInput, NativePortableDrawRequest, RouteRenderer,
+        portable_orthogonal_slice_pngs_for_view, portable_xy_tile_png, scene_route_frame_for_display, ChannelStateInput, NativePortableDrawRequest, RouteRenderer,
     },
     session::{LayerChannelSummary, LocalSession},
 };
@@ -206,7 +206,7 @@ struct FrameJob {
     controls: CameraControls,
     view: RenderView,
     crosshair: Option<[u32; 3]>,
-    slice_zooms: [f32; 3],
+    slice_zooms: [f64; 3],
     response: oneshot::Sender<RenderResult>,
 }
 
@@ -282,6 +282,7 @@ struct RenderedOrthogonal {
     crosshair_xyz: [u32; 3],
     pyramid_levels: Option<[u32; 3]>,
     viewport: bool,
+    pyramid_shapes_xyz: Vec<[u32; 3]>,
 }
 
 enum RenderOutput {
@@ -347,7 +348,7 @@ struct FrameRequest {
     #[serde(default = "default_slice_axis")]
     slice_axis: u32,
     #[serde(default)]
-    slice_zooms: Option<[f32; 3]>,
+    slice_zooms: Option<[f64; 3]>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
@@ -418,6 +419,7 @@ struct SocketOrthogonal {
     #[serde(skip_serializing_if = "Option::is_none")]
     pyramid_levels: Option<[u32; 3]>,
     viewport: bool,
+    pyramid_shapes_xyz: Vec<[u32; 3]>,
 }
 
 #[derive(Serialize)]
@@ -475,6 +477,10 @@ fn app_router(
         .route("/v1/frames", get(frame_socket))
         .route("/v1/datasets", get(list_datasets))
         .route("/v1/datasets/{dataset}/zarr/{*asset}", get(read_zarr_asset))
+        .route(
+            "/v1/datasets/{dataset}/tiles/xy/{level}/{tile_x}/{tile_y}",
+            get(dataset_xy_tile),
+        )
         .route(
             "/v1/datasets/{dataset}/channels",
             get(dataset_channels).post(set_dataset_channel),
@@ -1056,6 +1062,34 @@ async fn list_datasets(State(state): State<AppState>) -> Json<DatasetList> {
     Json(DatasetList { datasets })
 }
 
+const XY_TILE_EDGE: u32 = 512;
+
+async fn dataset_xy_tile(
+    State(state): State<AppState>,
+    AxumPath((dataset, level, tile_x, tile_y)): AxumPath<(String, u32, u32, u32)>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let root = resolve_frame_dataset(&state.datasets, &dataset)?;
+    let sessions = state.sessions.clone();
+    let png = tokio::task::spawn_blocking(move || {
+        let session = sessions.session_for(&dataset, &root)?;
+        portable_xy_tile_png(&session, level, tile_x, tile_y, XY_TILE_EDGE)
+            .map(|(png, _)| png)
+    })
+    .await
+    .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "tile task failed".to_owned()))?
+    .map_err(|message| (StatusCode::BAD_REQUEST, message))?;
+    Ok((
+        [
+            (header::CONTENT_TYPE, HeaderValue::from_static("image/png")),
+            (
+                header::CACHE_CONTROL,
+                HeaderValue::from_static("private, max-age=31536000, immutable"),
+            ),
+        ],
+        png,
+    ))
+}
+
 /// Serve a configured dataset asset without exposing its local path. This is intentionally a
 /// narrow byte transport: NGFF metadata interpretation and codec selection stay in the browser
 /// client, while source authorization remains at the server boundary.
@@ -1217,7 +1251,9 @@ async fn enqueue_render(
         orientation: request.orientation,
         focus_xyz: request.focus_xyz,
     };
-    let slice_zooms = request.slice_zooms.unwrap_or([request.zoom; 3]);
+    let slice_zooms = request
+        .slice_zooms
+        .unwrap_or([f64::from(request.zoom); 3]);
     let controls = match request.view {
         RenderView::Volume => controls
             .validate()
@@ -1225,11 +1261,11 @@ async fn enqueue_render(
         RenderView::Orthogonal => {
             if slice_zooms
                 .iter()
-                .any(|zoom| !zoom.is_finite() || !(0.25..=64.0).contains(zoom))
+                .any(|zoom| !zoom.is_finite() || *zoom < 0.25)
             {
                 return Err((
                     StatusCode::BAD_REQUEST,
-                    "2D zoom must be finite and in 0.25..=64.0".to_owned(),
+                    "2D zoom must be finite and at least 0.25".to_owned(),
                 ));
             }
             if controls.focus_xyz.is_some_and(|focus| {
@@ -1467,6 +1503,7 @@ async fn serve_frame_socket(mut socket: WebSocket, state: AppState, session_id: 
                     crosshair_xyz: rendered.crosshair_xyz,
                     pyramid_levels: rendered.pyramid_levels,
                     viewport: rendered.viewport,
+                    pyramid_shapes_xyz: rendered.pyramid_shapes_xyz,
                 };
                 if socket
                     .send(Message::Text(
@@ -1595,6 +1632,7 @@ fn start_render(job: FrameJob, completed_tx: &mpsc::UnboundedSender<RenderComple
                         crosshair_xyz: slices.crosshair_xyz,
                         pyramid_levels: Some(slices.levels),
                         viewport: true,
+                        pyramid_shapes_xyz: slices.pyramid_shapes_xyz,
                         render_ms: started.elapsed().as_secs_f64() * 1_000.0,
                     })),
                     Err(portable_error) => dataset_xyz_extent(&job.root).and_then(|shape| {
@@ -1616,6 +1654,7 @@ fn start_render(job: FrameJob, completed_tx: &mpsc::UnboundedSender<RenderComple
                                 crosshair_xyz: crosshair,
                                 pyramid_levels: None,
                                 viewport: false,
+                                pyramid_shapes_xyz: Vec::new(),
                                 render_ms: started.elapsed().as_secs_f64() * 1_000.0,
                             })
                         })
@@ -2448,6 +2487,7 @@ mod tests {
             crosshair_xyz: [64, 64, 16],
             pyramid_levels: Some([2, 3, 4]),
             viewport: true,
+            pyramid_shapes_xyz: vec![[128, 128, 32]],
         })
         .unwrap();
         assert_eq!(json["type"], "orthogonal");

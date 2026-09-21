@@ -36,6 +36,9 @@ button { cursor: pointer; }
 .workspace-tabs .spacer { flex: 1; }
 .workspace-tabs .origin { color: var(--muted); font-size: 11px; }
 .app-container { flex: 1; display: flex; min-height: 0; position: relative; }
+.app-container.probing > :not(.dataset-loading) { visibility: hidden; }
+.dataset-loading { position: absolute; inset: 0; z-index: 100; display: flex; align-items: center; justify-content: center; gap: 8px; background: var(--bg-deep); color: var(--muted-light); }
+.dataset-loading .busy { color: var(--accent); }
 .viewer-shell { flex: 1; display: flex; flex-direction: column; min-width: 0; position: relative; }
 .viewer-area { flex: 1; position: relative; min-height: 0; background: var(--bg-deep); }
 
@@ -53,6 +56,9 @@ button { cursor: pointer; }
 .pane.ortho { cursor: grab; }
 .pane.ortho:active { cursor: grabbing; }
 .pane .slice-image { position: absolute; display: block; image-rendering: auto; user-select: none; -webkit-user-drag: none; pointer-events: none; }
+.pane .slice-tile-layer { position: absolute; left: 0; top: 0; transform-origin: 0 0; pointer-events: none; }
+.pane .slice-tile { position: absolute; display: block; opacity: 0; image-rendering: auto; user-select: none; -webkit-user-drag: none; pointer-events: none; }
+.pane .slice-tile.loaded { opacity: 1; background: var(--bg-deep); }
 .pane .annotation-overlay { position: absolute; overflow: visible; pointer-events: none; }
 .pane .annotation-overlay .annotation-shape { vector-effect: non-scaling-stroke; fill-rule: evenodd; }
 .pane .annotation-overlay .annotation-shape.selected { stroke: #fff; stroke-width: 3; }

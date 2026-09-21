@@ -2423,6 +2423,99 @@ pub struct PortableOrthogonalViewSlices {
     pub levels: [u32; 3],
     pub voxel_shape_xyz: [u32; 3],
     pub crosshair_xyz: [u32; 3],
+    pub pyramid_shapes_xyz: Vec<[u32; 3]>,
+}
+
+pub fn portable_pyramid_shapes_xyz(session: &LocalSession) -> Result<Vec<[u32; 3]>, String> {
+    let limits = LayerRenderLimits::new(4, 4);
+    let base = session
+        .local_layer_render_requests(limits)
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .next()
+        .ok_or_else(|| "no image layer to inspect".to_owned())?;
+    let mut shapes = Vec::new();
+    for level in 0.. {
+        let Ok(requests) = session.local_layer_render_requests_at_level(limits, level) else {
+            break;
+        };
+        let Some(request) = requests
+            .into_iter()
+            .find(|request| request.layer.layer_id == base.layer.layer_id)
+        else {
+            break;
+        };
+        shapes.push(std::array::from_fn(|axis| {
+            u32::try_from(request.source.spatial_shape(axis)).unwrap_or(u32::MAX)
+        }));
+    }
+    Ok(shapes)
+}
+
+/// One native-resolution, source-aligned XY tile for the browser's progressive 2D cache.
+pub fn portable_xy_tile_png(
+    session: &LocalSession,
+    level: u32,
+    tile_x: u32,
+    tile_y: u32,
+    tile_edge: u32,
+) -> Result<(Vec<u8>, [u32; 2]), String> {
+    let limits = LayerRenderLimits::new(4, 4);
+    let request = session
+        .local_layer_render_requests_at_level(limits, level)
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .next()
+        .ok_or_else(|| "no image layer to tile".to_owned())?;
+    let shape: [u64; 3] = std::array::from_fn(|axis| request.source.spatial_shape(axis));
+    let origin = [u64::from(tile_x) * u64::from(tile_edge), u64::from(tile_y) * u64::from(tile_edge)];
+    if origin[0] >= shape[0] || origin[1] >= shape[1] {
+        return Err("XY tile is outside the pyramid level".into());
+    }
+    let extent = [
+        u32::try_from((shape[0] - origin[0]).min(u64::from(tile_edge))).unwrap(),
+        u32::try_from((shape[1] - origin[1]).min(u64::from(tile_edge))).unwrap(),
+    ];
+    let chunk_shape: [u64; 3] =
+        std::array::from_fn(|axis| request.source.spatial_chunk_shape(axis).max(1));
+    let counts: [u64; 3] =
+        std::array::from_fn(|axis| shape[axis].div_ceil(chunk_shape[axis]));
+    let chunk_min = [origin[0] / chunk_shape[0], origin[1] / chunk_shape[1]];
+    let chunk_max = [
+        (origin[0] + u64::from(extent[0]) - 1) / chunk_shape[0],
+        (origin[1] + u64::from(extent[1]) - 1) / chunk_shape[1],
+    ];
+    let z = 0_u64;
+    let mut indices = Vec::new();
+    for y in chunk_min[1]..=chunk_max[1] {
+        for x in chunk_min[0]..=chunk_max[0] {
+            indices.push(u32::try_from(x + counts[0] * (y + counts[1] * z))
+                .map_err(|_| "XY tile chunk index exceeds u32")?);
+        }
+    }
+    let words = request.layer.channels.iter().map(|channel| {
+        session.layer_chunk_words_cached(limits, request.layer.layer_id, level, channel.source_index, &indices)
+            .map_err(|error| error.to_string())
+    }).collect::<Result<Vec<_>, _>>()?;
+    let transfers = request.layer.channels.iter()
+        .map(newvolim_render::PortableChannelTransfer::from).collect::<Vec<_>>();
+    let rgba = (0..usize::try_from(u64::from(extent[0]) * u64::from(extent[1])).unwrap())
+        .flat_map(|pixel| {
+            let coordinate = [origin[0] + pixel as u64 % u64::from(extent[0]), origin[1] + pixel as u64 / u64::from(extent[0]), 0];
+            let chunk: [u64; 3] =
+                std::array::from_fn(|axis| coordinate[axis] / chunk_shape[axis]);
+            let index = (chunk[0] + counts[0] * (chunk[1] + counts[1] * chunk[2])) as u32;
+            let position = indices.binary_search(&index).expect("tile planned its pixel chunk");
+            let local: [u64; 3] = std::array::from_fn(|axis| coordinate[axis] - chunk[axis] * chunk_shape[axis]);
+            let logical: [u64; 3] = std::array::from_fn(|axis| (shape[axis] - chunk[axis] * chunk_shape[axis]).min(chunk_shape[axis]));
+            let offset = (local[0] + logical[0] * (local[1] + logical[1] * local[2])) as usize;
+            let samples = words.iter().map(|channel| channel[position][offset] as f64).collect::<Vec<_>>();
+            let linear = newvolim_render::composite_portable_scene_samples(&[(&transfers, &samples)])
+                .expect("XY tile channel samples match transfers");
+            portable_linear_premultiplied_to_srgb8(linear)
+        }).collect::<Vec<_>>();
+    let frame = palace_png::RgbaFrame::new(extent[0], extent[1], rgba).map_err(|error| error.to_string())?;
+    Ok((palace_png::encode_rgba(&frame), extent))
 }
 
 /// Render one screen-sized orthogonal viewport. Pyramid selection is based on physical output
@@ -2434,7 +2527,7 @@ fn portable_orthogonal_view_plane(
     crosshair_xyz: [u32; 3],
     focus_xyz: [f64; 3],
     pane_size: [u32; 2],
-    zoom: f32,
+    zoom: f64,
     plane_index: usize,
 ) -> Result<((u32, u32, Vec<u8>), u32), String> {
     let limits = LayerRenderLimits::new(4, 4);
@@ -2447,7 +2540,7 @@ fn portable_orthogonal_view_plane(
     let [width, height] = pane_size;
     let fit = (width as f64 / shape0[horizontal_axis].max(1) as f64)
         .min(height as f64 / shape0[vertical_axis].max(1) as f64);
-    let scale = fit * f64::from(zoom);
+    let scale = fit * zoom;
     if !scale.is_finite() || scale <= 0.0 {
         return Err("orthogonal viewport scale is invalid".into());
     }
@@ -2591,7 +2684,7 @@ pub fn portable_orthogonal_slice_pngs_for_view(
     session: &LocalSession,
     crosshair_xyz: Option<[u32; 3]>,
     pane_size: [u32; 2],
-    zooms: [f32; 3],
+    zooms: [f64; 3],
     focus_normalized_xyz: Option<[f32; 3]>,
 ) -> Result<([Vec<u8>; 3], PortableOrthogonalViewSlices), String> {
     let limits = LayerRenderLimits::new(4, 4);
@@ -2642,6 +2735,7 @@ pub fn portable_orthogonal_slice_pngs_for_view(
         levels,
         voxel_shape_xyz,
         crosshair_xyz,
+        pyramid_shapes_xyz: portable_pyramid_shapes_xyz(session)?,
     };
     Ok((pngs, slices))
 }

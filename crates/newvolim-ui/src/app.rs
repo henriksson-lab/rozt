@@ -150,6 +150,23 @@ pub struct Slices {
     pub xz: String,
     pub yz: String,
     pub viewport: bool,
+    pub capture: OrthogonalCapture,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct OrthogonalCapture {
+    pub focus_xyz: [f64; 3],
+    pub zooms: [f64; 3],
+    pub pane_size: [u32; 2],
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct SliceTilePlacement {
+    src: String,
+    source_x: u32,
+    source_y: u32,
+    source_width: u32,
+    source_height: u32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -225,6 +242,11 @@ pub struct Session {
     pub focus: RwSignal<[f64; 3]>,
     /// Zoom of the XY, XZ and YZ panes over their slice: 1 fits the whole slice.
     pub zoom_2d: RwSignal<[f64; 3]>,
+    pub pyramid_shapes_xyz: RwSignal<Vec<[u32; 3]>>,
+    pub tile_generation: RwSignal<u64>,
+    /// False until the first dataset response has selected its final 2D or 3D layout and the
+    /// browser has had a frame to apply it.
+    pub dataset_layout_ready: RwSignal<bool>,
     /// Bumped on window resize so pane geometry recomputes.
     pub layout_tick: RwSignal<u32>,
     pub camera: RwSignal<Camera>,
@@ -247,6 +269,7 @@ pub struct Session {
     volume_preview_generation: StoredValue<u64>,
     ortho_inflight: StoredValue<Option<u64>>,
     ortho_dirty: StoredValue<bool>,
+    ortho_request_capture: StoredValue<Option<OrthogonalCapture>>,
     browser_busy: StoredValue<bool>,
     browser_dirty: StoredValue<bool>,
     channel_inflight: StoredValue<bool>,
@@ -265,6 +288,13 @@ pub struct Session {
 }
 
 impl Session {
+    fn uses_xy_tile_cache(self) -> bool {
+        self.voxel_shape
+            .get_untracked()
+            .is_some_and(|shape| shape[2] == 1)
+            && !self.pyramid_shapes_xyz.get_untracked().is_empty()
+    }
+
     fn new() -> Self {
         Self {
             origin: RwSignal::new(String::new()),
@@ -300,6 +330,9 @@ impl Session {
             crosshair: RwSignal::new([0; 3]),
             focus: RwSignal::new([0.0; 3]),
             zoom_2d: RwSignal::new([1.0; 3]),
+            pyramid_shapes_xyz: RwSignal::new(Vec::new()),
+            tile_generation: RwSignal::new(js_sys::Date::now() as u64),
+            dataset_layout_ready: RwSignal::new(false),
             layout_tick: RwSignal::new(0),
             camera: RwSignal::new(Camera::default()),
             view_mode: RwSignal::new(ViewMode::Grid),
@@ -319,6 +352,7 @@ impl Session {
             volume_preview_generation: StoredValue::new(0),
             ortho_inflight: StoredValue::new(None),
             ortho_dirty: StoredValue::new(false),
+            ortho_request_capture: StoredValue::new(None),
             browser_busy: StoredValue::new(false),
             browser_dirty: StoredValue::new(false),
             channel_inflight: StoredValue::new(false),
@@ -381,6 +415,9 @@ impl Session {
     pub fn open(self, name: String) {
         if !self.close() { return; }
         self.dataset.set(Some(name.clone()));
+        // The first orthogonal response decides whether this dataset has a volume. Starting from
+        // Grid makes a later 3D dataset predictable without speculatively rendering one now.
+        self.view_mode.set(ViewMode::Grid);
         self.error.set(None);
         self.status.set(format!("Opening {name}…"));
         self.refresh_layers();
@@ -391,7 +428,6 @@ impl Session {
         // first orthogonal reply brings the voxel shape and a centred crosshair.
         request_animation_frame(move || {
             self.request_orthogonal();
-            self.request_volume();
         });
     }
 
@@ -419,6 +455,8 @@ impl Session {
         self.queued_annotations.set_value(Vec::new());
         self.annotation_undo.set_value(Vec::new());
         self.voxel_shape.set(None);
+        self.pyramid_shapes_xyz.set(Vec::new());
+        self.dataset_layout_ready.set(false);
         self.slices.set(None);
         self.volume_png.set(None);
         self.camera.set(Camera::default());
@@ -451,7 +489,11 @@ impl Session {
                     let active = self.annotation_layer.get_untracked();
                     self.select_annotation_layer(active.filter(|id| layers.iter().any(|layer| layer.id == *id)).or_else(|| layers.first().map(|layer| layer.id)));
                     self.annotation_layers.set(layers);
-                    if has_annotations { self.request_volume(); }
+                    if has_annotations
+                        && self.voxel_shape.get_untracked().is_some_and(|shape| shape[2] > 1)
+                    {
+                        self.request_volume();
+                    }
                 }
                 Err(message) => self.fail(message),
             }
@@ -891,6 +933,10 @@ impl Session {
     pub fn request_orthogonal(self) {
         let Some(dataset) = self.dataset.get_untracked() else { return };
         let mode = self.view_mode.get_untracked();
+        if self.uses_xy_tile_cache() && mode == ViewMode::Xy && self.slices.get_untracked().is_some() {
+            self.ortho_dirty.set_value(false);
+            return;
+        }
         let zooms = self.zoom_2d.get_untracked();
         let Some(pane_index) = [Plane::Xy, Plane::Xz, Plane::Yz]
             .iter()
@@ -908,6 +954,11 @@ impl Session {
         let focus_xyz = self.voxel_shape.get_untracked().map(|shape| normalized_focus_xyz(self.focus.get_untracked(), shape));
         let request_id = self.next_request_id();
         self.ortho_inflight.set_value(Some(request_id));
+        self.ortho_request_capture.set_value(Some(OrthogonalCapture {
+            focus_xyz: self.focus.get_untracked(),
+            zooms,
+            pane_size: [width, height],
+        }));
         self.ortho_dirty.set_value(false);
         self.update_busy();
         let request = FrameRequest {
@@ -925,7 +976,7 @@ impl Session {
             y: crosshair.map(|c| c[1]),
             z: crosshair.map(|c| c[2]),
             slice_axis: [2, 1, 0][pane_index],
-            slice_zooms: Some(zooms.map(|zoom| zoom as f32)),
+            slice_zooms: Some(zooms),
         };
         self.socket_send(serde_json::to_string(&request).expect("FrameRequest serializes"));
     }
@@ -1105,22 +1156,41 @@ impl Session {
                     }
                 }
             }
-            SocketReply::Orthogonal { request_id, render_ms, xy_base64, xz_base64, yz_base64, voxel_shape_xyz, crosshair_xyz, pyramid_levels, viewport, .. } => {
+            SocketReply::Orthogonal { request_id, render_ms, xy_base64, xz_base64, yz_base64, voxel_shape_xyz, crosshair_xyz, pyramid_levels, viewport, pyramid_shapes_xyz, .. } => {
                 if self.ortho_inflight.get_value() == Some(request_id) {
                     self.ortho_inflight.set_value(None);
                     let first = self.voxel_shape.get_untracked().is_none();
                     self.voxel_shape.set(Some(voxel_shape_xyz));
+                    self.pyramid_shapes_xyz.set(pyramid_shapes_xyz);
+                    let mut capture = self.ortho_request_capture.get_value().unwrap_or(OrthogonalCapture {
+                        focus_xyz: crosshair_xyz.map(|value| value as f64 + 0.5),
+                        zooms: [1.0; 3],
+                        pane_size: [256, 256],
+                    });
                     if first {
                         self.crosshair.set(crosshair_xyz);
                         self.focus.set(crosshair_xyz.map(|v| v as f64 + 0.5));
                         self.zoom_2d.set([1.0; 3]);
-                        self.request_volume();
+                        capture.focus_xyz = crosshair_xyz.map(|value| value as f64 + 0.5);
+                        capture.zooms = [1.0; 3];
+                        if voxel_shape_xyz[2] == 1 {
+                            self.set_view_mode(ViewMode::Xy);
+                        } else {
+                            self.request_volume();
+                        }
+                        // Keep the provisional grid hidden until its final pane visibility and
+                        // control set have reached layout. This also remeasures tile geometry.
+                        request_animation_frame(move || {
+                            self.layout_tick.update(|tick| *tick += 1);
+                            self.dataset_layout_ready.set(true);
+                        });
                     }
                     self.slices.set(Some(Slices {
                         xy: format!("data:image/png;base64,{xy_base64}"),
                         xz: format!("data:image/png;base64,{xz_base64}"),
                         yz: format!("data:image/png;base64,{yz_base64}"),
                         viewport,
+                        capture,
                     }));
                     self.error.set(None);
                     self.status.set(match pyramid_levels {
@@ -1157,9 +1227,9 @@ impl Session {
         self.focus.set(next_focus);
         if clamped != self.crosshair.get_untracked() {
             self.crosshair.set(clamped);
-            self.request_orthogonal();
+            if !self.uses_xy_tile_cache() { self.request_orthogonal(); }
         }
-        if moved { self.request_interactive_volume(); }
+        if moved && !self.uses_xy_tile_cache() { self.request_interactive_volume(); }
     }
 
     /// Move the focus continuously (a pan): the crosshair follows as its floor, and the slices
@@ -1172,9 +1242,9 @@ impl Session {
         let crosshair: [u32; 3] = std::array::from_fn(|axis| (clamped[axis].floor() as u32).min(shape[axis].saturating_sub(1)));
         if crosshair != self.crosshair.get_untracked() {
             self.crosshair.set(crosshair);
-            self.request_orthogonal();
+            if !self.uses_xy_tile_cache() { self.request_orthogonal(); }
         }
-        if moved { self.request_interactive_volume(); }
+        if moved && !self.uses_xy_tile_cache() { self.request_interactive_volume(); }
     }
 
     pub fn orbit_by(self, dx: i32, dy: i32) {
@@ -1213,9 +1283,10 @@ impl Session {
     pub fn set_view_mode(self, mode: ViewMode) {
         self.notice.set(None);
         self.view_mode.set(mode);
-        self.layout_tick.update(|tick| *tick += 1);
-        // Pane sizes changed with the layout; render both at their new sizes.
+        // The mode's classes and hidden panes must reach browser layout before anything reads
+        // clientWidth/clientHeight for the replacement geometry.
         request_animation_frame(move || {
+            self.layout_tick.update(|tick| *tick += 1);
             self.request_orthogonal();
             self.request_volume();
         });
@@ -1262,6 +1333,7 @@ impl Session {
                 self.channel_dirty.set_value(None);
                 self.post_channel(next);
             } else {
+                self.tile_generation.update(|generation| *generation = generation.wrapping_add(1));
                 self.request_orthogonal();
                 self.request_volume();
             }
@@ -1512,7 +1584,7 @@ pub fn App() -> impl IntoView {
                 <span class="origin">{move || session.origin.get()}</span>
             </nav>
             <Show when=move || session.dataset.get().is_some() fallback=move || view! { <FrontPage/> }>
-                <div class="app-container">
+                <div class="app-container" class:probing=move || !session.dataset_layout_ready.get()>
                     <ViewerShell/>
                     <button
                         class="panel-toggle"
@@ -1523,6 +1595,15 @@ pub fn App() -> impl IntoView {
                         {move || if session.panel_open.get() { "»" } else { "«" }}
                     </button>
                     <Sidebar/>
+                    <Show when=move || !session.dataset_layout_ready.get()>
+                        <div class="dataset-loading">
+                            <span class="busy">"●"</span>
+                            <span>{move || session.status.get()}</span>
+                            <Show when=move || session.error.get().is_some()>
+                                <span class="error">{move || session.error.get().unwrap_or_default()}</span>
+                            </Show>
+                        </div>
+                    </Show>
                 </div>
             </Show>
         </div>
@@ -1578,6 +1659,7 @@ fn FrontPage() -> impl IntoView {
 #[component]
 fn ViewerShell() -> impl IntoView {
     let session = expect_context::<Session>();
+    let is_2d = move || session.voxel_shape.get().is_some_and(|shape| shape[2] == 1);
     let mode_button = move |mode: ViewMode, label: &'static str| {
         view! {
             <button class="tool-button" class:active=move || session.view_mode.get() == mode on:click=move |_| session.set_view_mode(mode)>{label}</button>
@@ -1597,19 +1679,23 @@ fn ViewerShell() -> impl IntoView {
             >
                 <div class="toolbar">
                     <div class="tool-group">
-                        {mode_button(ViewMode::Grid, "Grid")}
                         {mode_button(ViewMode::Xy, "XY")}
-                        {mode_button(ViewMode::Xz, "XZ")}
-                        {mode_button(ViewMode::Yz, "YZ")}
-                        {mode_button(ViewMode::Volume, "3D")}
+                        <Show when=move || !is_2d()>
+                            {mode_button(ViewMode::Grid, "Grid")}
+                            {mode_button(ViewMode::Xz, "XZ")}
+                            {mode_button(ViewMode::Yz, "YZ")}
+                            {mode_button(ViewMode::Volume, "3D")}
+                        </Show>
                     </div>
-                    <div class="tool-group">
-                        {renderer_button(Renderer::Server, "Server", "Volume frames rendered by the server")}
-                        {renderer_button(Renderer::Browser, "WebGPU", "Volume rendered in this browser: it plans residency itself and fetches only the chunks it misses")}
-                    </div>
-                    <div class="tool-group">
-                        <button class="tool-button" title="Reset the camera" on:click=move |_| { session.camera.set(Camera::default()); session.request_volume(); }>"Reset view"</button>
-                    </div>
+                    <Show when=move || !is_2d()>
+                        <div class="tool-group">
+                            {renderer_button(Renderer::Server, "Server", "Volume frames rendered by the server")}
+                            {renderer_button(Renderer::Browser, "WebGPU", "Volume rendered in this browser: it plans residency itself and fetches only the chunks it misses")}
+                        </div>
+                        <div class="tool-group">
+                            <button class="tool-button" title="Reset the camera" on:click=move |_| { session.camera.set(Camera::default()); session.request_volume(); }>"Reset view"</button>
+                        </div>
+                    </Show>
                     <div class="tool-group annotation-tools" title="Draw annotations in the XY slice">
                         {[
                             AnnotationTool::Pan, AnnotationTool::Select, AnnotationTool::Point,
@@ -1638,7 +1724,9 @@ fn ViewerShell() -> impl IntoView {
                         None => String::new(),
                     }
                 }}</span>
-                <span class="readout">{move || format!("3D zoom {:.2}", session.camera.get().zoom)}</span>
+                <Show when=move || !is_2d()>
+                    <span class="readout">{move || format!("3D zoom {:.2}", session.camera.get().zoom)}</span>
+                </Show>
                 <Show when=move || session.notice.get().is_some()>
                     <span class="error">{move || session.notice.get().unwrap_or_default()}</span>
                 </Show>
@@ -1824,6 +1912,110 @@ fn OrthoPane(plane: Plane) -> impl IntoView {
             shape[v_axis] as f64 * scale,
         ))
     };
+    // A completed viewport remains a correctly registered fallback while focus and zoom move.
+    // Reproject it immediately; source-aligned tiles below progressively replace it.
+    let cached_view_placement = move || -> Option<(f64, f64, f64, f64)> {
+        let slices = session.slices.get()?;
+        let capture = slices.capture;
+        let (width, height, fit) = geometry()?;
+        let shape = session.voxel_shape.get()?;
+        let old_fit = (capture.pane_size[0] as f64 / shape[h_axis].max(1) as f64)
+            .min(capture.pane_size[1] as f64 / shape[v_axis].max(1) as f64);
+        let old_scale = old_fit * capture.zooms[pane_index];
+        if !old_scale.is_finite() || old_scale <= 0.0 { return None; }
+        let current_scale = fit * session.zoom_2d.get()[pane_index];
+        let current_focus = session.focus.get();
+        let world_width = capture.pane_size[0] as f64 / old_scale;
+        let world_height = capture.pane_size[1] as f64 / old_scale;
+        let drawn_width = world_width * current_scale;
+        let drawn_height = world_height * current_scale;
+        Some((
+            width * 0.5 + (capture.focus_xyz[h_axis] - current_focus[h_axis]) * current_scale - drawn_width * 0.5,
+            height * 0.5 + (capture.focus_xyz[v_axis] - current_focus[v_axis]) * current_scale - drawn_height * 0.5,
+            drawn_width,
+            drawn_height,
+        ))
+    };
+    let visible_tiles = move || -> Vec<SliceTilePlacement> {
+        if plane != Plane::Xy { return Vec::new(); }
+        let Some(shape0) = session.voxel_shape.get() else { return Vec::new() };
+        if shape0[2] != 1 { return Vec::new(); }
+        let levels = session.pyramid_shapes_xyz.get();
+        if levels.is_empty() { return Vec::new(); }
+        let Some(dataset) = session.dataset.get() else { return Vec::new() };
+        let Some(pane) = node_ref.get() else { return Vec::new() };
+        let [physical_width, physical_height] = {
+            let (width, height) = physical_size(&pane);
+            [width, height]
+        };
+        let Some((width, height, fit)) = geometry() else { return Vec::new() };
+        let zoom = session.zoom_2d.get()[pane_index];
+        let level = xy_tile_level(shape0, &levels, [physical_width, physical_height], zoom);
+        let level_shape = levels[level];
+        let scale = fit * zoom;
+        let focus = session.focus.get();
+        let world_bounds = [
+            (focus[0] - width * 0.5 / scale).max(0.0),
+            (focus[1] - height * 0.5 / scale).max(0.0),
+            (focus[0] + width * 0.5 / scale).min(shape0[0] as f64),
+            (focus[1] + height * 0.5 / scale).min(shape0[1] as f64),
+        ];
+        if world_bounds[2] <= world_bounds[0] || world_bounds[3] <= world_bounds[1] {
+            return Vec::new();
+        }
+        const TILE: u32 = 512;
+        let source_bounds = [
+            (world_bounds[0] * level_shape[0] as f64 / shape0[0] as f64).floor() as u32,
+            (world_bounds[1] * level_shape[1] as f64 / shape0[1] as f64).floor() as u32,
+            (world_bounds[2] * level_shape[0] as f64 / shape0[0] as f64).ceil() as u32,
+            (world_bounds[3] * level_shape[1] as f64 / shape0[1] as f64).ceil() as u32,
+        ];
+        let tile_min = [source_bounds[0] / TILE, source_bounds[1] / TILE];
+        let tile_max = [source_bounds[2].saturating_sub(1) / TILE, source_bounds[3].saturating_sub(1) / TILE];
+        let origin = session.origin.get();
+        let generation = session.tile_generation.get();
+        let mut tiles = Vec::new();
+        for tile_y in tile_min[1]..=tile_max[1] {
+            for tile_x in tile_min[0]..=tile_max[0] {
+                let source_x = tile_x * TILE;
+                let source_y = tile_y * TILE;
+                let source_width = TILE.min(level_shape[0].saturating_sub(source_x));
+                let source_height = TILE.min(level_shape[1].saturating_sub(source_y));
+                tiles.push(SliceTilePlacement {
+                    src: xy_tile_url(&origin, &dataset, level as u32, tile_x, tile_y, generation),
+                    source_x,
+                    source_y,
+                    source_width,
+                    source_height,
+                });
+            }
+        }
+        tiles
+    };
+    // Tile images keep source-level coordinates. One reactive parent transform moves them during
+    // pan/zoom, so keyed tile nodes survive while their URL is valid. At a pyramid transition the
+    // level in the URL changes and <For> removes the old bitmap instead of stretching it into the
+    // new tile's position while the replacement image decodes.
+    let tile_layer_transform = move || -> String {
+        let Some(shape0) = session.voxel_shape.get() else { return String::new() };
+        let levels = session.pyramid_shapes_xyz.get();
+        let Some(pane) = node_ref.get() else { return String::new() };
+        let physical_size = {
+            let (width, height) = physical_size(&pane);
+            [width, height]
+        };
+        let Some((width, height, fit)) = geometry() else { return String::new() };
+        let zoom = session.zoom_2d.get()[pane_index];
+        let level = xy_tile_level(shape0, &levels, physical_size, zoom);
+        let Some(level_shape) = levels.get(level).copied() else { return String::new() };
+        let focus = session.focus.get();
+        let scale = fit * zoom;
+        let scale_x = scale * shape0[0] as f64 / level_shape[0].max(1) as f64;
+        let scale_y = scale * shape0[1] as f64 / level_shape[1].max(1) as f64;
+        let translate_x = width * 0.5 - focus[0] * scale;
+        let translate_y = height * 0.5 - focus[1] * scale;
+        format!("matrix({scale_x},0,0,{scale_y},{translate_x},{translate_y})")
+    };
     let last = StoredValue::new(None::<(i32, i32)>);
     let annotation_drag = StoredValue::new(None::<AnnotationDrag>);
     let world_at = move |ev: &web_sys::PointerEvent| -> Option<([f64; 2], f64)> {
@@ -1953,7 +2145,8 @@ fn OrthoPane(plane: Plane) -> impl IntoView {
         let rect = pane.get_bounding_client_rect();
         let cursor = (ev.client_x() as f64 - rect.left() - width * 0.5, ev.client_y() as f64 - rect.top() - height * 0.5);
         let old_zoom = session.zoom_2d.get_untracked()[pane_index];
-        let new_zoom = (old_zoom * (1.0 - ev.delta_y() * 0.001)).clamp(0.25, 64.0);
+        let candidate = old_zoom * (1.0 - ev.delta_y() * 0.001);
+        let new_zoom = if candidate.is_finite() { candidate.max(0.25) } else { old_zoom };
         // The voxel under the cursor stays under the cursor.
         let (old_scale, new_scale) = (fit * old_zoom, fit * new_zoom);
         let mut focus = session.focus.get_untracked();
@@ -1964,7 +2157,7 @@ fn OrthoPane(plane: Plane) -> impl IntoView {
         session.set_focus(focus);
         // A wheel step at the pane centre does not move the crosshair, but it can still cross a
         // pyramid threshold and must ask the server for the newly appropriate source level.
-        if session.crosshair.get_untracked() == old_crosshair {
+        if !session.uses_xy_tile_cache() && session.crosshair.get_untracked() == old_crosshair {
             session.request_orthogonal();
         }
     };
@@ -1980,16 +2173,37 @@ fn OrthoPane(plane: Plane) -> impl IntoView {
             on:dblclick=on_double
             on:wheel=on_wheel
         >
-            {move || match (image(), is_viewport(), placement()) {
-                (Some(src), true, _) => view! { <img class="pane-image" src=src alt=plane.label() draggable="false"/> }.into_any(),
-                (Some(src), false, Some((left, top, width, height))) => view! {
+            {move || match (image(), is_viewport(), cached_view_placement(), placement()) {
+                (Some(src), true, Some((left, top, width, height)), _) => view! {
+                    <img class="slice-image cached-slice" src=src alt=plane.label() draggable="false"
+                        style:left=format!("{left}px") style:top=format!("{top}px")
+                        style:width=format!("{width}px") style:height=format!("{height}px")/>
+                }.into_any(),
+                (Some(src), false, _, Some((left, top, width, height))) => view! {
                     <img class="slice-image" src=src alt=plane.label() draggable="false"
                         style:left=format!("{left}px") style:top=format!("{top}px")
                         style:width=format!("{width}px") style:height=format!("{height}px")/>
                 }.into_any(),
-                (Some(src), false, None) => view! { <img class="pane-image" src=src alt=plane.label() draggable="false"/> }.into_any(),
-                (None, _, _) => view! { <div class="pane-empty">"waiting for slices…"</div> }.into_any(),
+                (Some(src), _, _, _) => view! { <img class="pane-image" src=src alt=plane.label() draggable="false"/> }.into_any(),
+                (None, _, _, _) => view! { <div class="pane-empty">"waiting for slices…"</div> }.into_any(),
             }}
+            <div class="slice-tile-layer" style:transform=tile_layer_transform>
+                <For
+                    each=visible_tiles
+                    key=|tile| tile.src.clone()
+                    children=|tile| {
+                        let loaded = RwSignal::new(false);
+                        view! {
+                            <img class="slice-tile" class:loaded=move || loaded.get()
+                                src=tile.src draggable="false" on:load=move |_| loaded.set(true)
+                                style:left=format!("{}px", tile.source_x)
+                                style:top=format!("{}px", tile.source_y)
+                                style:width=format!("{}px", tile.source_width)
+                                style:height=format!("{}px", tile.source_height)/>
+                        }
+                    }
+                />
+            </div>
             {move || {
                 let (Some(shape), Some((left, top, width, height))) = (session.voxel_shape.get(), placement()) else { return view! { <span></span> }.into_any() };
                 if plane != Plane::Xy { return view! { <span></span> }.into_any(); }
@@ -2282,7 +2496,9 @@ fn AxisSliders() -> impl IntoView {
         <div class="axis-sliders">
             {slider(0, "X")}
             {slider(1, "Y")}
-            {slider(2, "Z")}
+            <Show when=move || session.voxel_shape.get().is_none_or(|shape| shape[2] > 1)>
+                {slider(2, "Z")}
+            </Show>
         </div>
     }
 }
@@ -2298,26 +2514,28 @@ fn Sidebar() -> impl IntoView {
             <Show when=move || session.layers.get().is_empty()>
                 <div class="hint">"No image layers yet."</div>
             </Show>
-            <div class="layer-block">
-                <h3>"Scene"</h3>
-                <div class="slider-row" title="How far light penetrates: a multiplier on the distance over which an opaque voxel absorbs everything (the scene diagonal / 256 at 1×). Larger sees deeper.">
-                    <span>"Depth"</span>
-                    <input
-                        type="range"
-                        min="-1"
-                        max="2"
-                        step="0.02"
-                        prop:value=move || slider_from_depth_scale(session.depth_scale.get()).to_string()
-                        on:input=move |ev| {
-                            if let Ok(position) = event_target_value(&ev).parse::<f32>() {
-                                session.set_depth_scale(depth_scale_from_slider(position));
+            <Show when=move || session.voxel_shape.get().is_none_or(|shape| shape[2] > 1)>
+                <div class="layer-block">
+                    <h3>"Scene"</h3>
+                    <div class="slider-row" title="How far light penetrates: a multiplier on the distance over which an opaque voxel absorbs everything (the scene diagonal / 256 at 1×). Larger sees deeper.">
+                        <span>"Depth"</span>
+                        <input
+                            type="range"
+                            min="-1"
+                            max="2"
+                            step="0.02"
+                            prop:value=move || slider_from_depth_scale(session.depth_scale.get()).to_string()
+                            on:input=move |ev| {
+                                if let Ok(position) = event_target_value(&ev).parse::<f32>() {
+                                    session.set_depth_scale(depth_scale_from_slider(position));
+                                }
                             }
-                        }
-                    />
-                    <span class="slider-value">{move || format!("{:.2}×", session.depth_scale.get())}</span>
+                        />
+                        <span class="slider-value">{move || format!("{:.2}×", session.depth_scale.get())}</span>
+                    </div>
+                    <div class="hint">"Each channel's window start is its transparency cutoff and its opacity scales alpha; depth changes how far the ray sees before it saturates."</div>
                 </div>
-                <div class="hint">"Each channel's window start is its transparency cutoff and its opacity scales alpha; depth changes how far the ray sees before it saturates."</div>
-            </div>
+            </Show>
             <div class="layer-block add-layer">
                 <AnnotationControls/>
             </div>

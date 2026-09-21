@@ -155,7 +155,7 @@ pub struct FrameRequest {
     pub z: Option<u32>,
     pub slice_axis: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub slice_zooms: Option<[f32; 3]>,
+    pub slice_zooms: Option<[f64; 3]>,
 }
 
 /// A channel edit over the socket: the edit plus the dataset and a request id, flattened.
@@ -198,6 +198,8 @@ pub enum SocketReply {
         pyramid_levels: Option<[u32; 3]>,
         #[serde(default)]
         viewport: bool,
+        #[serde(default)]
+        pyramid_shapes_xyz: Vec<[u32; 3]>,
     },
     #[serde(rename_all = "camelCase")]
     Channels {
@@ -255,6 +257,43 @@ pub fn datasets_url(origin: &str) -> String {
 
 pub fn channels_url(origin: &str, dataset: &str) -> String {
     format!("{origin}/v1/datasets/{}/channels", encode_path(dataset))
+}
+
+pub fn xy_tile_url(
+    origin: &str,
+    dataset: &str,
+    level: u32,
+    tile_x: u32,
+    tile_y: u32,
+    generation: u64,
+) -> String {
+    format!(
+        "{origin}/v1/datasets/{}/tiles/xy/{level}/{tile_x}/{tile_y}?v={generation}",
+        encode_path(dataset)
+    )
+}
+
+/// Choose the coarsest pyramid level that still provides one source pixel per physical screen
+/// pixel. If even level zero is undersampled, keep level zero and let the browser enlarge it.
+pub fn xy_tile_level(
+    shape0: [u32; 3],
+    levels: &[[u32; 3]],
+    physical_size: [u32; 2],
+    zoom: f64,
+) -> usize {
+    let physical_fit = (physical_size[0] as f64 / shape0[0].max(1) as f64)
+        .min(physical_size[1] as f64 / shape0[1].max(1) as f64);
+    let required = [
+        shape0[0] as f64 * physical_fit * zoom,
+        shape0[1] as f64 * physical_fit * zoom,
+    ];
+    levels
+        .iter()
+        .enumerate()
+        .filter(|(_, shape)| shape[0] as f64 >= required[0] && shape[1] as f64 >= required[1])
+        .map(|(index, _)| index)
+        .last()
+        .unwrap_or(0)
 }
 
 pub fn layers_url(origin: &str, dataset: &str) -> String {
@@ -400,6 +439,17 @@ pub fn parse_color_hex(text: &str) -> Option<[u8; 3]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tile_level_tracks_physical_pixels_and_has_no_zoom_ceiling() {
+        let shape: [u32; 3] = [66_048, 157_440, 1];
+        let levels = (0..10)
+            .map(|level| shape.map(|extent| extent.div_ceil(1 << level)))
+            .collect::<Vec<_>>();
+        assert_eq!(xy_tile_level(shape, &levels, [300, 200], 64.0), 3);
+        assert_eq!(xy_tile_level(shape, &levels, [600, 400], 64.0), 2);
+        assert_eq!(xy_tile_level(shape, &levels, [300, 200], 1_000.0), 0);
+    }
 
     #[test]
     fn frame_request_uses_the_servers_camel_case_keys() {

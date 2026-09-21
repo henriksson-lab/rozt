@@ -119,9 +119,30 @@ it decodes only chunks intersecting the visible viewport and returns a pane-size
 image. Level choice is independent per plane and no longer limited by fitting the
 whole level into four pages. At 64× on R1, 150×100, 300×200 and 600×400 physical
 panes select XY levels 4, 3 and 2 respectively; a warm 300×200 response was 45 ms.
-The socket response reports `pyramidLevels`, and the UI status displays them. Wheel
-zoom explicitly requests a slice even when the cursor anchored focus leaves the
-crosshair unchanged; 2D socket zoom accepts the UI's full 0.25×–64× range.
+The socket response reports `pyramidLevels` and every pyramid shape; the UI status
+displays the selected levels. The 2D zoom has a 0.25× lower bound and no upper bound.
+After the first viewport frame, a true 2D XY view switches to progressive 512×512
+source-aligned PNG tiles. The page chooses the coarsest level that supplies one source
+pixel per physical display pixel, requests only tiles intersecting the viewport, and
+lets the browser's immutable HTTP cache retain visited tiles. While missing tiles load,
+the last complete viewport is translated and scaled into its current position. Pan and
+zoom no longer enqueue whole viewport frames once this tile path is active. Channel
+edits use a new tile URL generation after the final accepted edit. The server's decoded
+chunk cache backs both frame and tile routes. At 1000×, R1 selects level zero. A live
+512×512 level-3 R1 tile was 42 KB and took about 60 ms to render from the warm session.
+Tiles use fixed source-level coordinates inside one transformed parent and are keyed by
+their immutable URL. An in-level pan changes only the parent matrix; a pyramid transition
+removes the old image nodes before inserting the new level. This prevents the browser from
+displaying an old bitmap at a new level's position while its replacement decodes. New tile
+elements stay transparent until their PNG `load` event; the transformed viewport fallback
+remains visible below them, and ready tiles replace it progressively. Their dark backing is
+applied only once loaded, preserving correct alpha compositing without a black loading flash.
+For a dataset whose Z extent is one, the page starts in XY and hides Grid, XZ, YZ, 3D,
+renderer, camera reset, Z position, 3D status and volume depth controls. Opening a dataset
+requests its orthogonal metadata first, so a 2D dataset never speculatively queues a volume
+render. The provisional grid stays mounted but invisible during that request; after the response
+selects the final layout, the page waits for an animation frame, remeasures the pane, and then
+reveals it. This prevents the Grid-to-XY control jump and stale pre-hide pane geometry.
 Live checks rendered an R1 volume
 PNG and XY/XZ/YZ PNGs; headless Chrome listed all five and loaded R1 at
 `66048×157440×1` without an error.
