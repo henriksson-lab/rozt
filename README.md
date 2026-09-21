@@ -3,6 +3,8 @@
 **Rusty OmeZarr Tiles** is a Rust viewer for OME-Zarr images, multidimensional
 volumes, and their annotations.
 
+![ROZT displaying the cells3d dataset](docs/rozt-cells3d.png)
+
 ROZT provides progressive tiled 2D navigation, orthogonal slices, server and
 WebGPU volume rendering, editable annotations, channel controls, and line
 profiles. The browser interface talks to `newvolim-server`; the existing crate

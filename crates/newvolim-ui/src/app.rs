@@ -177,16 +177,16 @@ fn annotation_tool_icon(tool: AnnotationTool) -> AnyView {
             <svg class="tool-icon" viewBox="0 0 20 20"><ellipse cx="10" cy="10" rx="7" ry="5"/></svg>
         }.into_any(),
         AnnotationTool::Polygon => view! {
-            <svg class="tool-icon outline" viewBox="0 0 20 20"><path d="M10 2.5 L17 7 L14.5 16 L5.5 16 L3 7 Z"/></svg>
+            <svg class="tool-icon" viewBox="0 0 20 20"><path d="M10 2.5 L17 7 L14.5 16 L5.5 16 L3 7 Z"/></svg>
         }.into_any(),
         AnnotationTool::FreehandRegion => view! {
-            <svg class="tool-icon" viewBox="0 0 20 20"><path d="M2 14 C5 4 8 16 11 7 C14 1 16 12 18 5 L18 17 L2 17 Z"/></svg>
+            <svg class="tool-icon" viewBox="0 0 20 20"><path d="M3 13 C2 9 5 5 8 7 C11 9 12 3 16 5 C19 8 17 14 13 16 C9 18 4 16 3 13 Z"/></svg>
         }.into_any(),
         AnnotationTool::Polyline => view! {
             <svg class="tool-icon outline" viewBox="0 0 20 20"><path d="M2 16 L7 7 L11 12 L18 3"/></svg>
         }.into_any(),
         AnnotationTool::FreehandLine => view! {
-            <svg class="tool-icon outline" viewBox="0 0 20 20"><path d="M2 14 C5 4 8 16 11 7 C14 1 16 12 18 5"/></svg>
+            <svg class="tool-icon outline" viewBox="0 0 20 20"><path d="M3 13 C2 9 5 5 8 7 C11 9 12 3 16 5 C18 7 18 10 17 12"/></svg>
         }.into_any(),
         AnnotationTool::Profile => view! {
             <svg class="tool-icon outline" viewBox="0 0 20 20">
