@@ -7,6 +7,11 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
+/// QuPath-compatible vector annotations, shared by the browser editor and server storage.
+pub mod qupath;
+/// Read and write QuPath's GeoJSON FeatureCollection dialect.
+pub mod qupath_geojson;
+
 /// Stable identifier for a layer within one viewing session.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct LayerId(pub u64);

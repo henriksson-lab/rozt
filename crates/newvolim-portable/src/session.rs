@@ -24,6 +24,7 @@ use newvolim_scene::{
     Annotation, AnnotationGeometry, AnnotationId, ChannelState, ChannelWindow, Layer, LayerId,
     LayerTransform, Scene,
 };
+use newvolim_scene::qupath::{Annotation as QuPathAnnotation, Geometry as QuPathGeometry};
 use serde::{Deserialize, Serialize};
 use std::sync::{
     Mutex,
@@ -297,6 +298,29 @@ pub struct LocalOmeZarrSource {
     pub timepoint: u32,
 }
 
+/// A missing Z axis is represented as a virtual singleton dimension. NGFF permits 2D
+/// multiscales (`c,y,x`), while the renderer always consumes XYZ volumes.
+const VIRTUAL_SPATIAL_AXIS: u32 = u32::MAX;
+
+impl LocalOmeZarrSource {
+    pub(crate) fn spatial_axis(&self, xyz: usize) -> Option<usize> {
+        (self.spatial_axes_xyz[xyz] != VIRTUAL_SPATIAL_AXIS)
+            .then_some(self.spatial_axes_xyz[xyz] as usize)
+    }
+
+    pub(crate) fn spatial_shape(&self, xyz: usize) -> u64 {
+        self.spatial_axis(xyz).map_or(1, |axis| self.shape[axis])
+    }
+
+    pub(crate) fn spatial_chunk_shape(&self, xyz: usize) -> u64 {
+        self.spatial_axis(xyz).map_or(1, |axis| self.chunk_shape[axis])
+    }
+
+    fn logical_extent_xyz(&self, extent: &[u64], xyz: usize) -> u64 {
+        self.spatial_axis(xyz).map_or(1, |axis| extent[axis])
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum LocalChunkKeyEncoding {
@@ -336,7 +360,13 @@ fn chunk_address(
     let source = &request.source;
     let mut coordinates = vec![0_u64; source.axes.len()];
     for axis in 0..3 {
-        coordinates[source.spatial_axes_xyz[axis] as usize] = chunk_xyz[axis];
+        if let Some(source_axis) = source.spatial_axis(axis) {
+            coordinates[source_axis] = chunk_xyz[axis];
+        } else if chunk_xyz[axis] != 0 {
+            return Err(SessionError::LayerSource(
+                "virtual singleton Z accepts only chunk coordinate zero".into(),
+            ));
+        }
     }
     if let Some(axis) = source.channel_axis {
         coordinates[axis as usize] = u64::from(channel.source_index);
@@ -641,7 +671,7 @@ impl LocalSession {
                         Some([
                             array.shape.get(axis("x")?)?.to_owned(),
                             array.shape.get(axis("y")?)?.to_owned(),
-                            array.shape.get(axis("z")?)?.to_owned(),
+                            axis("z").and_then(|index| array.shape.get(index).copied()).unwrap_or(1),
                         ])
                     })
             });
@@ -841,6 +871,104 @@ impl LocalSession {
 
     pub fn annotations(&self) -> &[Annotation] {
         self.scene.annotations()
+    }
+
+    /// Project QuPath's level-zero XY annotations into this session's physical scene. The
+    /// browser editor keeps QuPath GeoJSON as the authority; the scene is the 3D display copy.
+    pub fn set_qupath_annotations(&mut self, items: &[QuPathAnnotation]) -> Result<(), SessionError> {
+        let existing = self.scene.annotations().iter().map(|item| item.id).collect::<Vec<_>>();
+        for id in existing { self.scene.remove_annotation(id); }
+        let mut next_id = 0_u64;
+        let shape_z = self.voxel_shape_xyz.map(|shape| shape[2]).unwrap_or(0);
+        for item in items {
+            if item.plane.z < 0 || item.plane.z as u64 >= shape_z { continue; }
+            let z = item.plane.z as f64 + 0.5;
+            let end_plane = (item.plane.z as u64 + item.z_extent as u64).min(shape_z - 1);
+            let end_z = end_plane as f64 + 0.5;
+            for geometry in std::iter::once(&item.geometry).chain(item.nucleus.iter()) {
+                let mut display = self.qupath_scene_geometry(geometry, z)?;
+                if end_z > z {
+                    display.extend(self.qupath_scene_geometry(geometry, end_z)?);
+                    display.extend(self.qupath_span_connectors(geometry, z, end_z)?);
+                }
+                for geometry in display {
+                    let converted = Annotation::new(
+                        AnnotationId(next_id), item.display_name(), geometry,
+                        item.effective_color().unwrap_or([51, 230, 255]),
+                    ).map_err(|error| SessionError::Annotation(error.to_string()))?;
+                    self.scene.insert_annotation(converted).map_err(|error| SessionError::Annotation(error.to_string()))?;
+                    next_id = next_id.checked_add(1).ok_or_else(|| SessionError::Annotation("annotation IDs exhausted".into()))?;
+                }
+            }
+        }
+        self.next_annotation_id = next_id;
+        Ok(())
+    }
+
+    /// A Z-spanning QuPath shape becomes two planar end caps and vertical edges in the 3D
+    /// overlay. A long freehand path uses sampled vertical edges to keep the projected packet
+    /// bounded independently of the number of Z slices it covers.
+    fn qupath_span_connectors(&self, geometry: &QuPathGeometry, z0: f64, z1: f64) -> Result<Vec<AnnotationGeometry>, SessionError> {
+        let mut points = geometry.markers();
+        for path in geometry.outlines() {
+            let vertices = if path.len() > 1 && path.first() == path.last() { &path[..path.len()-1] } else { &path[..] };
+            if vertices.is_empty() { continue; }
+            let stride = vertices.len().div_ceil(64);
+            points.extend(vertices.iter().step_by(stride).copied());
+        }
+        points.into_iter().map(|point| {
+            Ok(AnnotationGeometry::Polyline(vec![
+                self.voxel_point_physical_f64([point[0], point[1], z0])?,
+                self.voxel_point_physical_f64([point[0], point[1], z1])?,
+            ]))
+        }).collect()
+    }
+
+    fn qupath_scene_geometry(&self, geometry: &QuPathGeometry, z: f64) -> Result<Vec<AnnotationGeometry>, SessionError> {
+        let physical = |point: [f64; 2]| self.voxel_point_physical_f64([point[0], point[1], z]);
+        let line = |points: &[[f64; 2]]| points.iter().copied().map(physical).collect::<Result<Vec<_>, _>>();
+        let mut out = Vec::new();
+        match geometry {
+            QuPathGeometry::Point(point) => out.push(AnnotationGeometry::Point(physical(*point)?)),
+            QuPathGeometry::MultiPoint(points) => for point in points { out.push(AnnotationGeometry::Point(physical(*point)?)); },
+            QuPathGeometry::LineString(points) => if points.len() >= 2 { out.push(AnnotationGeometry::Polyline(line(points)?)); },
+            QuPathGeometry::MultiLineString(lines) => for points in lines { if points.len() >= 2 { out.push(AnnotationGeometry::Polyline(line(points)?)); } },
+            QuPathGeometry::Polygon(rings) => {
+                for (index, ring) in rings.iter().enumerate() {
+                    if ring.len() >= 3 {
+                        let points = line(ring)?;
+                        out.push(if index == 0 { AnnotationGeometry::Polygon(points) } else { AnnotationGeometry::Polyline(points) });
+                    }
+                }
+            }
+            QuPathGeometry::MultiPolygon(polygons) => for rings in polygons {
+                out.extend(self.qupath_scene_geometry(&QuPathGeometry::Polygon(rings.clone()), z)?);
+            },
+        }
+        Ok(out)
+    }
+
+    /// Map a continuous level-zero XYZ voxel coordinate through the declared NGFF transform.
+    pub fn voxel_point_physical_f64(&self, voxel_xyz: [f64; 3]) -> Result<[f64; 3], SessionError> {
+        let metadata = self.metadata.as_ref().ok_or_else(|| SessionError::Annotation("open an OME-Zarr dataset first".into()))?;
+        let multiscale = metadata.multiscales.first().ok_or_else(|| SessionError::Annotation("dataset has no multiscale metadata".into()))?;
+        let axis = |name: &str| multiscale.axes.iter().position(|axis| axis.name.eq_ignore_ascii_case(name));
+        let (x, y, z) = (
+            axis("x").ok_or_else(|| SessionError::Annotation("multiscale lacks an x axis".into()))?,
+            axis("y").ok_or_else(|| SessionError::Annotation("multiscale lacks a y axis".into()))?,
+            axis("z"),
+        );
+        let mut point = vec![0.0; multiscale.axes.len()];
+        point[x] = voxel_xyz[0]; point[y] = voxel_xyz[1];
+        if let Some(z) = z { point[z] = voxel_xyz[2]; }
+        let transformed = level_transform(multiscale, 0).and_then(|transform| transform.apply(&point))
+            .map_err(|error| SessionError::Annotation(error.to_string()))?;
+        let physical_z = match z {
+            Some(z) => transformed[z],
+            None => voxel_xyz[2] * portable_axis_aligned_transform(multiscale, 0)
+                .map_err(|error| SessionError::Annotation(error.to_string()))?.scale[2],
+        };
+        Ok([transformed[x], transformed[y], physical_z])
     }
 
     /// Translate the session-owned scene state into the bounded request consumed by a local
@@ -1340,9 +1468,8 @@ impl LocalSession {
                 SessionError::LayerSource("portable scene layer has no chunks".into())
             })?;
             let voxel_origin_xyz = std::array::from_fn(|axis| {
-                let source_axis = plan.request.source.spatial_axes_xyz[axis] as usize;
                 first_chunk.spatial_chunk_xyz[axis]
-                    .checked_mul(plan.request.source.chunk_shape[source_axis])
+                    .checked_mul(plan.request.source.spatial_chunk_shape(axis))
                     .ok_or_else(|| {
                         SessionError::LayerSource(
                             "portable scene voxel origin overflows u64".into(),
@@ -1466,8 +1593,7 @@ impl LocalSession {
             .map(|request| {
                 let source = &request.source;
                 let spatial_counts: [u64; 3] = std::array::from_fn(|xyz| {
-                    let axis = source.spatial_axes_xyz[xyz] as usize;
-                    source.shape[axis].div_ceil(source.chunk_shape[axis])
+                    source.spatial_shape(xyz).div_ceil(source.spatial_chunk_shape(xyz))
                 });
                 let end_xyz = [
                     region.origin_xyz[0]
@@ -1576,8 +1702,7 @@ impl LocalSession {
             .map(|request| {
                 let source = &request.source;
                 let spatial_counts: [u64; 3] = std::array::from_fn(|xyz| {
-                    let axis = source.spatial_axes_xyz[xyz] as usize;
-                    source.shape[axis].div_ceil(source.chunk_shape[axis])
+                    source.spatial_shape(xyz).div_ceil(source.spatial_chunk_shape(xyz))
                 });
                 let mut unique: Vec<[u64; 3]> = Vec::with_capacity(chunks_xyz.len());
                 for chunk in chunks_xyz {
@@ -1729,9 +1854,8 @@ impl LocalSession {
                 .find(|request| request.layer.layer_id == layer_id)
                 .ok_or_else(|| SessionError::LayerSource(format!("layer {} is not in the render plan", layer_id.0)))?;
             let source = &request.source;
-            let spatial: [usize; 3] = source.spatial_axes_xyz.map(|axis| axis as usize);
             let counts: [u64; 3] = std::array::from_fn(|axis| {
-                source.shape[spatial[axis]].div_ceil(source.chunk_shape[spatial[axis]].max(1))
+                source.spatial_shape(axis).div_ceil(source.spatial_chunk_shape(axis).max(1))
             });
             let coordinates: Vec<[u64; 3]> = missing
                 .iter()
@@ -1748,13 +1872,13 @@ impl LocalSession {
                 .lock()
                 .map_err(|_| SessionError::LayerSource("chunk cache lock was poisoned".into()))?;
             for entry in &loaded {
-                if entry.address.channel != channel {
-                    continue;
-                }
                 let Some(index) = linear_chunk_index(entry.address.spatial_chunk_xyz, x_count, y_count) else { continue };
                 let words = Arc::new(portable_words_xyz(&entry.bytes, &entry.address, source)?);
-                cache.insert(key(index), words.clone());
-                found.insert(index, words);
+                let entry_key = (layer_id.0, level, entry.address.channel, index);
+                cache.insert(entry_key, words.clone());
+                if entry.address.channel == channel {
+                    found.insert(index, words);
+                }
             }
         }
         chunk_indices
@@ -1786,10 +1910,8 @@ impl LocalSession {
         channel: u32,
     ) -> Result<Vec<Vec<u32>>, SessionError> {
         let source = &plan.request.source;
-        let spatial: [usize; 3] = source.spatial_axes_xyz.map(|axis| axis as usize);
-        let dimensions: [u32; 3] = std::array::from_fn(|axis| source.shape[spatial[axis]] as u32);
-        let chunk_shape: [u32; 3] =
-            std::array::from_fn(|axis| source.chunk_shape[spatial[axis]] as u32);
+        let dimensions: [u32; 3] = std::array::from_fn(|axis| source.spatial_shape(axis) as u32);
+        let chunk_shape: [u32; 3] = std::array::from_fn(|axis| source.spatial_chunk_shape(axis) as u32);
         if chunk_plan.grid().dimensions_xyz() != dimensions
             || chunk_plan.grid().chunk_shape_xyz() != chunk_shape
         {
@@ -2093,19 +2215,19 @@ impl LocalSession {
             .multiscales
             .first()
             .ok_or_else(|| SessionError::Annotation("dataset has no multiscale metadata".into()))?;
-        let axis = |name: &str| {
-            multiscale
-                .axes
-                .iter()
-                .position(|candidate| candidate.name.eq_ignore_ascii_case(name))
-                .ok_or_else(|| SessionError::Annotation(format!("multiscale lacks a {name} axis")))
-        };
-        let xyz = [axis("x")?, axis("y")?, axis("z")?];
+        let axis = |name: &str| multiscale.axes.iter().position(|candidate| candidate.name.eq_ignore_ascii_case(name));
+        let xyz = [
+            Some(axis("x").ok_or_else(|| SessionError::Annotation("multiscale lacks an x axis".into()))?),
+            Some(axis("y").ok_or_else(|| SessionError::Annotation("multiscale lacks a y axis".into()))?),
+            axis("z"),
+        ];
         let mut voxel_origin = vec![0.0; multiscale.axes.len()];
         let mut voxel_endpoint = vec![0.0; multiscale.axes.len()];
         for component in 0..3 {
-            voxel_origin[xyz[component]] = origin_xyz[component];
-            voxel_endpoint[xyz[component]] = origin_xyz[component] + direction_xyz[component];
+            if let Some(axis) = xyz[component] {
+                voxel_origin[axis] = origin_xyz[component];
+                voxel_endpoint[axis] = origin_xyz[component] + direction_xyz[component];
+            }
         }
         let transform = level_transform(multiscale, 0)
             .map_err(|error| SessionError::Annotation(error.to_string()))?;
@@ -2115,9 +2237,15 @@ impl LocalSession {
         let physical_endpoint = transform
             .apply(&voxel_endpoint)
             .map_err(|error| SessionError::Annotation(error.to_string()))?;
-        let origin = std::array::from_fn(|component| physical_origin[xyz[component]]);
-        let direction = std::array::from_fn(|component| {
-            physical_endpoint[xyz[component]] - physical_origin[xyz[component]]
+        let virtual_z_scale = portable_axis_aligned_transform(multiscale, 0)
+            .map_err(|error| SessionError::Annotation(error.to_string()))?.scale[2];
+        let origin = std::array::from_fn(|component| match xyz[component] {
+            Some(axis) => physical_origin[axis],
+            None => origin_xyz[component] * virtual_z_scale,
+        });
+        let direction = std::array::from_fn(|component| match xyz[component] {
+            Some(axis) => physical_endpoint[axis] - physical_origin[axis],
+            None => direction_xyz[component] * virtual_z_scale,
         });
         let physical_distance_per_palace_unit = direction
             .iter()
@@ -2160,24 +2288,23 @@ impl LocalSession {
             .multiscales
             .first()
             .ok_or_else(|| SessionError::Annotation("dataset has no multiscale metadata".into()))?;
-        let axis_index = |name: &str| {
-            multiscale
-                .axes
-                .iter()
-                .position(|axis| axis.name.eq_ignore_ascii_case(name))
-                .ok_or_else(|| SessionError::Annotation(format!("multiscale lacks a {name} axis")))
-        };
-        let x = axis_index("x")?;
-        let y = axis_index("y")?;
-        let z = axis_index("z")?;
+        let axis_index = |name: &str| multiscale.axes.iter().position(|axis| axis.name.eq_ignore_ascii_case(name));
+        let x = axis_index("x").ok_or_else(|| SessionError::Annotation("multiscale lacks an x axis".into()))?;
+        let y = axis_index("y").ok_or_else(|| SessionError::Annotation("multiscale lacks a y axis".into()))?;
+        let z = axis_index("z");
         let mut world = vec![0.0; multiscale.axes.len()];
         world[x] = physical[0];
         world[y] = physical[1];
-        world[z] = physical[2];
+        if let Some(z) = z { world[z] = physical[2]; }
         let voxel = level_transform(multiscale, 0)
             .and_then(|transform| transform.inverse_apply(&world))
             .map_err(|error| SessionError::Annotation(error.to_string()))?;
-        let xyz = [voxel[x], voxel[y], voxel[z]];
+        let voxel_z = match z {
+            Some(z) => voxel[z],
+            None => physical[2] / portable_axis_aligned_transform(multiscale, 0)
+                .map_err(|error| SessionError::Annotation(error.to_string()))?.scale[2],
+        };
+        let xyz = [voxel[x], voxel[y], voxel_z];
         if xyz.iter().any(|value| !value.is_finite() || *value < 0.0) {
             return Err(SessionError::Annotation(
                 "physical point maps outside voxel space".into(),
@@ -2187,7 +2314,7 @@ impl LocalSession {
             if xyz
                 .iter()
                 .zip(shape)
-                .any(|(value, extent)| *value >= extent as f64)
+                .any(|(value, extent)| *value > extent as f64)
             {
                 return Err(SessionError::Annotation(
                     "physical point maps outside array bounds".into(),
@@ -2477,24 +2604,23 @@ impl LocalSession {
                 "dataset has no level-zero array metadata".into(),
             ));
         }
-        let axis_index = |name: &str| {
-            multiscale
-                .axes
-                .iter()
-                .position(|axis| axis.name.eq_ignore_ascii_case(name))
-                .ok_or_else(|| SessionError::Annotation(format!("multiscale lacks a {name} axis")))
-        };
-        let x = axis_index("x")?;
-        let y = axis_index("y")?;
-        let z = axis_index("z")?;
+        let axis_index = |name: &str| multiscale.axes.iter().position(|axis| axis.name.eq_ignore_ascii_case(name));
+        let x = axis_index("x").ok_or_else(|| SessionError::Annotation("multiscale lacks an x axis".into()))?;
+        let y = axis_index("y").ok_or_else(|| SessionError::Annotation("multiscale lacks a y axis".into()))?;
+        let z = axis_index("z");
         let mut point = vec![0.0; multiscale.axes.len()];
         point[x] = voxel_xyz[0] as f64;
         point[y] = voxel_xyz[1] as f64;
-        point[z] = voxel_xyz[2] as f64;
+        if let Some(z) = z { point[z] = voxel_xyz[2] as f64; }
         let transformed = level_transform(multiscale, 0)
             .and_then(|transform| transform.apply(&point))
             .map_err(|error| SessionError::Annotation(error.to_string()))?;
-        Ok([transformed[x], transformed[y], transformed[z]])
+        let physical_z = match z {
+            Some(z) => transformed[z],
+            None => voxel_xyz[2] as f64 * portable_axis_aligned_transform(multiscale, 0)
+                .map_err(|error| SessionError::Annotation(error.to_string()))?.scale[2],
+        };
+        Ok([transformed[x], transformed[y], physical_z])
     }
 }
 
@@ -2624,7 +2750,11 @@ impl LocalOmeZarrSource {
             chunk_shape: array.chunks,
             dtype: array.dtype,
             chunk_key_encoding,
-            spatial_axes_xyz: [axis_index("x")?, axis_index("y")?, axis_index("z")?],
+            spatial_axes_xyz: [
+                axis_index("x")?,
+                axis_index("y")?,
+                optional_axis("z")?.unwrap_or(VIRTUAL_SPATIAL_AXIS),
+            ],
             channel_axis: optional_axis("c")?,
             time_axis: optional_axis("t")?,
             timepoint: 0,
@@ -2692,8 +2822,15 @@ fn image_layer_for_dataset(
     }
     // This vector's position is the source C address. Preserve a disabled prefix rather
     // than collapsing the selected OME channel to slot zero.
-    let disabled_window = ChannelWindow::new(0.0, 65_535.0)
+    let dtype_max = match source.dtype.as_str() {
+        "uint8" | "|u1" => 255.0,
+        "uint16" | "<u2" => 65_535.0,
+        "uint32" | "<u4" => u32::MAX as f64,
+        _ => 65_535.0,
+    };
+    let disabled_window = ChannelWindow::new(0.0, dtype_max)
         .map_err(|error| SessionError::LayerSource(error.to_string()))?;
+    let mut used_colors = Vec::new();
     let channels = (0..channel_count)
         .map(|index| {
             let display = metadata
@@ -2701,21 +2838,38 @@ fn image_layer_for_dataset(
                 .as_ref()
                 .and_then(|omero| omero.channels.get(index));
             let enabled = active_channels.contains(&index);
-            let color_srgb = display
-                .and_then(|channel| channel.color.as_deref())
-                .and_then(parse_srgb_hex)
-                .unwrap_or([255, 255, 255]);
+            let label = display
+                .and_then(|channel| channel.label.as_deref())
+                .unwrap_or("");
+            let wanted = if channel_count == 1 {
+                [255, 255, 255]
+            } else {
+                display
+                    .and_then(|channel| channel.color.as_deref())
+                    .and_then(parse_srgb_hex)
+                    .or_else(|| color_from_channel_name(label))
+                    .unwrap_or_else(|| default_channel_color(index))
+            };
+            let color_srgb = if used_colors.contains(&wanted) {
+                (0..32)
+                    .map(default_channel_color)
+                    .find(|color| !used_colors.contains(color))
+                    .unwrap_or(wanted)
+            } else {
+                wanted
+            };
+            used_colors.push(color_srgb);
             let window = display
                 .and_then(|channel| channel.window)
                 .map(|window| [window.start, window.end])
-                .unwrap_or([0.0, 65_535.0]);
+                .unwrap_or([0.0, dtype_max]);
             let selected_window =
                 ChannelWindow::new(window[0], window[1]).map_err(|error| {
                     SessionError::LayerSource(format!("invalid OME display window: {error}"))
                 })?;
             ChannelState::new(
                 enabled,
-                if enabled { color_srgb } else { [255, 255, 255] },
+                color_srgb,
                 if enabled {
                     selected_window
                 } else {
@@ -2735,27 +2889,32 @@ fn portable_axis_aligned_transform(
 ) -> Result<LayerTransform, SessionError> {
     let transform = level_transform(multiscale, level)
         .map_err(|error| SessionError::LayerSource(error.to_string()))?;
-    let axis = |name: &str| {
-        multiscale
-            .axes
-            .iter()
-            .position(|candidate| candidate.name.eq_ignore_ascii_case(name))
-            .ok_or_else(|| SessionError::LayerSource(format!("multiscale lacks a {name} axis")))
-    };
-    let xyz = [axis("x")?, axis("y")?, axis("z")?];
+    let axis = |name: &str| multiscale.axes.iter().position(|candidate| candidate.name.eq_ignore_ascii_case(name));
+    let xyz = [
+        Some(axis("x").ok_or_else(|| SessionError::LayerSource("multiscale lacks an x axis".into()))?),
+        Some(axis("y").ok_or_else(|| SessionError::LayerSource("multiscale lacks a y axis".into()))?),
+        axis("z"),
+    ];
     let matrix = transform.matrix();
-    let mut scale = [0.0; 3];
-    let mut translation = [0.0; 3];
-    for (target, &row) in xyz.iter().enumerate() {
+    let mut scale = [0.0_f64; 3];
+    let mut translation = [0.0_f64; 3];
+    for (target, row) in xyz.iter().copied().enumerate() {
+        let Some(row) = row else { continue };
         for (column, value) in matrix[row].iter().take(multiscale.axes.len()).enumerate() {
-            if column != xyz[target] && value.abs() > 1e-10 {
+            if Some(column) != xyz[target] && value.abs() > 1e-10 {
                 return Err(SessionError::LayerSource(
                     "native portable default layer requires an axis-aligned NGFF transform".into(),
                 ));
             }
         }
-        scale[target] = matrix[row][xyz[target]];
+        scale[target] = matrix[row][row];
         translation[target] = matrix[row][multiscale.axes.len()];
+    }
+    if xyz[2].is_none() {
+        // Give a 2D image one physically meaningful voxel of thickness. Using the smaller
+        // in-plane spacing avoids an exaggerated slab for non-square pixels.
+        scale[2] = scale[0].abs().min(scale[1].abs());
+        translation[2] = 0.0;
     }
     LayerTransform::new(scale, translation)
         .map_err(|error| SessionError::LayerSource(error.to_string()))
@@ -2771,6 +2930,35 @@ fn parse_srgb_hex(value: &str) -> Option<[u8; 3]> {
         u8::from_str_radix(&value[2..4], 16).ok()?,
         u8::from_str_radix(&value[4..6], 16).ok()?,
     ])
+}
+
+fn default_channel_color(index: usize) -> [u8; 3] {
+    const COLORS: [[u8; 3]; 6] = [
+        [0, 255, 0],
+        [255, 0, 255],
+        [0, 255, 255],
+        [255, 255, 0],
+        [255, 0, 0],
+        [0, 0, 255],
+    ];
+    COLORS[index % COLORS.len()]
+}
+
+fn color_from_channel_name(label: &str) -> Option<[u8; 3]> {
+    let name = label.to_ascii_lowercase();
+    const RULES: &[(&[&str], [u8; 3])] = &[
+        (&["dapi", "hoechst", "draq5", "draq 5", "to-pro-3", "topro3", "nucblue", "nuclear", "nuclei"], [25, 63, 255]),
+        (&["fitc", "gfp", "egfp", "yfp", "alexa 488", "alexa488", "af488", "fluor 488", "cy2"], [0, 255, 0]),
+        (&["cy3", "tritc", "alexa 555", "alexa555", "af555", "alexa 568", "alexa568", "af568", "fluor 555", "fluor 568"], [255, 114, 0]),
+        (&["rfp", "dsred", "mcherry", "tdtomato", "texas red", "alexa 594", "alexa594", "af594", "fluor 594"], [255, 0, 0]),
+        (&["cy5", "alexa 647", "alexa647", "af647", "fluor 647", "cy5.5", "alexa 660", "alexa660", "af660"], [255, 0, 255]),
+        (&["hematoxylin", "haematoxylin"], [63, 89, 255]),
+        (&["eosin"], [255, 89, 140]),
+    ];
+    RULES
+        .iter()
+        .find(|(needles, _)| needles.iter().any(|needle| name.contains(needle)))
+        .map(|(_, color)| *color)
 }
 
 fn portable_words(bytes: &[u8], dtype: &str) -> Result<Vec<u32>, SessionError> {
@@ -2825,7 +3013,7 @@ fn portable_dimensions_xyz(
     layer_id: LayerId,
 ) -> Result<[u32; 3], SessionError> {
     let dimension = |xyz: usize| {
-        u32::try_from(address.logical_extent[source.spatial_axes_xyz[xyz] as usize]).map_err(|_| {
+        u32::try_from(source.logical_extent_xyz(&address.logical_extent, xyz)).map_err(|_| {
             SessionError::LayerSource(format!(
                 "layer {} chunk extent does not fit portable u32 dimensions",
                 layer_id.0
@@ -2867,12 +3055,13 @@ fn portable_words_xyz(
             .checked_mul(address.logical_extent[axis + 1] as usize)
             .ok_or_else(|| SessionError::LayerSource("chunk stride overflows usize".into()))?;
     }
-    let [x_axis, y_axis, z_axis] = source.spatial_axes_xyz.map(|axis| axis as usize);
+    let axes = source.spatial_axes_xyz.map(|axis| (axis != VIRTUAL_SPATIAL_AXIS).then_some(axis as usize));
     let mut result = Vec::with_capacity(expected);
     for z in 0..dimensions[2] as usize {
         for y in 0..dimensions[1] as usize {
             for x in 0..dimensions[0] as usize {
-                let index = x * strides[x_axis] + y * strides[y_axis] + z * strides[z_axis];
+                let coordinate = [x, y, z];
+                let index: usize = axes.iter().enumerate().filter_map(|(xyz, axis)| axis.map(|axis| coordinate[xyz] * strides[axis])).sum();
                 result.push(source_words[index]);
             }
         }
@@ -2891,8 +3080,7 @@ fn assemble_portable_xyz_tiles(
     let first = tiles
         .first()
         .ok_or_else(|| SessionError::LayerSource("portable tile set is empty".into()))?;
-    let chunk_shape: [u64; 3] =
-        std::array::from_fn(|axis| source.chunk_shape[source.spatial_axes_xyz[axis] as usize]);
+    let chunk_shape: [u64; 3] = std::array::from_fn(|axis| source.spatial_chunk_shape(axis));
     let origin_chunk: [u64; 3] = std::array::from_fn(|axis| {
         tiles
             .iter()
@@ -2906,7 +3094,7 @@ fn assemble_portable_xyz_tiles(
             .iter()
             .map(|(address, _)| {
                 address.spatial_chunk_xyz[axis] * chunk_shape[axis]
-                    + address.logical_extent[source.spatial_axes_xyz[axis] as usize]
+                    + source.logical_extent_xyz(&address.logical_extent, axis)
             })
             .max()
             .unwrap()
@@ -3324,6 +3512,51 @@ mod tests {
         let summary = session.open_local_omezarr(root.path()).unwrap();
         assert_eq!(summary.voxel_shape_xyz, Some([13, 11, 7]));
         assert_eq!(session.summary().voxel_shape_xyz, Some([13, 11, 7]));
+    }
+
+    #[test]
+    fn two_dimensional_ngff_is_admitted_as_a_singleton_z_volume() {
+        let root = tempfile::tempdir().unwrap();
+        fs::write(
+            root.path().join("zarr.json"),
+            r#"{"zarr_format":3,"node_type":"group","attributes":{"ome":{"version":"0.5","multiscales":[{"axes":[{"name":"c","type":"channel"},{"name":"y","type":"space","unit":"micrometer"},{"name":"x","type":"space","unit":"micrometer"}],"datasets":[{"path":"0","coordinateTransformations":[{"type":"scale","scale":[1.0,0.325,0.325]}]}]}],"omero":{"channels":[{"active":true}]}}}}"#,
+        ).unwrap();
+        fs::create_dir(root.path().join("0")).unwrap();
+        fs::write(
+            root.path().join("0/zarr.json"),
+            r#"{"zarr_format":3,"node_type":"array","shape":[4,307,129],"data_type":"uint8","chunk_grid":{"name":"regular","configuration":{"chunk_shape":[1,307,129]}},"chunk_key_encoding":{"name":"default","configuration":{"separator":"/"}},"fill_value":0,"codecs":[{"name":"bytes","configuration":{"endian":"little"}}]}"#,
+        ).unwrap();
+
+        let mut session = LocalSession::default();
+        let summary = session.open_local_omezarr(root.path()).unwrap();
+        assert_eq!(summary.voxel_shape_xyz, Some([129, 307, 1]));
+        let source = session.prepare_default_portable_image_layer().unwrap();
+        assert_eq!(source.spatial_axes_xyz, [2, 1, VIRTUAL_SPATIAL_AXIS]);
+        assert_eq!([source.spatial_shape(0), source.spatial_shape(1), source.spatial_shape(2)], [129, 307, 1]);
+        assert_eq!([source.spatial_chunk_shape(0), source.spatial_chunk_shape(1), source.spatial_chunk_shape(2)], [129, 307, 1]);
+        assert_eq!(session.scene.layers()[0].transform.scale, [0.325, 0.325, 0.325]);
+        assert_eq!(session.layer_channels()[0].channels[0].window_end, 255.0);
+        assert_eq!(
+            session.layer_channels()[0]
+                .channels
+                .iter()
+                .map(|channel| channel.color_srgb)
+                .collect::<Vec<_>>(),
+            vec![[0, 255, 0], [255, 0, 255], [0, 255, 255], [255, 255, 0]]
+        );
+    }
+
+    #[test]
+    fn channel_color_defaults_match_the_reference_viewer() {
+        assert_eq!(default_channel_color(0), [0, 255, 0]);
+        assert_eq!(default_channel_color(1), [255, 0, 255]);
+        assert_eq!(default_channel_color(6), [0, 255, 0]);
+        assert_eq!(color_from_channel_name("DAPI nuclei"), Some([25, 63, 255]));
+        assert_eq!(color_from_channel_name("Alexa 488"), Some([0, 255, 0]));
+        assert_eq!(color_from_channel_name("Cy3"), Some([255, 114, 0]));
+        assert_eq!(color_from_channel_name("Cy5"), Some([255, 0, 255]));
+        assert_eq!(color_from_channel_name("Hematoxylin"), Some([63, 89, 255]));
+        assert_eq!(color_from_channel_name("Eosin"), Some([255, 89, 140]));
     }
 
     #[test]
@@ -3772,6 +4005,47 @@ mod tests {
         assert_eq!(summary.voxel_shape_xyz, Some([128, 128, 32]));
         assert_eq!(summary.channel_count, 1);
         assert_eq!(summary.multiscale_count, 1);
+    }
+
+    #[test]
+    fn qupath_annotations_project_from_level_zero_pixels_into_anisotropic_physical_space() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../test-data/cells3d-anisotropic.ome.zarr");
+        let mut session = LocalSession::default();
+        session.open_local_omezarr(root).unwrap();
+        let point = QuPathAnnotation::point(8.0, 6.0, newvolim_scene::qupath::Plane::at(2, 0));
+        session.set_qupath_annotations(&[point]).unwrap();
+        assert_eq!(session.annotations().len(), 1);
+        let AnnotationGeometry::Point(actual) = session.annotations()[0].geometry else { panic!("point") };
+        for (value, expected) in actual.into_iter().zip([2.08, 1.56, 0.725]) {
+            assert!((value - expected).abs() < 1e-10, "{value} vs {expected}");
+        }
+        let polygon = QuPathAnnotation {
+            geometry: QuPathGeometry::Polygon(vec![
+                vec![[0.0,0.0],[10.0,0.0],[10.0,10.0],[0.0,10.0],[0.0,0.0]],
+                vec![[2.0,2.0],[2.0,4.0],[4.0,4.0],[2.0,2.0]],
+            ]),
+            plane: newvolim_scene::qupath::Plane::at(2, 0),
+            ..QuPathAnnotation::default()
+        };
+        session.set_qupath_annotations(&[polygon]).unwrap();
+        assert!(matches!(session.annotations()[0].geometry, AnnotationGeometry::Polygon(_)));
+        assert!(matches!(session.annotations()[1].geometry, AnnotationGeometry::Polyline(_)), "a hole keeps its outline in 3D");
+
+        let span = QuPathAnnotation {
+            geometry: QuPathGeometry::Point([8.0, 6.0]),
+            plane: newvolim_scene::qupath::Plane::at(2, 0),
+            z_extent: 3,
+            ..QuPathAnnotation::default()
+        };
+        session.set_qupath_annotations(&[span]).unwrap();
+        assert_eq!(session.annotations().len(), 3, "start, end and depth connector");
+        let AnnotationGeometry::Point(end) = session.annotations()[1].geometry else { panic!("end point") };
+        assert!((end[2] - 1.595).abs() < 1e-10);
+        let AnnotationGeometry::Polyline(ref connector) = session.annotations()[2].geometry else { panic!("span connector") };
+        assert_eq!(connector.len(), 2);
+        assert!((connector[0][2] - 0.725).abs() < 1e-10);
+        assert!((connector[1][2] - 1.595).abs() < 1e-10);
     }
 
     #[test]

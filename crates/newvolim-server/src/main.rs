@@ -15,14 +15,17 @@ use std::{
     time::Instant,
 };
 
+mod annotation_store;
+use annotation_store::{AnnotationLayer, AnnotationSaveReport, AnnotationStore, RoiSaveReport, RoiTableSummary};
+
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
-        Path as AxumPath, Query, State,
+        DefaultBodyLimit, Path as AxumPath, Query, State,
     },
     http::{header, HeaderValue, StatusCode},
     response::IntoResponse,
-    routing::{get, post},
+    routing::{get, post, put},
     Json, Router,
 };
 use base64::{engine::general_purpose::STANDARD, Engine};
@@ -31,11 +34,12 @@ use newvolim_io::{read_array_info, read_dataset_metadata, LocalSourcePolicy};
 use newvolim_portable::{
     routes::{
         composite_palace_scene_annotations, demand_scene_plan, demand_scene_plan_only, full_level_scene_inputs_fitting, layer_chunk_words,
-        portable_orthogonal_slice_pngs, scene_route_frame_for_display, ChannelStateInput, NativePortableDrawRequest, RouteRenderer,
+        portable_orthogonal_slice_pngs_for_view, scene_route_frame_for_display, ChannelStateInput, NativePortableDrawRequest, RouteRenderer,
     },
     session::{LayerChannelSummary, LocalSession},
 };
 use newvolim_render::{ColorEncoding, ColorFormat, DepthAttachment, PhysicalExtent, RenderTarget};
+use newvolim_scene::{qupath::Annotation as QuPathAnnotation, qupath_geojson};
 use palace_frame::{
     render_local_zarr_orthogonal_at_png, render_local_zarr_with_camera_attachments, CameraControls,
     FrameSize,
@@ -92,6 +96,7 @@ struct AppState {
     /// would display, rendered by the same route, and channel edits sent to it persist across
     /// requests from every client of that dataset.
     sessions: SessionStore,
+    annotations: AnnotationStore,
     /// Palace tasks are not yet cancellable. The dispatcher retains one active task and only
     /// the newest waiting request, preventing an unbounded stale-render backlog.
     render_queue: mpsc::Sender<FrameJob>,
@@ -195,11 +200,13 @@ struct FrameJob {
     session_id: SessionId,
     dataset: String,
     sessions: SessionStore,
+    annotations: AnnotationStore,
     root: PathBuf,
     size: FrameSize,
     controls: CameraControls,
     view: RenderView,
     crosshair: Option<[u32; 3]>,
+    slice_zooms: [f32; 3],
     response: oneshot::Sender<RenderResult>,
 }
 
@@ -273,6 +280,8 @@ struct RenderedOrthogonal {
     render_ms: f64,
     voxel_shape_xyz: [u32; 3],
     crosshair_xyz: [u32; 3],
+    pyramid_levels: Option<[u32; 3]>,
+    viewport: bool,
 }
 
 enum RenderOutput {
@@ -334,6 +343,11 @@ struct FrameRequest {
     y: Option<u32>,
     #[serde(default)]
     z: Option<u32>,
+    /// Cut axis for the 2D pane whose size and zoom this request carries: 2=XY, 1=XZ, 0=YZ.
+    #[serde(default = "default_slice_axis")]
+    slice_axis: u32,
+    #[serde(default)]
+    slice_zooms: Option<[f32; 3]>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
@@ -346,6 +360,10 @@ enum RenderView {
 
 fn default_zoom() -> f32 {
     1.0
+}
+
+fn default_slice_axis() -> u32 {
+    2
 }
 
 #[derive(Debug, Serialize)]
@@ -397,6 +415,9 @@ struct SocketOrthogonal {
     yz_base64: String,
     voxel_shape_xyz: [u32; 3],
     crosshair_xyz: [u32; 3],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pyramid_levels: Option<[u32; 3]>,
+    viewport: bool,
 }
 
 #[derive(Serialize)]
@@ -435,6 +456,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         render_queue,
         next_session_id: Arc::new(AtomicU64::new(1)),
         sessions: SessionStore::default(),
+        annotations: AnnotationStore::default(),
     };
     let app = app_router(state, args.cors_origin, args.page_dir);
     let listener = tokio::net::TcpListener::bind(args.bind).await?;
@@ -458,6 +480,20 @@ fn app_router(
             get(dataset_channels).post(set_dataset_channel),
         )
         .route("/v1/datasets/{dataset}/layers", post(add_dataset_layer))
+        .route("/v1/datasets/{dataset}/annotations", get(annotation_layers).post(create_annotation_layer))
+        .route("/v1/datasets/{dataset}/annotations/projection", get(annotation_projection))
+        .route("/v1/datasets/{dataset}/annotations/roi-tables", get(annotation_roi_tables))
+        .route("/v1/datasets/{dataset}/annotations/roi-tables/{name}", post(import_annotation_roi))
+        .route("/v1/datasets/{dataset}/annotations/{layer}", get(annotation_layer).post(add_annotation).delete(delete_annotation_layer).layer(DefaultBodyLimit::max(annotation_store::MAX_ANNOTATION_BYTES)))
+        .route("/v1/datasets/{dataset}/annotations/{layer}/geojson", get(export_annotation_geojson).put(import_annotation_geojson).layer(DefaultBodyLimit::max(annotation_store::MAX_ANNOTATION_BYTES)))
+        .route("/v1/datasets/{dataset}/annotations/{layer}/state", put(replace_annotation_state).layer(DefaultBodyLimit::max(annotation_store::MAX_ANNOTATION_BYTES)))
+        .route("/v1/datasets/{dataset}/annotations/{layer}/visibility", put(set_annotation_visibility))
+        .route("/v1/datasets/{dataset}/annotations/{layer}/save", post(save_annotation_layer))
+        .route("/v1/datasets/{dataset}/annotations/{layer}/save-to", post(save_annotation_to))
+        .route("/v1/datasets/{dataset}/annotations/{layer}/save-roi", post(save_annotation_roi))
+        .route("/v1/datasets/{dataset}/annotations/{layer}/renest", post(renest_annotation_layer))
+        .route("/v1/datasets/{dataset}/annotations/{layer}/{id}", put(update_annotation).delete(delete_annotation).layer(DefaultBodyLimit::max(annotation_store::MAX_ANNOTATION_BYTES)))
+        .route("/v1/datasets/{dataset}/annotations/{layer}/{id}/detach", post(detach_annotation))
         .route(
             "/v1/datasets/{dataset}/settings",
             get(dataset_settings).post(set_dataset_settings),
@@ -473,6 +509,139 @@ fn app_router(
         Some(dir) => router.fallback_service(ServeDir::new(dir)),
         None => router,
     }
+}
+
+type ApiError = (StatusCode, String);
+
+fn annotation_dataset(state: &AppState, dataset: &str) -> Result<PathBuf, ApiError> {
+    resolve_frame_dataset(&state.datasets, dataset)
+}
+
+#[derive(Deserialize)]
+struct NewAnnotationLayer { name: String }
+
+async fn annotation_layers(State(state): State<AppState>, AxumPath(dataset): AxumPath<String>) -> Result<Json<Vec<AnnotationLayer>>, ApiError> {
+    let root = annotation_dataset(&state, &dataset)?;
+    state.annotations.layers(&dataset, &root).map(Json).map_err(|message| (StatusCode::BAD_REQUEST, message))
+}
+
+async fn create_annotation_layer(State(state): State<AppState>, AxumPath(dataset): AxumPath<String>, Json(body): Json<NewAnnotationLayer>) -> Result<Json<AnnotationLayer>, ApiError> {
+    let root = annotation_dataset(&state, &dataset)?;
+    state.annotations.create(&dataset, &root, body.name).map(Json).map_err(|message| (StatusCode::BAD_REQUEST, message))
+}
+
+async fn annotation_layer(State(state): State<AppState>, AxumPath((dataset, layer)): AxumPath<(String, u64)>) -> Result<Json<AnnotationLayer>, ApiError> {
+    let root = annotation_dataset(&state, &dataset)?;
+    state.annotations.edit(&dataset, &root, layer, |item| Ok(item.clone())).map(Json).map_err(|message| (StatusCode::NOT_FOUND, message))
+}
+
+async fn delete_annotation_layer(State(state): State<AppState>, AxumPath((dataset, layer)): AxumPath<(String, u64)>) -> Result<StatusCode, ApiError> {
+    let root = annotation_dataset(&state, &dataset)?;
+    state.annotations.remove_layer(&dataset, &root, layer)
+        .map(|()| StatusCode::NO_CONTENT).map_err(|message| (StatusCode::NOT_FOUND, message))
+}
+
+#[derive(Deserialize)]
+struct AnnotationVisibility { visible: bool }
+
+async fn set_annotation_visibility(State(state): State<AppState>, AxumPath((dataset, layer)): AxumPath<(String, u64)>, Json(body): Json<AnnotationVisibility>) -> Result<Json<AnnotationLayer>, ApiError> {
+    let root = annotation_dataset(&state, &dataset)?;
+    state.annotations.edit(&dataset, &root, layer, |item| { item.visible = body.visible; Ok(item.clone()) })
+        .map(Json).map_err(|message| (StatusCode::BAD_REQUEST, message))
+}
+
+async fn add_annotation(State(state): State<AppState>, AxumPath((dataset, layer)): AxumPath<(String, u64)>, Json(body): Json<QuPathAnnotation>) -> Result<Json<QuPathAnnotation>, ApiError> {
+    let root = annotation_dataset(&state, &dataset)?;
+    state.annotations.edit(&dataset, &root, layer, |item| item.add(body)).map(Json).map_err(|message| (StatusCode::BAD_REQUEST, message))
+}
+
+async fn update_annotation(State(state): State<AppState>, AxumPath((dataset, layer, id)): AxumPath<(String, u64, u64)>, Json(body): Json<QuPathAnnotation>) -> Result<Json<QuPathAnnotation>, ApiError> {
+    let root = annotation_dataset(&state, &dataset)?;
+    state.annotations.edit(&dataset, &root, layer, |item| item.update(id, body)).map(Json).map_err(|message| (StatusCode::BAD_REQUEST, message))
+}
+
+async fn delete_annotation(State(state): State<AppState>, AxumPath((dataset, layer, id)): AxumPath<(String, u64, u64)>) -> Result<StatusCode, ApiError> {
+    let root = annotation_dataset(&state, &dataset)?;
+    state.annotations.edit(&dataset, &root, layer, |item| item.remove(id)).map(|()| StatusCode::NO_CONTENT).map_err(|message| (StatusCode::BAD_REQUEST, message))
+}
+
+async fn detach_annotation(State(state): State<AppState>, AxumPath((dataset, layer, id)): AxumPath<(String, u64, u64)>) -> Result<StatusCode, ApiError> {
+    let root = annotation_dataset(&state, &dataset)?;
+    state.annotations.edit(&dataset, &root, layer, |item| item.detach(id)).map(|()| StatusCode::NO_CONTENT).map_err(|message| (StatusCode::BAD_REQUEST, message))
+}
+
+async fn renest_annotation_layer(State(state): State<AppState>, AxumPath((dataset, layer)): AxumPath<(String, u64)>) -> Result<StatusCode, ApiError> {
+    let root = annotation_dataset(&state, &dataset)?;
+    state.annotations.edit(&dataset, &root, layer, |item| { item.renest(); Ok(()) }).map(|()| StatusCode::NO_CONTENT).map_err(|message| (StatusCode::BAD_REQUEST, message))
+}
+
+async fn save_annotation_layer(State(state): State<AppState>, AxumPath((dataset, layer)): AxumPath<(String, u64)>) -> Result<Json<String>, ApiError> {
+    let root = annotation_dataset(&state, &dataset)?;
+    state.annotations.save(&dataset, &root, layer).map(Json).map_err(|message| (StatusCode::BAD_REQUEST, message))
+}
+
+#[derive(Deserialize)]
+struct AnnotationSaveTarget { target: String }
+
+async fn save_annotation_to(State(state): State<AppState>, AxumPath((dataset, layer)): AxumPath<(String, u64)>, Json(body): Json<AnnotationSaveTarget>) -> Result<Json<AnnotationSaveReport>, ApiError> {
+    let root = annotation_dataset(&state, &dataset)?;
+    let session = state.sessions.session_for(&dataset, &root).map_err(|message| (StatusCode::BAD_REQUEST, message))?;
+    state.annotations.save_to(&dataset, &root, layer, &session, &body.target)
+        .map(Json).map_err(|message| (StatusCode::BAD_REQUEST, message))
+}
+
+async fn save_annotation_roi(State(state): State<AppState>, AxumPath((dataset, layer)): AxumPath<(String, u64)>) -> Result<Json<RoiSaveReport>, ApiError> {
+    let root = annotation_dataset(&state, &dataset)?;
+    let session = state.sessions.session_for(&dataset, &root).map_err(|message| (StatusCode::BAD_REQUEST, message))?;
+    state.annotations.save_roi_csv(&dataset, &root, layer, &session).map(Json).map_err(|message| (StatusCode::BAD_REQUEST, message))
+}
+
+async fn annotation_roi_tables(State(state): State<AppState>, AxumPath(dataset): AxumPath<String>) -> Result<Json<Vec<RoiTableSummary>>, ApiError> {
+    let root = annotation_dataset(&state, &dataset)?;
+    AnnotationStore::roi_tables(&root).map(Json).map_err(|message| (StatusCode::BAD_REQUEST, message))
+}
+
+async fn import_annotation_roi(State(state): State<AppState>, AxumPath((dataset, name)): AxumPath<(String, String)>) -> Result<Json<AnnotationLayer>, ApiError> {
+    let root = annotation_dataset(&state, &dataset)?;
+    let session = state.sessions.session_for(&dataset, &root).map_err(|message| (StatusCode::BAD_REQUEST, message))?;
+    state.annotations.import_roi_table(&dataset, &root, &session, &name).map(Json).map_err(|message| (StatusCode::BAD_REQUEST, message))
+}
+
+async fn export_annotation_geojson(State(state): State<AppState>, AxumPath((dataset, layer)): AxumPath<(String, u64)>) -> Result<([(axum::http::HeaderName, &'static str); 1], Vec<u8>), ApiError> {
+    let root = annotation_dataset(&state, &dataset)?;
+    let bytes = state.annotations.edit(&dataset, &root, layer, |item| qupath_geojson::write(&item.annotations).map_err(|error| error.to_string()))
+        .map_err(|message| (StatusCode::BAD_REQUEST, message))?;
+    Ok(([(header::CONTENT_TYPE, "application/geo+json")], bytes))
+}
+
+async fn import_annotation_geojson(State(state): State<AppState>, AxumPath((dataset, layer)): AxumPath<(String, u64)>, body: axum::body::Bytes) -> Result<Json<AnnotationLayer>, ApiError> {
+    let root = annotation_dataset(&state, &dataset)?;
+    state.annotations.replace_from_geojson(&dataset, &root, layer, &body).map(Json).map_err(|message| (StatusCode::BAD_REQUEST, message))
+}
+
+async fn replace_annotation_state(State(state): State<AppState>, AxumPath((dataset, layer)): AxumPath<(String, u64)>, Json(items): Json<Vec<QuPathAnnotation>>) -> Result<Json<AnnotationLayer>, ApiError> {
+    let root = annotation_dataset(&state, &dataset)?;
+    state.annotations.edit(&dataset, &root, layer, |current| { current.replace_items(items)?; Ok(current.clone()) })
+        .map(Json).map_err(|message| (StatusCode::BAD_REQUEST, message))
+}
+
+async fn annotation_projection(
+    State(state): State<AppState>, AxumPath(dataset): AxumPath<String>, Query(query): Query<SceneQuery>,
+) -> Result<Json<Vec<u32>>, ApiError> {
+    let root = annotation_dataset(&state, &dataset)?;
+    validate_render_extent(query.width, query.height, RenderView::Volume).map_err(|message| (StatusCode::BAD_REQUEST, message))?;
+    let size = FrameSize::new(query.width, query.height).map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
+    let controls = CameraControls {
+        orbit_delta: [query.orbit_x, query.orbit_y], zoom: query.zoom,
+        orientation: parse_orientation_query(query.orientation.as_deref())?,
+        focus_xyz: parse_focus_query(query.focus_xyz.as_deref())?,
+    }.validate().map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
+    let mut session = state.sessions.session_for(&dataset, &root).map_err(|message| (StatusCode::BAD_REQUEST, message))?;
+    let layers = state.annotations.layers(&dataset, &root).map_err(|message| (StatusCode::BAD_REQUEST, message))?;
+    let visible = layers.iter().filter(|layer| layer.visible).flat_map(|layer| layer.annotations.iter().cloned()).collect::<Vec<_>>();
+    session.set_qupath_annotations(&visible).map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
+    newvolim_portable::routes::project_session_annotation_words(&session, &root, size, controls)
+        .map(Json).map_err(|message| (StatusCode::BAD_REQUEST, message))
 }
 
 /// One channel edit for a dataset's portable session, over HTTP or the frame socket.
@@ -1034,6 +1203,12 @@ async fn enqueue_render(
 ) -> Result<RenderOutput, (StatusCode, String)> {
     validate_render_extent(request.width, request.height, request.view)
         .map_err(|message| (StatusCode::BAD_REQUEST, message))?;
+    if request.slice_axis > 2 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "sliceAxis must be 0, 1, or 2".to_owned(),
+        ));
+    }
     let size = FrameSize::new(request.width, request.height)
         .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
     let controls = CameraControls {
@@ -1041,9 +1216,35 @@ async fn enqueue_render(
         zoom: request.zoom,
         orientation: request.orientation,
         focus_xyz: request.focus_xyz,
-    }
-    .validate()
-    .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
+    };
+    let slice_zooms = request.slice_zooms.unwrap_or([request.zoom; 3]);
+    let controls = match request.view {
+        RenderView::Volume => controls
+            .validate()
+            .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?,
+        RenderView::Orthogonal => {
+            if slice_zooms
+                .iter()
+                .any(|zoom| !zoom.is_finite() || !(0.25..=64.0).contains(zoom))
+            {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "2D zoom must be finite and in 0.25..=64.0".to_owned(),
+                ));
+            }
+            if controls.focus_xyz.is_some_and(|focus| {
+                focus
+                    .iter()
+                    .any(|value| !value.is_finite() || !(0.0..=1.0).contains(value))
+            }) {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "2D focus must be normalized to finite values in 0..=1".to_owned(),
+                ));
+            }
+            controls
+        }
+    };
     let crosshair =
         request_crosshair(&request).map_err(|message| (StatusCode::BAD_REQUEST, message))?;
     let root = resolve_frame_dataset(&state.datasets, &request.dataset)?;
@@ -1054,11 +1255,13 @@ async fn enqueue_render(
             session_id,
             dataset: request.dataset.clone(),
             sessions: state.sessions.clone(),
+            annotations: state.annotations.clone(),
             root,
             size,
             controls,
             view: request.view,
             crosshair,
+            slice_zooms,
             response,
         })
         .map_err(|error| match error {
@@ -1262,6 +1465,8 @@ async fn serve_frame_socket(mut socket: WebSocket, state: AppState, session_id: 
                     yz_base64: STANDARD.encode(&rendered.png[2]),
                     voxel_shape_xyz: rendered.voxel_shape_xyz,
                     crosshair_xyz: rendered.crosshair_xyz,
+                    pyramid_levels: rendered.pyramid_levels,
+                    viewport: rendered.viewport,
                 };
                 if socket
                     .send(Message::Text(
@@ -1349,8 +1554,15 @@ fn start_render(job: FrameJob, completed_tx: &mpsc::UnboundedSender<RenderComple
         let started = Instant::now();
         let result = match job.view {
             RenderView::Volume => {
-                let session = job.sessions.session_for(&job.dataset, &job.root).ok();
-                render_volume_frame(session.as_ref(), &job.root, job.size, job.controls).map(
+                let mut session = job.sessions.session_for(&job.dataset, &job.root).ok();
+                let prepared = if let Some(session) = session.as_mut() {
+                    job.annotations.layers(&job.dataset, &job.root).and_then(|layers| {
+                        let visible = layers.iter().filter(|layer| layer.visible)
+                            .flat_map(|layer| layer.annotations.iter().cloned()).collect::<Vec<_>>();
+                        session.set_qupath_annotations(&visible).map_err(|error| error.to_string())
+                    })
+                } else { Ok(()) };
+                prepared.and_then(|()| render_volume_frame(session.as_ref(), &job.root, job.size, job.controls)).map(
                     |(png, ray_distance_pfm, renderer)| {
                         RenderOutput::Volume(RenderedFrame {
                             png,
@@ -1362,18 +1574,27 @@ fn start_render(job: FrameJob, completed_tx: &mpsc::UnboundedSender<RenderComple
                 )
             }
             RenderView::Orthogonal => {
-                // The portable session slices the whole base layer on the CPU at the finest
-                // level that fits its pages, on any store it can open; Palace's Vulkan slicer
-                // remains the fallback for a dataset the portable session cannot hold.
+                // Select a level from pane size and 2D zoom, then slice the whole base layer on
+                // the CPU. Palace's Vulkan slicer remains the fallback for unsupported stores.
                 let portable = job
                     .sessions
                     .session_for(&job.dataset, &job.root)
-                    .and_then(|session| portable_orthogonal_slice_pngs(&session, job.crosshair));
+                    .and_then(|session| {
+                        portable_orthogonal_slice_pngs_for_view(
+                            &session,
+                            job.crosshair,
+                            [job.size.width, job.size.height],
+                            job.slice_zooms,
+                            job.controls.focus_xyz,
+                        )
+                    });
                 match portable {
                     Ok((png, slices)) => Ok(RenderOutput::Orthogonal(RenderedOrthogonal {
                         png,
                         voxel_shape_xyz: slices.voxel_shape_xyz,
                         crosshair_xyz: slices.crosshair_xyz,
+                        pyramid_levels: Some(slices.levels),
+                        viewport: true,
                         render_ms: started.elapsed().as_secs_f64() * 1_000.0,
                     })),
                     Err(portable_error) => dataset_xyz_extent(&job.root).and_then(|shape| {
@@ -1393,6 +1614,8 @@ fn start_render(job: FrameJob, completed_tx: &mpsc::UnboundedSender<RenderComple
                                 png,
                                 voxel_shape_xyz: shape,
                                 crosshair_xyz: crosshair,
+                                pyramid_levels: None,
+                                viewport: false,
                                 render_ms: started.elapsed().as_secs_f64() * 1_000.0,
                             })
                         })
@@ -1423,8 +1646,12 @@ fn dataset_xyz_extent(root: &Path) -> Result<[u32; 3], String> {
         let input_axis = multiscale
             .axes
             .iter()
-            .position(|axis| axis.name.eq_ignore_ascii_case(name))
-            .ok_or_else(|| format!("multiscale is missing {name} axis"))?;
+            .position(|axis| axis.name.eq_ignore_ascii_case(name));
+        if name == "z" && input_axis.is_none() {
+            xyz[output_axis] = 1;
+            continue;
+        }
+        let input_axis = input_axis.ok_or_else(|| format!("multiscale is missing {name} axis"))?;
         xyz[output_axis] = array
             .shape
             .get(input_axis)
@@ -1515,11 +1742,13 @@ mod tests {
             session_id: SessionId(session_id),
             dataset: "test".to_owned(),
             sessions: SessionStore::default(),
+            annotations: AnnotationStore::default(),
             root: PathBuf::from("/tmp/test.ome.zarr"),
             size: FrameSize::new(1, 1).unwrap(),
             controls: CameraControls::default(),
             view: RenderView::Volume,
             crosshair: None,
+            slice_zooms: [1.0; 3],
             response,
         }
     }
@@ -2094,6 +2323,8 @@ mod tests {
             x,
             y,
             z,
+            slice_axis: 2,
+            slice_zooms: None,
         };
         assert_eq!(
             request_crosshair(&request(RenderView::Orthogonal, Some(5), Some(6), Some(7))),
@@ -2215,12 +2446,15 @@ mod tests {
             yz_base64: "eXo=".into(),
             voxel_shape_xyz: [128, 128, 32],
             crosshair_xyz: [64, 64, 16],
+            pyramid_levels: Some([2, 3, 4]),
+            viewport: true,
         })
         .unwrap();
         assert_eq!(json["type"], "orthogonal");
         assert_eq!(json["xyBase64"], "eHk=");
         assert_eq!(json["voxelShapeXyz"], serde_json::json!([128, 128, 32]));
         assert_eq!(json["crosshairXyz"], serde_json::json!([64, 64, 16]));
+        assert_eq!(json["pyramidLevels"], serde_json::json!([2, 3, 4]));
         assert_eq!(json["target"]["depth"], "none");
         assert_eq!(json["progress"], "final");
     }
@@ -2292,6 +2526,7 @@ mod tests {
             render_queue,
             next_session_id: Arc::new(AtomicU64::new(1)),
             sessions: SessionStore::default(),
+            annotations: AnnotationStore::default(),
         };
         let app = app_router(
             state,
@@ -2366,6 +2601,7 @@ mod tests {
                 render_queue,
                 next_session_id: Arc::new(AtomicU64::new(1)),
                 sessions: SessionStore::default(),
+                annotations: AnnotationStore::default(),
             },
             vec![],
             None,
@@ -2443,6 +2679,7 @@ mod tests {
                 render_queue,
                 next_session_id: Arc::new(AtomicU64::new(1)),
                 sessions: SessionStore::default(),
+                annotations: AnnotationStore::default(),
             }
         };
         let get = |app: Router, uri: &str| {
@@ -2497,6 +2734,7 @@ mod tests {
             render_queue,
             next_session_id: Arc::new(AtomicU64::new(1)),
             sessions: SessionStore::default(),
+            annotations: AnnotationStore::default(),
         };
         let app = app_router(state, vec![], None);
         let call = |app: Router, method: &str, uri: &str, body: Option<String>| {
@@ -2555,6 +2793,68 @@ mod tests {
         assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 
+    #[tokio::test]
+    async fn annotation_routes_edit_geojson_and_project_into_the_3d_camera() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../test-data/cells3d-anisotropic.ome.zarr").canonicalize().unwrap();
+        let (render_queue, _receiver) = mpsc::channel(1);
+        let state = AppState {
+            datasets: Arc::new(HashMap::from([("cells3d".into(), root)])),
+            render_queue, next_session_id: Arc::new(AtomicU64::new(1)),
+            sessions: SessionStore::default(), annotations: AnnotationStore::default(),
+        };
+        let app = app_router(state, vec![], None);
+        let call = |app: Router, method: &str, uri: String, body: Option<String>| {
+            let request = Request::builder().method(method).uri(uri)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(body.map(Body::from).unwrap_or_else(Body::empty)).unwrap();
+            async move {
+                let response = app.oneshot(request).await.unwrap();
+                let status = response.status();
+                let bytes = to_bytes(response.into_body(), 1 << 20).await.unwrap();
+                (status, bytes)
+            }
+        };
+        let prefix = "/v1/datasets/cells3d/annotations";
+        let (status, layer) = call(app.clone(), "POST", prefix.into(), Some(r#"{"name":"test"}"#.into())).await;
+        assert_eq!(status, StatusCode::OK);
+        let layer: AnnotationLayer = serde_json::from_slice(&layer).unwrap();
+        let uri = format!("{prefix}/{}", layer.id);
+        let mut point = QuPathAnnotation::point(8.0, 8.0, newvolim_scene::qupath::Plane::at(1, 0));
+        point.z_extent = 2;
+        let (status, stored) = call(app.clone(), "POST", uri.clone(), Some(serde_json::to_string(&point).unwrap())).await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&stored));
+        let stored: QuPathAnnotation = serde_json::from_slice(&stored).unwrap();
+        assert_eq!(stored.id, 1);
+        let (status, exported) = call(app.clone(), "GET", format!("{uri}/geojson"), None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(qupath_geojson::parse(&exported).unwrap().len(), 1);
+        let (status, projection) = call(app.clone(), "GET", format!("{prefix}/projection?width=64&height=48"), None).await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&projection));
+        let words: Vec<u32> = serde_json::from_slice(&projection).unwrap();
+        assert!(!words.is_empty());
+        assert_eq!(words.len() % 13, 0);
+        assert!(words.len() >= 39, "a Z span projects its start, end and connector");
+        let (status, hidden) = call(app.clone(), "PUT", format!("{uri}/visibility"), Some(r#"{"visible":false}"#.into())).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(!serde_json::from_slice::<AnnotationLayer>(&hidden).unwrap().visible);
+        let (status, projection) = call(app.clone(), "GET", format!("{prefix}/projection?width=64&height=48"), None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(serde_json::from_slice::<Vec<u32>>(&projection).unwrap().is_empty());
+        let (status, _) = call(app.clone(), "PUT", format!("{uri}/visibility"), Some(r#"{"visible":true}"#.into())).await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = call(app.clone(), "DELETE", format!("{uri}/{}", stored.id), None).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (status, projection) = call(app.clone(), "GET", format!("{prefix}/projection?width=64&height=48"), None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(serde_json::from_slice::<Vec<u32>>(&projection).unwrap().is_empty());
+        let (status, _) = call(app.clone(), "DELETE", uri.clone(), None).await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+        let (status, layers) = call(app, "GET", prefix.into(), None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(serde_json::from_slice::<Vec<AnnotationLayer>>(&layers).unwrap().is_empty());
+    }
+
     /// A socket frame request carries the ray-distance PFM only when it asks (`depth: true`);
     /// the page never asks, which saves 888 KB of base64 per pane-sized frame.
     #[test]
@@ -2584,6 +2884,7 @@ mod tests {
             render_queue,
             next_session_id: Arc::new(AtomicU64::new(1)),
             sessions: SessionStore::default(),
+            annotations: AnnotationStore::default(),
         };
         let app = app_router(state.clone(), vec![], None);
 
@@ -2665,6 +2966,8 @@ mod tests {
                 x: None,
                 y: None,
                 z: None,
+                slice_axis: 2,
+                slice_zooms: None,
             },
         )
         .await
@@ -2700,6 +3003,8 @@ mod tests {
                 x: Some(u32::MAX),
                 y: Some(u32::MAX),
                 z: Some(u32::MAX),
+                slice_axis: 2,
+                slice_zooms: None,
             },
         )
         .await

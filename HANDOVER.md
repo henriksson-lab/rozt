@@ -103,6 +103,40 @@ puts socket delivery about 3–5 ms beyond rendering locally. Python WebSocket a
 events had falsely suggested an 80–100 ms transfer delay. Lossless WebP compressed these images
 further but encoded much more slowly in a standalone codec comparison, so PNG remains the
 measured choice for this local path. The server should stay on `0.0.0.0:9876`.
+The test datasets were moved out of the checkout: use
+`--allow-root /husky/otherdataset/teresa`, with `cells3d` at
+`/husky/otherdataset/teresa/newvol-test/cells3d-anisotropic.ome.zarr` and
+`gradient` at
+`/husky/otherdataset/teresa/newvol-test/two-channel-gradient.ome.zarr`.
+The live registry also includes `2079_R1`, `2079_R2`, `2079_R3`, `2079_R4`
+and `2079_merged_registered` from that root. These stores are 2D NGFF
+`[c,y,x]` pyramids. The portable session now admits a missing Z axis as a
+singleton physical slice, and orthogonal level selection also checks that its
+largest output plane fits one Palace page for the noninteractive slice API. The
+interactive 2D socket now selects the coarsest admitted pyramid level that still
+provides one source pixel per physical screen pixel at the pane's current zoom;
+it decodes only chunks intersecting the visible viewport and returns a pane-sized
+image. Level choice is independent per plane and no longer limited by fitting the
+whole level into four pages. At 64× on R1, 150×100, 300×200 and 600×400 physical
+panes select XY levels 4, 3 and 2 respectively; a warm 300×200 response was 45 ms.
+The socket response reports `pyramidLevels`, and the UI status displays them. Wheel
+zoom explicitly requests a slice even when the cursor anchored focus leaves the
+crosshair unchanged; 2D socket zoom accepts the UI's full 0.25×–64× range.
+Live checks rendered an R1 volume
+PNG and XY/XZ/YZ PNGs; headless Chrome listed all five and loaded R1 at
+`66048×157440×1` without an error.
+R1 is `uint8` and has no OMERO display window. Channel defaults now follow the
+array dtype (0–255 for `uint8`, 0–65535 for `uint16`) instead of always using
+16-bit range; the former made R1 approximately 256 times too dark while its
+annotations remained visible. The overlapping contrast range was replaced by
+separate full-width Black and White sliders with 20 px drag targets. A live R1
+XY frame had 139,891 nonblack pixels of 634,680, ranged 0–255, and Chromium
+pointer drags moved the controls from 0→51 and 255→188 before restoring 0–255.
+Channel color defaults now match `omezarr_viewers-rs`: one channel is white;
+multiple unnamed channels cycle green, magenta, cyan, yellow, red and blue;
+OMERO colors take precedence, then known dye/stain names, and repeated colors
+move to the first unused palette color. Live R1 defaults are DAPI blue, 488 green,
+Cy3 orange and Cy5 magenta.
 
 **Depth control:** the 3D scene's logarithmic Depth slider now reaches 100× (session accepts
 0.05×–100×); its prior 10× slider ceiling was too shallow. The slice-axis sliders are separate.
@@ -592,6 +626,27 @@ Implemented foundations:
    are diagnosable.
 4. The portable route has had no side-by-side visual comparison against the native compositor,
    whose volume blend and annotation-ordering rules both differ.
+
+## Current annotation work (2026-09-21)
+
+The web viewer now has editable QuPath annotations in the XY pane and projected
+annotations in the 3D pane. The model and GeoJSON codec were ported from
+`omezarr_viewers-rs`; the server keeps dataset-scoped layers in memory and
+saves them explicitly under `annotations/<layer>/annotations.geojson`. ROI CSV,
+JSON, Parquet and AnnData v1 tables can be imported; CSV ROI boxes can be
+exported. See `STAGE0.md` under “Editable annotations” for behavior and tests.
+The source parity follow-up adds target-aware Save, per-layer view settings,
+hierarchy list, 3D Z spans and one-basis projection. The page and server release
+builds are running together on `0.0.0.0:9876`; a live point round trip and a
+browser layer-switch check passed.
+The XY SVG overlay initially emitted literal `attr:d`/`attr:viewBox` names and
+was invisible; direct SVG attributes fixed it. Headless Chromium on the live
+release page now finds real paths for a temporary cell and its nucleus, with
+real `d`, `stroke`, and `viewBox` attributes. The temporary layer was removed.
+The browser bundle in `dist` is rebuilt and the existing release server on
+`0.0.0.0:9876` serves it. The current 3D annotation compositor admits at most
+4,096 projected primitives per frame; that is an existing Palace packet limit
+for large imported layers.
 
 ## Completed milestone: Palace WGPU ordered-scene DVR
 

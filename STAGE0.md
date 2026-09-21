@@ -5949,3 +5949,62 @@ and ZYX axis order before applying quaternion orientation and zoom. Slice slider
 continuous 2D pans update the 3D frame; the latter use the existing half-size interaction
 preview and issue a full-size frame after the drag settles. Omitting `focusXyz` preserves the
 previous volume-centered view for other API callers.
+
+## Editable annotations (2026-09-21)
+
+Ported the QuPath annotation model and GeoJSON reader/writer from
+`omezarr_viewers-rs`. The XY pane has point, rectangle, ellipse, polygon,
+polyline, freehand region and freehand line tools, plus selection, body and
+vertex editing, class/type/color/width controls, nesting, undo, class filtering,
+layer visibility and explicit Save. Shapes use level-0 pixel coordinates and
+their Z/T ranges. The same layers project into server and browser 3D frames;
+the browser composites them against the paired ray-distance attachment.
+
+The server discovers native `annotations/*/annotations.geojson`, saves QuPath
+GeoJSON with the ngio group metadata, and imports existing ROI tables in CSV,
+JSON, Parquet or AnnData v1. The ROI table exporter writes physical-coordinate
+CSV boxes and reports when a non-box geometry was reduced to its bounds. A
+native GeoJSON save preserves full geometry and metadata. The server keeps
+edits in memory until Save; restarting discards unsaved edits.
+
+Evidence: scene model/GeoJSON tests 24; server 29 passed, 2 adapter-only
+ignored, including annotation routes, 3D projection, visibility, GeoJSON
+round trip, ROI physical spacing and AnnData categorical import; UI 12 passed;
+wasm target check passed. Release server and Trunk page built; the service was
+restarted on `0.0.0.0:9876`. Live HTTP returned the page and annotation routes,
+and headless Chrome mounted the annotation controls.
+
+### Annotation compatibility follow-up
+
+The source viewer's remaining annotation behavior was compared against the
+port. Layers can now be removed from the session without deleting saved files;
+the shape list follows parent/child order. Each layer keeps its own drawing
+defaults and view controls while switching: class, type, line width, fill,
+class filter, true-size point radius (including per-class radii), stable class
+colors, opacity, point size, and Z slab. The XY overlay strokes a cell's nucleus,
+uses world-pixel scribble width, and fades shapes outside their Z range according
+to the slab. A QuPath Z span appears in 3D at both ends with depth connectors.
+
+The ROI reader recognizes ngio's older `experimental_*_v1` names, AnnData's
+`anndata_v1`, `masking_roi_table`, and the source viewer's recorded pixel and
+time scale. ROI CSV now writes `len_z_micrometer` and `len_t_second` as the
+number of *further* planes/frames, matching the source format. Save accepts
+`annotations/<name>` or `tables/<name>` within the configured dataset, reports
+how many shapes the latter reduced to boxes, and remembers the target.
+
+3D projection now fits one camera basis per frame rather than reopening the
+Zarr for each vertex. A point behind the camera is skipped without failing the
+whole volume frame. The fitted projection matched Palace's file-opening
+projection across the default, orbit, zoom, and shifted-focus cameras in the
+fixture. The affected scene, portable, server and UI suites passed; wasm check
+and both release builds passed. The live server was restarted on
+`0.0.0.0:9876`. A live demo round trip created a point, saved it as GeoJSON and
+as an ROI table, read both routes, and removed the test data. Headless Chrome
+mounted the controls and preserved distinct opacity values when switching
+between two temporary annotation layers.
+
+The first visual smoke check exposed a Leptos SVG attribute mistake: `attr:d`
+and `attr:viewBox` appeared literally in the DOM, leaving paths invisible.
+The overlay now uses SVG attribute names directly. A rebuilt release page in
+headless Chromium showed a temporary cell and its nucleus as two paths with
+real `d`, `stroke`, and `viewBox` attributes; the temporary layer was removed.

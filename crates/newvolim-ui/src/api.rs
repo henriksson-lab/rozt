@@ -8,6 +8,56 @@
 //! those tests run with the workspace.
 
 use serde::{Deserialize, Serialize};
+use newvolim_scene::qupath::Annotation;
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AnnotationLayer {
+    pub id: u64,
+    pub name: String,
+    pub visible: bool,
+    pub annotations: Vec<Annotation>,
+    pub dirty: bool,
+    pub save_target: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AnnotationSaveReport { pub target: String, pub format: String, pub flattened: usize, pub rows: usize }
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct RoiSaveReport { pub target: String, pub flattened: usize }
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct RoiTableSummary { pub name: String, pub backend: String, pub supported: bool }
+
+pub fn annotation_layers_url(origin: &str, dataset: &str) -> String {
+    format!("{origin}/v1/datasets/{}/annotations", encode_path(dataset))
+}
+
+pub fn annotation_layer_url(origin: &str, dataset: &str, layer: u64) -> String {
+    format!("{}/{layer}", annotation_layers_url(origin, dataset))
+}
+
+pub fn annotation_projection_url(origin: &str, dataset: &str, width: u32, height: u32, zoom: f32, orientation: [f32; 4], focus_xyz: Option<[f32; 3]>) -> String {
+    let mut url = format!("{}/projection?width={width}&height={height}&zoom={zoom}&orientation={}",
+        annotation_layers_url(origin, dataset), orientation.iter().map(f32::to_string).collect::<Vec<_>>().join(","));
+    if let Some(focus) = focus_xyz {
+        url.push_str("&focusXyz=");
+        url.push_str(&focus.iter().map(f32::to_string).collect::<Vec<_>>().join(","));
+    }
+    url
+}
+
+pub fn annotation_roi_tables_url(origin: &str, dataset: &str) -> String {
+    format!("{}/roi-tables", annotation_layers_url(origin, dataset))
+}
+
+pub fn annotation_roi_import_url(origin: &str, dataset: &str, name: &str) -> String {
+    format!("{}/{}", annotation_roi_tables_url(origin, dataset), encode_path(name))
+}
 
 /// One image layer of a dataset's session and the transfer state of each of its channels.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -103,6 +153,9 @@ pub struct FrameRequest {
     pub y: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub z: Option<u32>,
+    pub slice_axis: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub slice_zooms: Option<[f32; 3]>,
 }
 
 /// A channel edit over the socket: the edit plus the dataset and a request id, flattened.
@@ -141,6 +194,10 @@ pub enum SocketReply {
         yz_base64: String,
         voxel_shape_xyz: [u32; 3],
         crosshair_xyz: [u32; 3],
+        #[serde(default)]
+        pyramid_levels: Option<[u32; 3]>,
+        #[serde(default)]
+        viewport: bool,
     },
     #[serde(rename_all = "camelCase")]
     Channels {
@@ -360,11 +417,13 @@ mod tests {
             x: None,
             y: None,
             z: None,
+            slice_axis: 2,
+            slice_zooms: None,
         })
         .unwrap();
         assert_eq!(
             volume,
-            serde_json::json!({"dataset":"demo","width":256,"height":192,"orbitX":30,"orbitY":-20,"zoom":1.5,"requestId":7,"view":"volume"})
+            serde_json::json!({"dataset":"demo","width":256,"height":192,"orbitX":30,"orbitY":-20,"zoom":1.5,"requestId":7,"view":"volume","sliceAxis":2})
         );
         let orthogonal = serde_json::to_value(FrameRequest {
             focus_xyz: None,
@@ -380,11 +439,14 @@ mod tests {
             x: Some(1),
             y: Some(2),
             z: Some(3),
+            slice_axis: 2,
+            slice_zooms: Some([1.0, 2.0, 3.0]),
         })
         .unwrap();
         assert_eq!(orthogonal["view"], "orthogonal");
         assert_eq!((orthogonal["x"].as_u64(), orthogonal["y"].as_u64(), orthogonal["z"].as_u64()), (Some(1), Some(2), Some(3)));
         assert!(orthogonal.get("orbit_x").is_none());
+        assert_eq!(orthogonal["sliceZooms"], serde_json::json!([1.0, 2.0, 3.0]));
         let mut volume_with_rotation = volume.clone();
         volume_with_rotation["orientation"] = serde_json::json!([0.0, 0.0, 0.0, 1.0]);
         let request = FrameRequest {
@@ -392,7 +454,7 @@ mod tests {
             dataset: "demo".into(), width: 256, height: 192,
             orbit_x: 0, orbit_y: 0, zoom: 1.0,
             orientation: Some([0.0, 0.0, 0.0, 1.0]), request_id: 9,
-            view: RenderView::Volume, x: None, y: None, z: None,
+            view: RenderView::Volume, x: None, y: None, z: None, slice_axis: 2, slice_zooms: None,
         };
         assert_eq!(serde_json::to_value(&request).unwrap()["orientation"], volume_with_rotation["orientation"]);
         let focused = FrameRequest { focus_xyz: Some([0.25, 0.5, 0.75]), ..request };
@@ -466,6 +528,9 @@ mod tests {
 
     #[test]
     fn urls_follow_the_servers_routes() {
+        assert_eq!(annotation_layers_url("http://h", "demo"), "http://h/v1/datasets/demo/annotations");
+        assert_eq!(annotation_layer_url("http://h", "demo", 4), "http://h/v1/datasets/demo/annotations/4");
+        assert!(annotation_projection_url("http://h", "demo", 20, 10, 1.0, [0.0, 0.0, 0.0, 1.0], Some([0.25, 0.5, 0.75])).ends_with("focusXyz=0.25,0.5,0.75"));
         assert_eq!(frames_socket_url("http://h:1"), "ws://h:1/v1/frames");
         assert_eq!(frames_socket_url("https://h"), "wss://h/v1/frames");
         assert_eq!(datasets_url("http://h"), "http://h/v1/datasets");

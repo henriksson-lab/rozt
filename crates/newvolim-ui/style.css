@@ -53,6 +53,10 @@ button { cursor: pointer; }
 .pane.ortho { cursor: grab; }
 .pane.ortho:active { cursor: grabbing; }
 .pane .slice-image { position: absolute; display: block; image-rendering: auto; user-select: none; -webkit-user-drag: none; pointer-events: none; }
+.pane .annotation-overlay { position: absolute; overflow: visible; pointer-events: none; }
+.pane .annotation-overlay .annotation-shape { vector-effect: non-scaling-stroke; fill-rule: evenodd; }
+.pane .annotation-overlay .annotation-shape.selected { stroke: #fff; stroke-width: 3; }
+.pane .annotation-overlay .annotation-handle { fill: #fff; stroke: #18213e; stroke-width: 1; vector-effect: non-scaling-stroke; }
 .pane .pane-zoom { position: absolute; right: 8px; bottom: 6px; font-size: 11px; color: var(--muted); pointer-events: none; text-shadow: 0 0 3px #000; }
 .pane.volume { cursor: grab; }
 .pane.volume:active { cursor: grabbing; }
@@ -67,6 +71,14 @@ button { cursor: pointer; }
 .tool-button:hover { color: #fff; }
 .tool-button.active { color: #fff; background: var(--accent); border-color: var(--accent); }
 .tool-button:disabled { opacity: 0.4; cursor: default; }
+.annotation-tools { max-width: min(100%, 710px); overflow-x: auto; }
+.annotation-name { width: 100px; }
+.annotation-list { max-height: 180px; overflow-y: auto; display: flex; flex-direction: column; gap: 2px; margin: 6px 0; }
+.annotation-row { text-align: left; background: var(--bg-deep); color: var(--text); border: 1px solid var(--border); border-radius: 3px; padding: 4px; font-size: 11px; }
+.annotation-row.active { border-color: var(--accent); }
+.annotation-edit { display: flex; flex-direction: column; gap: 5px; }
+.annotation-edit input[type=text], .layer-block textarea { max-width: 100%; box-sizing: border-box; }
+.layer-block textarea { width: 100%; min-height: 90px; background: var(--bg-deep); color: var(--text); border: 1px solid var(--border); }
 .toolbar .tool-group { display: flex; gap: 4px; padding-right: 6px; margin-right: 2px; border-right: 1px solid var(--border-soft); }
 .toolbar .tool-group:last-child { border-right: 0; padding-right: 0; }
 .view-controls { position: absolute; top: 8px; right: 8px; z-index: 25; display: flex; flex-direction: column; gap: 4px; }
@@ -105,6 +117,7 @@ button { cursor: pointer; }
 .slider-row { display: flex; align-items: center; gap: 6px; margin: 4px 0; }
 .slider-row > span:first-child { font-size: 11px; width: 54px; color: var(--muted); flex-shrink: 0; }
 .slider-row input[type="range"] { flex: 1; height: 6px; accent-color: var(--accent); min-width: 40px; margin: 0; }
+.slider-row.contrast-row input[type="range"] { height: 20px; cursor: pointer; }
 .slider-row .slider-value { font-size: 11px; min-width: 46px; text-align: right; color: var(--muted-light); }
 .slider-row label { font-size: 11px; color: var(--muted); display: flex; align-items: center; gap: 4px; }
 .slider-row input[type="checkbox"] { accent-color: var(--accent); margin: 0; }

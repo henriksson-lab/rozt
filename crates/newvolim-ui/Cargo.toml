@@ -11,6 +11,7 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+newvolim-scene = { path = "../newvolim-scene" }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 # `palace-core` reaches getrandom 0.3 transitively; the browser backend is opt-in (plus the
@@ -25,7 +26,7 @@ palace-core = { path = "../../palace-dev/palace-core", default-features = false 
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 web-sys = { version = "0.3", features = [
-  "CanvasRenderingContext2d", "CloseEvent", "console", "DomRect", "Element", "ErrorEvent", "Event",
+  "BeforeUnloadEvent", "CanvasRenderingContext2d", "CloseEvent", "console", "DomRect", "Element", "ErrorEvent", "Event", "File", "FileList",
   "HtmlCanvasElement", "HtmlElement", "HtmlInputElement", "HtmlSelectElement", "KeyboardEvent", "Location",
   "MessageEvent", "MouseEvent", "PointerEvent", "WebSocket", "WheelEvent", "Window",
 ] }

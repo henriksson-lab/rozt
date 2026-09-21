@@ -345,6 +345,36 @@ impl AnnotationProjector for DesktopAnnotationProjector<'_> {
     }
 }
 
+struct FittedAnnotationProjector<'a> {
+    session: &'a LocalSession,
+    basis: palace_frame::CameraRayBasis,
+    size: FrameSize,
+}
+
+impl FittedAnnotationProjector<'_> {
+    fn projection(&self, position: [f64; 3]) -> Option<ProjectedAnnotationVertex> {
+        let [x, y, z] = self.session.physical_point_voxel_xyz_f64(position).ok()?;
+        let projection = palace_frame::project_point_with_basis(self.basis, self.size, [z as f32, y as f32, x as f32])?;
+        Some(ProjectedAnnotationVertex { pixel: projection.pixel, ray_distance: projection.ray_distance })
+    }
+}
+
+impl AnnotationProjector for FittedAnnotationProjector<'_> {
+    fn project(&self, position: [f64; 3]) -> Option<ProjectedAnnotationVertex> {
+        self.projection(position)
+    }
+
+    fn project_radius(&self, center: [f64; 3], radius: f32) -> Option<f32> {
+        let center_projection = self.projection(center)?;
+        [[radius as f64, 0.0, 0.0], [0.0, radius as f64, 0.0], [0.0, 0.0, radius as f64]]
+            .into_iter()
+            .filter_map(|offset| self.projection(std::array::from_fn(|axis| center[axis] + offset[axis])))
+            .map(|projection| (projection.pixel[0] - center_projection.pixel[0]).hypot(projection.pixel[1] - center_projection.pixel[1]))
+            .reduce(f32::max)
+            .filter(|radius| radius.is_finite() && *radius > 0.0)
+    }
+}
+
 pub fn project_session_annotation_words(
     session: &LocalSession,
     root: &Path,
@@ -411,7 +441,7 @@ pub fn palace_annotation_primitives(
 
 pub fn project_session_annotation_records(
     session: &LocalSession,
-    root: &Path,
+    _root: &Path,
     size: FrameSize,
     controls: CameraControls,
 ) -> Result<Vec<newvolim_render::PortableAnnotationPrimitive>, String> {
@@ -420,18 +450,28 @@ pub fn project_session_annotation_records(
         .iter()
         .map(|annotation| annotation_overlay(annotation, ANNOTATION_PICK_STYLE))
         .collect::<Vec<_>>();
-    let projector = DesktopAnnotationProjector {
-        session,
-        root,
-        size,
-        controls,
-    };
-    let records = project_annotation_overlays(
-        &overlays,
-        PhysicalExtent::new(size.width, size.height).map_err(|error| error.to_string())?,
-        &projector,
-    )
-    .map_err(|error| error.to_string())?;
+    let shape = session.summary().voxel_shape_xyz.ok_or("annotation projection needs level-zero XYZ shape")?;
+    let dimensions_zyx = [shape[2], shape[1], shape[0]].map(|value| u32::try_from(value).map_err(|_| "annotation volume dimension exceeds u32"))
+        .into_iter().collect::<Result<Vec<_>, _>>()?;
+    let spacing = session.portable_level_spacings().map_err(|error| error.to_string())?
+        .into_iter().next().ok_or("annotation projection needs level-zero spacing")?;
+    let basis = palace_frame::camera_ray_basis_for_geometry(
+        [dimensions_zyx[0], dimensions_zyx[1], dimensions_zyx[2]],
+        [spacing[2], spacing[1], spacing[0]], controls,
+    ).map_err(|error| error.to_string())?;
+    let projector = FittedAnnotationProjector { session, basis, size };
+    let extent = PhysicalExtent::new(size.width, size.height).map_err(|error| error.to_string())?;
+    let mut records = Vec::new();
+    for overlay in &overlays {
+        match project_annotation_overlays(std::slice::from_ref(overlay), extent, &projector) {
+            Ok(mut projected) => records.append(&mut projected),
+            // When a close camera crosses an annotation plane, a vertex can lie behind the
+            // eye. The volume frame remains valid; only that overlay is unavailable.
+            Err(newvolim_render::AnnotationProjectionError::ProjectionUnavailable(_)
+                | newvolim_render::AnnotationProjectionError::InvalidRadius(_)) => {}
+            Err(error) => return Err(error.to_string()),
+        }
+    }
     Ok(records)
 }
 
@@ -612,9 +652,8 @@ pub fn native_portable_draw_for_session(
         .first()
         .ok_or_else(|| "portable draw layer plan has no selected chunk".to_owned())?;
     let voxel_origin_xyz: [Result<u64, String>; 3] = std::array::from_fn(|axis| {
-        let source_axis = first_plan.request.source.spatial_axes_xyz[axis] as usize;
         first_chunk.spatial_chunk_xyz[axis]
-            .checked_mul(first_plan.request.source.chunk_shape[source_axis])
+            .checked_mul(first_plan.request.source.spatial_chunk_shape(axis))
             .ok_or_else(|| "portable chunk voxel origin overflows u64".to_owned())
     });
     let [origin_x, origin_y, origin_z] = voxel_origin_xyz;
@@ -873,13 +912,7 @@ pub fn palace_slice_layout_and_channel_pages(
     ),
     String,
 > {
-    let channel = volume
-        .channels
-        .get(channel_index)
-        .ok_or_else(|| "portable Palace slice channel is outside the admission".to_owned())?;
-    if channel.page_count == 0 || channel.page_count > 4 {
-        return Err("portable Palace slice page range is not admitted".into());
-    }
+    let pages = palace_channel_pages(volume, channel_index)?;
     let layout = palace_core::gpu::PortableOrthogonalSliceLayout::new(
         volume.dimensions_xyz,
         axis,
@@ -892,6 +925,23 @@ pub fn palace_slice_layout_and_channel_pages(
         },
     )
     .ok_or_else(|| "portable Palace slice layout is not admitted".to_owned())?;
+    Ok((layout, pages))
+}
+
+/// Return one channel's admitted pages without imposing the single-page output bound of the
+/// GPU orthogonal-slice operator. The CPU scene compositor can write a larger image while its
+/// source volume remains bounded by the four portable input pages.
+fn palace_channel_pages(
+    volume: &newvolim_render::NativePortableVolumeInput,
+    channel_index: usize,
+) -> Result<Vec<palace_core::gpu::PortableTensorPage>, String> {
+    let channel = volume
+        .channels
+        .get(channel_index)
+        .ok_or_else(|| "portable Palace slice channel is outside the admission".to_owned())?;
+    if channel.page_count == 0 || channel.page_count > 4 {
+        return Err("portable Palace slice page range is not admitted".into());
+    }
     let first = channel.page_offset as usize;
     let end = first
         .checked_add(channel.page_count as usize)
@@ -909,7 +959,7 @@ pub fn palace_slice_layout_and_channel_pages(
         })
         .collect::<Option<Vec<_>>>()
         .ok_or_else(|| "portable Palace slice page is not admitted".to_owned())?;
-    Ok((layout, pages))
+    Ok(pages)
 }
 
 /// Prefer the fixed-binding WGPU recorder for an already admitted pane. Device discovery and
@@ -1063,8 +1113,7 @@ pub fn palace_scene_slice_rgba_with_sampling(
             };
             let pages = (0..layer.channels.len())
                 .map(|channel| {
-                    palace_slice_layout_and_channel_pages(&volume, channel, axis, index)
-                        .map(|(_, pages)| pages)
+                    palace_channel_pages(&volume, channel)
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             Ok((
@@ -1734,7 +1783,7 @@ fn demand_scene_whole_level_words(session: &LocalSession, levels: &[u32]) -> Res
         .iter()
         .map(|request| {
             let source = &request.source;
-            let voxels: u64 = source.spatial_axes_xyz.iter().map(|&axis| source.shape[axis as usize]).product();
+            let voxels: u64 = (0..3).map(|axis| source.spatial_shape(axis)).product();
             voxels.saturating_mul(request.layer.channels.len().max(1) as u64)
         })
         .sum())
@@ -1876,11 +1925,8 @@ fn prepare_demand_scene_inner(
         }
         total_channels += channels.len();
         let source = &request.source;
-        let spatial: [usize; 3] = source.spatial_axes_xyz.map(|axis| axis as usize);
-        let dimensions: [u32; 3] =
-            std::array::from_fn(|axis| source.shape[spatial[axis]] as u32);
-        let chunk_shape: [u32; 3] =
-            std::array::from_fn(|axis| source.chunk_shape[spatial[axis]] as u32);
+        let dimensions: [u32; 3] = std::array::from_fn(|axis| source.spatial_shape(axis) as u32);
+        let chunk_shape: [u32; 3] = std::array::from_fn(|axis| source.spatial_chunk_shape(axis) as u32);
         let grid = palace_core::gpu::PortableChunkGrid::new(dimensions, chunk_shape)
             .ok_or("source chunk grid is not admitted")?;
         // The layer occupies the same physical box at every level, so its AABB and the camera
@@ -2247,13 +2293,25 @@ pub fn portable_orthogonal_slices(
     session: &LocalSession,
     crosshair_xyz: Option<[u32; 3]>,
 ) -> Result<PortableOrthogonalSlices, String> {
+    portable_orthogonal_slices_for_view(session, crosshair_xyz, None)
+}
+
+/// Select a pyramid level for the displayed 2D pane. `view` is the physical pane extent, its
+/// zoom, and the cut axis (2=XY, 1=XZ, 0=YZ). The coarsest admitted level that still supplies at
+/// least one source pixel per screen pixel is used; when no admitted level reaches that density,
+/// the finest admitted level is used.
+pub fn portable_orthogonal_slices_for_view(
+    session: &LocalSession,
+    crosshair_xyz: Option<[u32; 3]>,
+    view: Option<([u32; 2], f32, u32)>,
+) -> Result<PortableOrthogonalSlices, String> {
     let limits = LayerRenderLimits::new(4, 4);
     let budget_words = u64::from(newvolim_render::PortablePageSubmission::PAGE_COUNT)
         * newvolim_render::PortablePageSubmission::PAGE_BYTES
         / 4;
     let spatial_shape = |request: &LocalLayerRenderRequest| -> Result<[u64; 3], String> {
         let source = &request.source;
-        Ok(std::array::from_fn(|axis| source.shape[source.spatial_axes_xyz[axis] as usize]))
+        Ok(std::array::from_fn(|axis| source.spatial_shape(axis)))
     };
     let base = session
         .local_layer_render_requests(limits)
@@ -2264,23 +2322,48 @@ pub fn portable_orthogonal_slices(
     let shape0 = spatial_shape(&base)?;
     let voxel_shape_xyz: [u32; 3] = std::array::from_fn(|axis| u32::try_from(shape0[axis]).unwrap_or(u32::MAX));
     let channel_count = base.layer.channels.len().max(1) as u64;
-    // The finest level whose whole extent, one word per voxel per channel, fits the pages.
+    let meets_view = |shape: [u64; 3]| {
+        let Some(([pane_width, pane_height], zoom, axis)) = view else { return false };
+        let plane = |shape: [u64; 3]| match axis {
+            0 => [shape[1], shape[2]],
+            1 => [shape[0], shape[2]],
+            _ => [shape[0], shape[1]],
+        };
+        let base = plane(shape0);
+        let candidate = plane(shape);
+        let fit = (pane_width as f64 / base[0].max(1) as f64)
+            .min(pane_height as f64 / base[1].max(1) as f64);
+        let zoom = f64::from(zoom.max(0.01));
+        candidate[0] as f64 >= base[0] as f64 * fit * zoom
+            && candidate[1] as f64 >= base[1] as f64 * fit * zoom
+    };
+    // Without a view target retain the original command/API behavior: choose the finest level
+    // that fits both the source pages and the GPU slice page. Interactive 2D views are composed
+    // on the CPU and may produce a larger image, still from at most four bounded source pages.
     let mut chosen = None;
     for level in 0.. {
         let Ok(requests) = session.local_layer_render_requests_at_level(limits, level) else { break };
         let Some(request) = requests.into_iter().next() else { break };
         let shape = spatial_shape(&request)?;
         let words = shape.iter().product::<u64>().saturating_mul(channel_count);
-        if words <= budget_words {
+        let largest_plane_words = [shape[0].saturating_mul(shape[1]), shape[0].saturating_mul(shape[2]), shape[1].saturating_mul(shape[2])]
+            .into_iter().max().unwrap_or(0);
+        if words > budget_words {
+            continue;
+        }
+        if view.is_none() {
+            if largest_plane_words <= palace_core::gpu::PortableTensorPage::MAX_WORDS as u64 {
+                chosen = Some((level, request, shape));
+                break;
+            }
+        } else if chosen.is_none() || meets_view(shape) {
             chosen = Some((level, request, shape));
-            break;
         }
     }
     let (level, request, shape) = chosen.ok_or_else(|| {
         "no pyramid level of the base layer fits the portable page budget".to_owned()
     })?;
-    let chunk_shape: [u64; 3] =
-        std::array::from_fn(|axis| request.source.chunk_shape[request.source.spatial_axes_xyz[axis] as usize].max(1));
+    let chunk_shape: [u64; 3] = std::array::from_fn(|axis| request.source.spatial_chunk_shape(axis).max(1));
     let counts: [u64; 3] = std::array::from_fn(|axis| shape[axis].div_ceil(chunk_shape[axis]));
     let mut chunks = Vec::with_capacity((counts[0] * counts[1] * counts[2]) as usize);
     for z in 0..counts[2] {
@@ -2331,6 +2414,235 @@ pub fn portable_orthogonal_slice_pngs(
         Ok(palace_png::encode_rgba(&frame))
     };
     let pngs = [encode(&slices.planes[0])?, encode(&slices.planes[1])?, encode(&slices.planes[2])?];
+    Ok((pngs, slices))
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PortableOrthogonalViewSlices {
+    pub planes: [(u32, u32, Vec<u8>); 3],
+    pub levels: [u32; 3],
+    pub voxel_shape_xyz: [u32; 3],
+    pub crosshair_xyz: [u32; 3],
+}
+
+/// Render one screen-sized orthogonal viewport. Pyramid selection is based on physical output
+/// pixels, while only chunks intersecting the visible rectangle and cut plane are decoded.
+fn portable_orthogonal_view_plane(
+    session: &LocalSession,
+    base: &LocalLayerRenderRequest,
+    shape0: [u64; 3],
+    crosshair_xyz: [u32; 3],
+    focus_xyz: [f64; 3],
+    pane_size: [u32; 2],
+    zoom: f32,
+    plane_index: usize,
+) -> Result<((u32, u32, Vec<u8>), u32), String> {
+    let limits = LayerRenderLimits::new(4, 4);
+    let (horizontal_axis, vertical_axis, cut_axis) = match plane_index {
+        0 => (0, 1, 2),
+        1 => (0, 2, 1),
+        2 => (1, 2, 0),
+        _ => return Err("orthogonal plane index is outside XY/XZ/YZ".into()),
+    };
+    let [width, height] = pane_size;
+    let fit = (width as f64 / shape0[horizontal_axis].max(1) as f64)
+        .min(height as f64 / shape0[vertical_axis].max(1) as f64);
+    let scale = fit * f64::from(zoom);
+    if !scale.is_finite() || scale <= 0.0 {
+        return Err("orthogonal viewport scale is invalid".into());
+    }
+    let meets_screen = |shape: [u64; 3]| {
+        shape[horizontal_axis] as f64
+            >= shape0[horizontal_axis] as f64 * scale
+            && shape[vertical_axis] as f64
+                >= shape0[vertical_axis] as f64 * scale
+    };
+    let mut chosen = None;
+    for level in 0.. {
+        let Ok(requests) = session.local_layer_render_requests_at_level(limits, level) else {
+            break;
+        };
+        let Some(request) = requests
+            .into_iter()
+            .find(|request| request.layer.layer_id == base.layer.layer_id)
+        else {
+            break;
+        };
+        let shape = std::array::from_fn(|axis| request.source.spatial_shape(axis));
+        if chosen.is_none() || meets_screen(shape) {
+            chosen = Some((level, request, shape));
+        }
+    }
+    let (level, request, shape) = chosen.ok_or_else(|| "no pyramid level to slice".to_owned())?;
+    let chunk_shape: [u64; 3] =
+        std::array::from_fn(|axis| request.source.spatial_chunk_shape(axis).max(1));
+    let chunk_counts: [u64; 3] =
+        std::array::from_fn(|axis| shape[axis].div_ceil(chunk_shape[axis]));
+    let source_at = |axis: usize, pixel: f64, extent: u32| {
+        let level_zero = focus_xyz[axis] + (pixel + 0.5 - extent as f64 * 0.5) / scale;
+        (level_zero * shape[axis] as f64 / shape0[axis].max(1) as f64).floor() as i64
+    };
+    let axis_range = |axis: usize, extent: u32| {
+        let first = source_at(axis, 0.0, extent);
+        let last = source_at(axis, extent.saturating_sub(1) as f64, extent);
+        let maximum = shape[axis].saturating_sub(1) as i64;
+        (first.min(last).clamp(0, maximum) as u64, first.max(last).clamp(0, maximum) as u64)
+    };
+    let (horizontal_min, horizontal_max) = axis_range(horizontal_axis, width);
+    let (vertical_min, vertical_max) = axis_range(vertical_axis, height);
+    let cut = (u64::from(crosshair_xyz[cut_axis]) * shape[cut_axis]
+        / shape0[cut_axis].max(1))
+        .min(shape[cut_axis].saturating_sub(1));
+    let mut voxel_min = [0; 3];
+    let mut voxel_max = shape.map(|extent| extent.saturating_sub(1));
+    voxel_min[horizontal_axis] = horizontal_min;
+    voxel_max[horizontal_axis] = horizontal_max;
+    voxel_min[vertical_axis] = vertical_min;
+    voxel_max[vertical_axis] = vertical_max;
+    voxel_min[cut_axis] = cut;
+    voxel_max[cut_axis] = cut;
+    let chunk_min: [u64; 3] = std::array::from_fn(|axis| voxel_min[axis] / chunk_shape[axis]);
+    let chunk_max: [u64; 3] = std::array::from_fn(|axis| voxel_max[axis] / chunk_shape[axis]);
+    let mut chunk_indices = Vec::new();
+    for z in chunk_min[2]..=chunk_max[2] {
+        for y in chunk_min[1]..=chunk_max[1] {
+            for x in chunk_min[0]..=chunk_max[0] {
+                let index = x + chunk_counts[0] * (y + chunk_counts[1] * z);
+                chunk_indices.push(u32::try_from(index).map_err(|_| "slice chunk index exceeds u32")?);
+            }
+        }
+    }
+    let channel_words = request
+        .layer
+        .channels
+        .iter()
+        .map(|channel| {
+            session
+                .layer_chunk_words_cached(
+                    limits,
+                    request.layer.layer_id,
+                    level,
+                    channel.source_index,
+                    &chunk_indices,
+                )
+                .map_err(|error| error.to_string())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let transfers = request
+        .layer
+        .channels
+        .iter()
+        .map(newvolim_render::PortableChannelTransfer::from)
+        .collect::<Vec<_>>();
+    let pixels = usize::try_from(width)
+        .ok()
+        .and_then(|width| width.checked_mul(height as usize))
+        .ok_or_else(|| "orthogonal viewport dimensions overflow".to_owned())?;
+    let rgba = (0..pixels)
+        .flat_map(|pixel| {
+            let screen = [pixel % width as usize, pixel / width as usize];
+            let mut coordinate = [cut as i64; 3];
+            coordinate[horizontal_axis] = source_at(horizontal_axis, screen[0] as f64, width);
+            coordinate[vertical_axis] = source_at(vertical_axis, screen[1] as f64, height);
+            let samples = channel_words
+                .iter()
+                .map(|chunks| {
+                    if coordinate
+                        .iter()
+                        .enumerate()
+                        .any(|(axis, &value)| value < 0 || value as u64 >= shape[axis])
+                    {
+                        return f64::NAN;
+                    }
+                    let chunk_xyz: [u64; 3] =
+                        std::array::from_fn(|axis| coordinate[axis] as u64 / chunk_shape[axis]);
+                    let chunk_index = (chunk_xyz[0]
+                        + chunk_counts[0]
+                            * (chunk_xyz[1] + chunk_counts[1] * chunk_xyz[2]))
+                        as u32;
+                    let Ok(chunk_position) = chunk_indices.binary_search(&chunk_index) else {
+                        return f64::NAN;
+                    };
+                    let local: [u64; 3] = std::array::from_fn(|axis| {
+                        coordinate[axis] as u64 - chunk_xyz[axis] * chunk_shape[axis]
+                    });
+                    let logical: [u64; 3] = std::array::from_fn(|axis| {
+                        (shape[axis] - chunk_xyz[axis] * chunk_shape[axis]).min(chunk_shape[axis])
+                    });
+                    let offset = local[0] + logical[0] * (local[1] + logical[1] * local[2]);
+                    chunks[chunk_position]
+                        .get(offset as usize)
+                        .copied()
+                        .map(f64::from)
+                        .unwrap_or(f64::NAN)
+                })
+                .collect::<Vec<_>>();
+            let linear = newvolim_render::composite_portable_scene_samples(&[(&transfers, &samples)])
+                .expect("orthogonal viewport channel samples match transfers");
+            portable_linear_premultiplied_to_srgb8(linear)
+        })
+        .collect();
+    Ok(((width, height, rgba), level))
+}
+
+/// View-aware counterpart used by the socket 2D viewer. Each plane independently chooses a
+/// level from its own zoom and renders exactly the pixels visible in the pane.
+pub fn portable_orthogonal_slice_pngs_for_view(
+    session: &LocalSession,
+    crosshair_xyz: Option<[u32; 3]>,
+    pane_size: [u32; 2],
+    zooms: [f32; 3],
+    focus_normalized_xyz: Option<[f32; 3]>,
+) -> Result<([Vec<u8>; 3], PortableOrthogonalViewSlices), String> {
+    let limits = LayerRenderLimits::new(4, 4);
+    let base = session
+        .local_layer_render_requests(limits)
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .next()
+        .ok_or_else(|| "no image layer to slice".to_owned())?;
+    let shape0: [u64; 3] = std::array::from_fn(|axis| base.source.spatial_shape(axis));
+    let voxel_shape_xyz: [u32; 3] =
+        std::array::from_fn(|axis| u32::try_from(shape0[axis]).unwrap_or(u32::MAX));
+    let requested = crosshair_xyz.unwrap_or(std::array::from_fn(|axis| voxel_shape_xyz[axis] / 2));
+    let crosshair_xyz: [u32; 3] = std::array::from_fn(|axis| {
+        requested[axis].min(voxel_shape_xyz[axis].saturating_sub(1))
+    });
+    let focus_xyz: [f64; 3] = focus_normalized_xyz
+        .map(|focus| std::array::from_fn(|axis| f64::from(focus[axis]) * shape0[axis] as f64))
+        .unwrap_or_else(|| crosshair_xyz.map(|value| value as f64 + 0.5));
+    let rendered = (0..3)
+        .map(|plane| {
+            portable_orthogonal_view_plane(
+                session,
+                &base,
+                shape0,
+                crosshair_xyz,
+                focus_xyz,
+                pane_size,
+                zooms[plane],
+                plane,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let levels: [u32; 3] = std::array::from_fn(|plane| rendered[plane].1);
+    let planes: [(u32, u32, Vec<u8>); 3] = std::array::from_fn(|plane| rendered[plane].0.clone());
+    let encode = |plane: &(u32, u32, Vec<u8>)| -> Result<Vec<u8>, String> {
+        let frame = palace_png::RgbaFrame::new(plane.0, plane.1, plane.2.clone())
+            .map_err(|error| error.to_string())?;
+        Ok(palace_png::encode_rgba(&frame))
+    };
+    let pngs = [
+        encode(&planes[0])?,
+        encode(&planes[1])?,
+        encode(&planes[2])?,
+    ];
+    let slices = PortableOrthogonalViewSlices {
+        planes,
+        levels,
+        voxel_shape_xyz,
+        crosshair_xyz,
+    };
     Ok((pngs, slices))
 }
 
@@ -2503,9 +2815,8 @@ pub fn layer_chunk_words(
         .into_iter()
         .find(|request| request.layer.layer_id.0 == layer_id)
         .ok_or_else(|| format!("layer {layer_id} is not in the render plan"))?;
-    let spatial: [usize; 3] = request.source.spatial_axes_xyz.map(|axis| axis as usize);
     let counts: [u32; 3] = std::array::from_fn(|axis| {
-        request.source.shape[spatial[axis]].div_ceil(request.source.chunk_shape[spatial[axis]].max(1)) as u32
+        request.source.spatial_shape(axis).div_ceil(request.source.spatial_chunk_shape(axis).max(1)) as u32
     });
     let indices = chunks_xyz
         .iter()
@@ -2586,11 +2897,10 @@ pub fn demand_scene_layer_level(
             .find(|request| request.layer.layer_id == id)
             .ok_or_else(|| format!("layer {} is not in the render plan", id.0))?;
         let source = &request.source;
-        let spatial: [usize; 3] = source.spatial_axes_xyz.map(|axis| axis as usize);
         let dimensions_zyx = [
-            source.shape[spatial[2]] as u32,
-            source.shape[spatial[1]] as u32,
-            source.shape[spatial[0]] as u32,
+            source.spatial_shape(2) as u32,
+            source.spatial_shape(1) as u32,
+            source.spatial_shape(0) as u32,
         ];
         let transform = session
             .portable_layer_level_transform(id, 0)
@@ -4078,6 +4388,55 @@ mod tests {
         assert_eq!(&words[..2], &[1, 1]);
         assert_eq!(words[2], 0x00ff_d848);
         assert!(f32::from_bits(words[6]).is_finite());
+    }
+
+    #[test]
+    fn a_close_camera_keeps_the_frame_when_an_annotation_is_behind_its_eye() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../test-data/cells3d-anisotropic.ome.zarr");
+        let mut session = LocalSession::default();
+        session.open_local_omezarr(&root).unwrap();
+        let size = FrameSize::new(64, 48).unwrap();
+        let controls = CameraControls { zoom: 4.0, ..CameraControls::default() };
+        let projector = DesktopAnnotationProjector { session: &session, root: &root, size, controls };
+        let near = [16.64, 16.64, 1000.0];
+        let far = session.voxel_point_physical_f64([64.0, 64.0, 0.5]).unwrap();
+        assert!(projector.projection(near).is_none(), "the point is behind the camera");
+        assert!(projector.projection(far).is_some());
+        session.add_point_annotation_physical("behind", near).unwrap();
+        session.add_point_annotation_physical("front", far).unwrap();
+        let records = project_session_annotation_words(&session, &root, size, controls).unwrap();
+        assert_eq!(records.len(), newvolim_render::PortableAnnotationPrimitive::WORDS);
+    }
+
+    #[test]
+    fn fitted_annotation_projection_matches_palace_file_projection() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../test-data/cells3d-anisotropic.ome.zarr");
+        let mut session = LocalSession::default();
+        session.open_local_omezarr(&root).unwrap();
+        session.add_point_annotation("point", [16, 21, 4]).unwrap();
+        let size = FrameSize::new(160, 120).unwrap();
+        let extent = PhysicalExtent::new(size.width, size.height).unwrap();
+        for controls in [
+            CameraControls::default(),
+            CameraControls { orbit_delta: [80, -30], zoom: 0.7, ..CameraControls::default() },
+            CameraControls { focus_xyz: Some([0.2, 0.4, 0.6]), zoom: 2.0, ..CameraControls::default() },
+        ] {
+            let direct = project_annotation_overlays(
+                &[annotation_overlay(&session.annotations()[0], ANNOTATION_PICK_STYLE)], extent,
+                &DesktopAnnotationProjector { session: &session, root: &root, size, controls },
+            ).unwrap();
+            let fitted = project_session_annotation_records(&session, &root, size, controls).unwrap();
+            assert_eq!(direct.len(), fitted.len());
+            for (a, b) in direct.iter().zip(&fitted) {
+                for (a, b) in a.vertices.iter().zip(&b.vertices) {
+                    assert!((a.pixel[0] - b.pixel[0]).abs() < 1e-4);
+                    assert!((a.pixel[1] - b.pixel[1]).abs() < 1e-4);
+                    assert!((a.ray_distance - b.ray_distance).abs() < 1e-4);
+                }
+            }
+        }
     }
 
     /// The direct portable volume's rays are the fitted Palace ray reordered ZYX → XYZ **and**
