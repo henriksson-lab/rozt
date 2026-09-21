@@ -7,8 +7,8 @@
 //! key spelling is pinned by tests here. This module is plain `serde` and compiles natively so
 //! those tests run with the workspace.
 
-use serde::{Deserialize, Serialize};
 use newvolim_scene::qupath::Annotation;
+use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -23,15 +23,27 @@ pub struct AnnotationLayer {
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
-pub struct AnnotationSaveReport { pub target: String, pub format: String, pub flattened: usize, pub rows: usize }
+pub struct AnnotationSaveReport {
+    pub target: String,
+    pub format: String,
+    pub flattened: usize,
+    pub rows: usize,
+}
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
-pub struct RoiSaveReport { pub target: String, pub flattened: usize }
+pub struct RoiSaveReport {
+    pub target: String,
+    pub flattened: usize,
+}
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
-pub struct RoiTableSummary { pub name: String, pub backend: String, pub supported: bool }
+pub struct RoiTableSummary {
+    pub name: String,
+    pub backend: String,
+    pub supported: bool,
+}
 
 pub fn annotation_layers_url(origin: &str, dataset: &str) -> String {
     format!("{origin}/v1/datasets/{}/annotations", encode_path(dataset))
@@ -41,12 +53,33 @@ pub fn annotation_layer_url(origin: &str, dataset: &str, layer: u64) -> String {
     format!("{}/{layer}", annotation_layers_url(origin, dataset))
 }
 
-pub fn annotation_projection_url(origin: &str, dataset: &str, width: u32, height: u32, zoom: f32, orientation: [f32; 4], focus_xyz: Option<[f32; 3]>) -> String {
-    let mut url = format!("{}/projection?width={width}&height={height}&zoom={zoom}&orientation={}",
-        annotation_layers_url(origin, dataset), orientation.iter().map(f32::to_string).collect::<Vec<_>>().join(","));
+pub fn annotation_projection_url(
+    origin: &str,
+    dataset: &str,
+    width: u32,
+    height: u32,
+    zoom: f32,
+    orientation: [f32; 4],
+    focus_xyz: Option<[f32; 3]>,
+) -> String {
+    let mut url = format!(
+        "{}/projection?width={width}&height={height}&zoom={zoom}&orientation={}",
+        annotation_layers_url(origin, dataset),
+        orientation
+            .iter()
+            .map(f32::to_string)
+            .collect::<Vec<_>>()
+            .join(",")
+    );
     if let Some(focus) = focus_xyz {
         url.push_str("&focusXyz=");
-        url.push_str(&focus.iter().map(f32::to_string).collect::<Vec<_>>().join(","));
+        url.push_str(
+            &focus
+                .iter()
+                .map(f32::to_string)
+                .collect::<Vec<_>>()
+                .join(","),
+        );
     }
     url
 }
@@ -56,7 +89,11 @@ pub fn annotation_roi_tables_url(origin: &str, dataset: &str) -> String {
 }
 
 pub fn annotation_roi_import_url(origin: &str, dataset: &str, name: &str) -> String {
-    format!("{}/{}", annotation_roi_tables_url(origin, dataset), encode_path(name))
+    format!(
+        "{}/{}",
+        annotation_roi_tables_url(origin, dataset),
+        encode_path(name)
+    )
 }
 
 /// One image layer of a dataset's session and the transfer state of each of its channels.
@@ -73,6 +110,8 @@ pub struct LayerChannelSummary {
 #[serde(rename_all = "camelCase")]
 pub struct ChannelSummary {
     pub source_index: usize,
+    #[serde(default)]
+    pub label: Option<String>,
     pub enabled: bool,
     pub color_srgb: [u8; 3],
     pub window_start: f64,
@@ -218,7 +257,11 @@ pub enum SocketReply {
 
 /// Where the API is. An empty box means the page's own origin (the server's `--page-dir`
 /// deployment); a `file:` or `tauri:` page has no usable origin and must name the server.
-pub fn api_origin(location_protocol: &str, location_origin: &str, entered: &str) -> Result<String, String> {
+pub fn api_origin(
+    location_protocol: &str,
+    location_origin: &str,
+    entered: &str,
+) -> Result<String, String> {
     let raw = entered.trim();
     let candidate = if raw.is_empty() {
         if location_protocol == "http:" || location_protocol == "https:" {
@@ -266,10 +309,63 @@ pub fn xy_tile_url(
     tile_x: u32,
     tile_y: u32,
     generation: u64,
+    windows: &[(usize, [f64; 2])],
 ) -> String {
+    let windows = windows
+        .iter()
+        .map(|(channel, [start, end])| format!("{channel}:{start}:{end}"))
+        .collect::<Vec<_>>()
+        .join(",");
     format!(
-        "{origin}/v1/datasets/{}/tiles/xy/{level}/{tile_x}/{tile_y}?v={generation}",
+        "{origin}/v1/datasets/{}/tiles/xy/{level}/{tile_x}/{tile_y}?v={generation}&windows={windows}",
         encode_path(dataset)
+    )
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProfileSample {
+    pub distance: f32,
+    pub x: f32,
+    pub y: f32,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ProfileChannel {
+    pub index: usize,
+    pub values: Vec<f32>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct LineProfileResponse {
+    pub level: u32,
+    pub z: u32,
+    pub pixel_length: f64,
+    pub physical_length: Option<f64>,
+    pub physical_unit: Option<String>,
+    pub samples: Vec<ProfileSample>,
+    pub channels: Vec<ProfileChannel>,
+}
+
+pub fn xy_profile_url(
+    origin: &str,
+    dataset: &str,
+    level: u32,
+    from: [f64; 2],
+    to: [f64; 2],
+    z: f64,
+    channels: &[usize],
+) -> String {
+    let channels = channels
+        .iter()
+        .map(usize::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "{origin}/v1/datasets/{}/profile/xy?level={level}&x0={}&y0={}&x1={}&y1={}&z={z}&channels={channels}",
+        encode_path(dataset), from[0], from[1], to[0], to[1]
     )
 }
 
@@ -312,33 +408,62 @@ pub fn settings_url(origin: &str, dataset: &str) -> String {
     format!("{origin}/v1/datasets/{}/settings", encode_path(dataset))
 }
 
-/// The depth slider is logarithmic: position −1..2 is scale 0.1..100.
+/// The depth slider is logarithmic: position log10(0.05)..2 is scale 0.05..100.
 pub fn depth_scale_from_slider(position: f32) -> f32 {
-    10_f32.powf(position.clamp(-1.0, 2.0))
+    10_f32.powf(position.clamp(0.05_f32.log10(), 2.0))
 }
 
 pub fn slider_from_depth_scale(scale: f32) -> f32 {
-    scale.max(1e-6).log10().clamp(-1.0, 2.0)
+    scale.max(1e-6).log10().clamp(0.05_f32.log10(), 2.0)
 }
 
 /// The client residency routes: the plan (including the fitted camera) and chunk words.
 /// `levels` overrides the camera's level choice after a page-bound refusal.
-pub fn scene_plan_url(origin: &str, dataset: &str, width: u32, height: u32, orbit_x: i32, orbit_y: i32, zoom: f32, orientation: Option<[f32; 4]>, focus_xyz: Option<[f32; 3]>, levels: Option<&[u32]>) -> String {
+pub fn scene_plan_url(
+    origin: &str,
+    dataset: &str,
+    width: u32,
+    height: u32,
+    orbit_x: i32,
+    orbit_y: i32,
+    zoom: f32,
+    orientation: Option<[f32; 4]>,
+    focus_xyz: Option<[f32; 3]>,
+    levels: Option<&[u32]>,
+) -> String {
     let mut url = format!(
         "{origin}/v1/datasets/{}/portable/plan?width={width}&height={height}&orbitX={orbit_x}&orbitY={orbit_y}&zoom={zoom}",
         encode_path(dataset)
     );
     if let Some(levels) = levels {
         url.push_str("&levels=");
-        url.push_str(&levels.iter().map(u32::to_string).collect::<Vec<_>>().join(","));
+        url.push_str(
+            &levels
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(","),
+        );
     }
     if let Some(quaternion) = orientation {
         url.push_str("&orientation=");
-        url.push_str(&quaternion.iter().map(f32::to_string).collect::<Vec<_>>().join(","));
+        url.push_str(
+            &quaternion
+                .iter()
+                .map(f32::to_string)
+                .collect::<Vec<_>>()
+                .join(","),
+        );
     }
     if let Some(focus) = focus_xyz {
         url.push_str("&focusXyz=");
-        url.push_str(&focus.iter().map(f32::to_string).collect::<Vec<_>>().join(","));
+        url.push_str(
+            &focus
+                .iter()
+                .map(f32::to_string)
+                .collect::<Vec<_>>()
+                .join(","),
+        );
     }
     url
 }
@@ -353,7 +478,9 @@ pub fn normalized_focus_xyz(focus: [f64; 3], shape: [u32; 3]) -> [f32; 3] {
 /// eye and up together, including through a vertical half-turn where a yaw/pitch camera locks.
 pub fn drag_orientation(orientation: [f32; 4], dx: i32, dy: i32) -> [f32; 4] {
     let length = (dx as f32).hypot(dy as f32);
-    if length == 0.0 { return orientation; }
+    if length == 0.0 {
+        return orientation;
+    }
     let half = length * 0.005;
     let sine = half.sin() / length;
     let delta = [-dy as f32 * sine, -dx as f32 * sine, 0.0, half.cos()];
@@ -365,12 +492,20 @@ pub fn drag_orientation(orientation: [f32; 4], dx: i32, dy: i32) -> [f32; 4] {
         aw * bz + ax * by - ay * bx + az * bw,
         aw * bw - ax * bx - ay * by - az * bz,
     ];
-    let reciprocal = 1.0 / next.iter().map(|component| component * component).sum::<f32>().sqrt();
+    let reciprocal = 1.0
+        / next
+            .iter()
+            .map(|component| component * component)
+            .sum::<f32>()
+            .sqrt();
     next.map(|component| component * reciprocal)
 }
 
 pub fn scene_chunks_url(origin: &str, dataset: &str) -> String {
-    format!("{origin}/v1/datasets/{}/portable/chunks", encode_path(dataset))
+    format!(
+        "{origin}/v1/datasets/{}/portable/chunks",
+        encode_path(dataset)
+    )
 }
 
 /// The body of a chunk request, as the server reads it.
@@ -388,7 +523,10 @@ pub fn words_from_le_bytes(bytes: &[u8]) -> Result<Vec<u32>, String> {
     if bytes.len() % 4 != 0 {
         return Err(format!("{} bytes are not whole words", bytes.len()));
     }
-    Ok(bytes.chunks_exact(4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect())
+    Ok(bytes
+        .chunks_exact(4)
+        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .collect())
 }
 
 /// The chunk route's reply: per chunk a word count then the words, in request order.
@@ -399,7 +537,9 @@ pub fn chunks_from_le_bytes(bytes: &[u8], expected: usize) -> Result<Vec<Vec<u32
     while chunks.len() < expected {
         let count = *words.get(at).ok_or("chunk reply ended before its count")? as usize;
         let end = at + 1 + count;
-        let body = words.get(at + 1..end).ok_or("chunk reply ended inside a chunk")?;
+        let body = words
+            .get(at + 1..end)
+            .ok_or("chunk reply ended inside a chunk")?;
         chunks.push(body.to_vec());
         at = end;
     }
@@ -415,7 +555,9 @@ fn encode_path(segment: &str) -> String {
     let mut out = String::with_capacity(segment.len());
     for byte in segment.bytes() {
         match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(byte as char),
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char)
+            }
             other => out.push_str(&format!("%{other:02X}")),
         }
     }
@@ -494,21 +636,47 @@ mod tests {
         })
         .unwrap();
         assert_eq!(orthogonal["view"], "orthogonal");
-        assert_eq!((orthogonal["x"].as_u64(), orthogonal["y"].as_u64(), orthogonal["z"].as_u64()), (Some(1), Some(2), Some(3)));
+        assert_eq!(
+            (
+                orthogonal["x"].as_u64(),
+                orthogonal["y"].as_u64(),
+                orthogonal["z"].as_u64()
+            ),
+            (Some(1), Some(2), Some(3))
+        );
         assert!(orthogonal.get("orbit_x").is_none());
         assert_eq!(orthogonal["sliceZooms"], serde_json::json!([1.0, 2.0, 3.0]));
         let mut volume_with_rotation = volume.clone();
         volume_with_rotation["orientation"] = serde_json::json!([0.0, 0.0, 0.0, 1.0]);
         let request = FrameRequest {
             focus_xyz: None,
-            dataset: "demo".into(), width: 256, height: 192,
-            orbit_x: 0, orbit_y: 0, zoom: 1.0,
-            orientation: Some([0.0, 0.0, 0.0, 1.0]), request_id: 9,
-            view: RenderView::Volume, x: None, y: None, z: None, slice_axis: 2, slice_zooms: None,
+            dataset: "demo".into(),
+            width: 256,
+            height: 192,
+            orbit_x: 0,
+            orbit_y: 0,
+            zoom: 1.0,
+            orientation: Some([0.0, 0.0, 0.0, 1.0]),
+            request_id: 9,
+            view: RenderView::Volume,
+            x: None,
+            y: None,
+            z: None,
+            slice_axis: 2,
+            slice_zooms: None,
         };
-        assert_eq!(serde_json::to_value(&request).unwrap()["orientation"], volume_with_rotation["orientation"]);
-        let focused = FrameRequest { focus_xyz: Some([0.25, 0.5, 0.75]), ..request };
-        assert_eq!(serde_json::to_value(focused).unwrap()["focusXyz"], serde_json::json!([0.25, 0.5, 0.75]));
+        assert_eq!(
+            serde_json::to_value(&request).unwrap()["orientation"],
+            volume_with_rotation["orientation"]
+        );
+        let focused = FrameRequest {
+            focus_xyz: Some([0.25, 0.5, 0.75]),
+            ..request
+        };
+        assert_eq!(
+            serde_json::to_value(focused).unwrap()["focusXyz"],
+            serde_json::json!([0.25, 0.5, 0.75])
+        );
     }
 
     #[test]
@@ -544,48 +712,102 @@ mod tests {
             r#"{"type":"frame","requestId":2,"width":200,"height":150,"mimeType":"image/png","target":{"extent":{"width":200,"height":150},"colorFormat":"rgba8Unorm","colorEncoding":"srgb","depth":"rayDistanceF32"},"progress":"final","renderMs":147.854285,"dataBase64":"iVBORw0K","rayDistancePfmBase64":"UEYK"}"#,
         )
         .unwrap();
-        assert!(matches!(reply, SocketReply::Frame { request_id: 2, ref data_base64, ref ray_distance_pfm_base64, .. } if data_base64 == "iVBORw0K" && ray_distance_pfm_base64.as_deref() == Some("UEYK")));
+        assert!(
+            matches!(reply, SocketReply::Frame { request_id: 2, ref data_base64, ref ray_distance_pfm_base64, .. } if data_base64 == "iVBORw0K" && ray_distance_pfm_base64.as_deref() == Some("UEYK"))
+        );
         let reply: SocketReply = serde_json::from_str(
             r#"{"type":"error","requestId":1,"status":500,"message":"Palace frame rendering failed: array metadata is missing"}"#,
         )
         .unwrap();
-        assert!(matches!(reply, SocketReply::Error { request_id: Some(1), status: 500, .. }));
+        assert!(matches!(
+            reply,
+            SocketReply::Error {
+                request_id: Some(1),
+                status: 500,
+                ..
+            }
+        ));
         let reply: SocketReply = serde_json::from_str(
             r#"{"type":"orthogonal","requestId":4,"width":2,"height":1,"mimeType":"image/png","target":{"extent":{"width":2,"height":1},"colorFormat":"rgba8Unorm","colorEncoding":"srgb","depth":"none"},"progress":"final","renderMs":1.5,"xyBase64":"a","xzBase64":"b","yzBase64":"c","voxelShapeXyz":[128,128,32],"crosshairXyz":[64,64,16]}"#,
         )
         .unwrap();
-        assert!(matches!(reply, SocketReply::Orthogonal { voxel_shape_xyz: [128, 128, 32], crosshair_xyz: [64, 64, 16], .. }));
+        assert!(matches!(
+            reply,
+            SocketReply::Orthogonal {
+                voxel_shape_xyz: [128, 128, 32],
+                crosshair_xyz: [64, 64, 16],
+                ..
+            }
+        ));
         let reply: SocketReply = serde_json::from_str(
             r#"{"type":"channels","requestId":6,"dataset":"demo","layers":[{"layerId":1,"name":"image","visible":true,"channels":[{"sourceIndex":0,"enabled":true,"colorSrgb":[1,2,3],"windowStart":0.0,"windowEnd":1.0,"opacity":1.0}]}]}"#,
         )
         .unwrap();
-        assert!(matches!(reply, SocketReply::Channels { ref layers, .. } if layers[0].channels[0].color_srgb == [1, 2, 3]));
+        assert!(
+            matches!(reply, SocketReply::Channels { ref layers, .. } if layers[0].channels[0].color_srgb == [1, 2, 3])
+        );
         // The old guess, `kind`, is rejected rather than silently matched.
-        assert!(serde_json::from_str::<SocketReply>(r#"{"kind":"error","status":400,"message":"bad"}"#).is_err());
+        assert!(serde_json::from_str::<SocketReply>(
+            r#"{"kind":"error","status":400,"message":"bad"}"#
+        )
+        .is_err());
     }
 
     #[test]
     fn api_origin_defaults_to_the_pages_origin_only_over_http() {
-        assert_eq!(api_origin("http:", "http://host:9876", "").unwrap(), "http://host:9876");
-        assert_eq!(api_origin("https:", "https://host", "  "), Ok("https://host".into()));
+        assert_eq!(
+            api_origin("http:", "http://host:9876", "").unwrap(),
+            "http://host:9876"
+        );
+        assert_eq!(
+            api_origin("https:", "https://host", "  "),
+            Ok("https://host".into())
+        );
         assert!(api_origin("file:", "null", "").is_err());
         assert!(api_origin("tauri:", "tauri://localhost", "").is_err());
-        assert_eq!(api_origin("file:", "null", "http://gpu-box:9876/").unwrap(), "http://gpu-box:9876");
-        assert_eq!(api_origin("http:", "http://a", "https://b/v1/datasets").unwrap(), "https://b");
+        assert_eq!(
+            api_origin("file:", "null", "http://gpu-box:9876/").unwrap(),
+            "http://gpu-box:9876"
+        );
+        assert_eq!(
+            api_origin("http:", "http://a", "https://b/v1/datasets").unwrap(),
+            "https://b"
+        );
         assert!(api_origin("http:", "http://a", "ws://b").is_err());
         assert!(api_origin("http:", "http://a", "b:9876").is_err());
     }
 
     #[test]
     fn urls_follow_the_servers_routes() {
-        assert_eq!(annotation_layers_url("http://h", "demo"), "http://h/v1/datasets/demo/annotations");
-        assert_eq!(annotation_layer_url("http://h", "demo", 4), "http://h/v1/datasets/demo/annotations/4");
-        assert!(annotation_projection_url("http://h", "demo", 20, 10, 1.0, [0.0, 0.0, 0.0, 1.0], Some([0.25, 0.5, 0.75])).ends_with("focusXyz=0.25,0.5,0.75"));
+        assert_eq!(
+            annotation_layers_url("http://h", "demo"),
+            "http://h/v1/datasets/demo/annotations"
+        );
+        assert_eq!(
+            annotation_layer_url("http://h", "demo", 4),
+            "http://h/v1/datasets/demo/annotations/4"
+        );
+        assert!(annotation_projection_url(
+            "http://h",
+            "demo",
+            20,
+            10,
+            1.0,
+            [0.0, 0.0, 0.0, 1.0],
+            Some([0.25, 0.5, 0.75])
+        )
+        .ends_with("focusXyz=0.25,0.5,0.75"));
         assert_eq!(frames_socket_url("http://h:1"), "ws://h:1/v1/frames");
         assert_eq!(frames_socket_url("https://h"), "wss://h/v1/frames");
         assert_eq!(datasets_url("http://h"), "http://h/v1/datasets");
-        assert_eq!(channels_url("http://h", "demo"), "http://h/v1/datasets/demo/channels");
-        assert_eq!(layers_url("http://h", "a/b"), "http://h/v1/datasets/a%2Fb/layers");
+        assert_eq!(
+            channels_url("http://h", "demo"),
+            "http://h/v1/datasets/demo/channels"
+        );
+        assert_eq!(
+            layers_url("http://h", "a/b"),
+            "http://h/v1/datasets/a%2Fb/layers"
+        );
     }
 
     #[test]
@@ -594,20 +816,69 @@ mod tests {
             scene_plan_url("http://h", "d", 4, 3, 1, -2, 1.5, None, None, None),
             "http://h/v1/datasets/d/portable/plan?width=4&height=3&orbitX=1&orbitY=-2&zoom=1.5"
         );
-        assert!(scene_plan_url("http://h", "d", 4, 3, 0, 0, 1.0, None, None, Some(&[2, 1])).ends_with("&levels=2,1"));
-        assert!(scene_plan_url("http://h", "d", 4, 3, 0, 0, 1.0, Some([0.0, 0.0, 0.0, 1.0]), None, None).ends_with("&orientation=0,0,0,1"));
-        assert!(scene_plan_url("http://h", "d", 4, 3, 0, 0, 1.0, None, Some([0.25, 0.5, 0.75]), None).ends_with("&focusXyz=0.25,0.5,0.75"));
-        assert_eq!(normalized_focus_xyz([50.5, 25.5, 7.5], [100, 100, 30]), [0.505, 0.255, 0.25]);
-        assert_eq!(scene_chunks_url("http://h", "d"), "http://h/v1/datasets/d/portable/chunks");
-        let body = serde_json::to_value(SceneChunksRequest { layer_id: 1, level: 2, source_index: 0, chunks: vec![[0, 0, 5]] }).unwrap();
-        assert_eq!(body, serde_json::json!({"layerId":1,"level":2,"sourceIndex":0,"chunks":[[0,0,5]]}));
+        assert!(
+            scene_plan_url("http://h", "d", 4, 3, 0, 0, 1.0, None, None, Some(&[2, 1]))
+                .ends_with("&levels=2,1")
+        );
+        assert!(scene_plan_url(
+            "http://h",
+            "d",
+            4,
+            3,
+            0,
+            0,
+            1.0,
+            Some([0.0, 0.0, 0.0, 1.0]),
+            None,
+            None
+        )
+        .ends_with("&orientation=0,0,0,1"));
+        assert!(scene_plan_url(
+            "http://h",
+            "d",
+            4,
+            3,
+            0,
+            0,
+            1.0,
+            None,
+            Some([0.25, 0.5, 0.75]),
+            None
+        )
+        .ends_with("&focusXyz=0.25,0.5,0.75"));
+        assert_eq!(
+            normalized_focus_xyz([50.5, 25.5, 7.5], [100, 100, 30]),
+            [0.505, 0.255, 0.25]
+        );
+        assert_eq!(
+            scene_chunks_url("http://h", "d"),
+            "http://h/v1/datasets/d/portable/chunks"
+        );
+        assert_eq!(
+            xy_profile_url("http://h", "a b", 3, [1.5, 2.0], [8.0, 9.5], 4.0, &[0, 2]),
+            "http://h/v1/datasets/a%20b/profile/xy?level=3&x0=1.5&y0=2&x1=8&y1=9.5&z=4&channels=0,2"
+        );
+        let body = serde_json::to_value(SceneChunksRequest {
+            layer_id: 1,
+            level: 2,
+            source_index: 0,
+            chunks: vec![[0, 0, 5]],
+        })
+        .unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({"layerId":1,"level":2,"sourceIndex":0,"chunks":[[0,0,5]]})
+        );
         let mut bytes = Vec::new();
         for words in [[2_u32, 7, 9].as_slice(), [1, 4].as_slice()] {
             for w in words {
                 bytes.extend_from_slice(&w.to_le_bytes());
             }
         }
-        assert_eq!(chunks_from_le_bytes(&bytes, 2).unwrap(), vec![vec![7, 9], vec![4]]);
+        assert_eq!(
+            chunks_from_le_bytes(&bytes, 2).unwrap(),
+            vec![vec![7, 9], vec![4]]
+        );
         assert!(chunks_from_le_bytes(&bytes, 3).is_err());
         assert!(chunks_from_le_bytes(&bytes[..7], 1).is_err());
     }
@@ -619,26 +890,44 @@ mod tests {
         let down_then_right = drag_orientation(drag_orientation(identity, 0, 120), 120, 0);
         assert_ne!(right_then_down, down_then_right, "drag order must compose");
         let flipped = drag_orientation(identity, 0, 314);
-        assert!(flipped[0].abs() > 0.99 && flipped[3].abs() < 0.01, "vertical half-turn is admitted");
+        assert!(
+            flipped[0].abs() > 0.99 && flipped[3].abs() < 0.01,
+            "vertical half-turn is admitted"
+        );
         let mut orientation = identity;
         for _ in 0..10_000 {
             orientation = drag_orientation(orientation, 1, 1);
         }
         let norm: f32 = orientation.iter().map(|value| value * value).sum();
-        assert!((norm - 1.0).abs() < 1e-5, "drag rotation must stay unit length");
+        assert!(
+            (norm - 1.0).abs() < 1e-5,
+            "drag rotation must stay unit length"
+        );
     }
 
     #[test]
     fn settings_are_camel_case_and_the_depth_slider_is_logarithmic() {
-        assert_eq!(settings_url("http://h", "d"), "http://h/v1/datasets/d/settings");
-        assert_eq!(serde_json::to_value(SceneSettings { depth_scale: 2.5 }).unwrap(), serde_json::json!({"depthScale": 2.5}));
+        assert_eq!(
+            settings_url("http://h", "d"),
+            "http://h/v1/datasets/d/settings"
+        );
+        assert_eq!(
+            serde_json::to_value(SceneSettings { depth_scale: 2.5 }).unwrap(),
+            serde_json::json!({"depthScale": 2.5})
+        );
         assert!((depth_scale_from_slider(0.0) - 1.0).abs() < 1e-6);
         assert!((depth_scale_from_slider(1.0) - 10.0).abs() < 1e-5);
         assert!((depth_scale_from_slider(-1.0) - 0.1).abs() < 1e-6);
+        assert!((depth_scale_from_slider(-2.0) - 0.05).abs() < 1e-6);
+        assert!((slider_from_depth_scale(0.05) - 0.05_f32.log10()).abs() < 1e-6);
         assert!((slider_from_depth_scale(depth_scale_from_slider(0.3)) - 0.3).abs() < 1e-5);
         assert!((depth_scale_from_slider(2.0) - 100.0).abs() < 1e-4);
         assert_eq!(slider_from_depth_scale(100.0), 2.0);
-        assert_eq!(slider_from_depth_scale(1000.0), 2.0, "clamped into the slider");
+        assert_eq!(
+            slider_from_depth_scale(1000.0),
+            2.0,
+            "clamped into the slider"
+        );
     }
 
     #[test]

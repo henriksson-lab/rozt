@@ -1,5 +1,9 @@
 # Portable renderer handover
 
+The viewer's public name is **ROZT — Rusty OmeZarr Tiles**. The GUI, browser
+title and root README use this name; `newvolim-*` crate and protocol identifiers
+remain internal names and have deliberately not been renamed.
+
 ## 2026-09-19 update — read this first
 
 Every item on the previous "Immediate next action" list is done; the detailed per-item notes
@@ -137,6 +141,10 @@ displaying an old bitmap at a new level's position while its replacement decodes
 elements stay transparent until their PNG `load` event; the transformed viewport fallback
 remains visible below them, and ready tiles replace it progressively. Their dark backing is
 applied only once loaded, preserving correct alpha compositing without a black loading flash.
+The tile layer is double-buffered: the most recent *fully loaded* pyramid level remains below
+the active level until every visible replacement tile loads, then retires. Rapid level changes
+therefore keep the last complete level rather than falling back to the initial low-resolution
+viewport or promoting an incomplete intermediate level.
 For a dataset whose Z extent is one, the page starts in XY and hides Grid, XZ, YZ, 3D,
 renderer, camera reset, Z position, 3D status and volume depth controls. Opening a dataset
 requests its orthogonal metadata first, so a 2D dataset never speculatively queues a volume
@@ -158,6 +166,38 @@ multiple unnamed channels cycle green, magenta, cyan, yellow, red and blue;
 OMERO colors take precedence, then known dye/stain names, and repeated colors
 move to the first unused palette color. Live R1 defaults are DAPI blue, 488 green,
 Cy3 orange and Cy5 magenta.
+The channel panel also carries each layer's OMERO channel `label` through the
+session API and displays it verbatim. Missing or blank labels fall back to the
+human-oriented `Channel 1`, `Channel 2`, and so on. R1 exposes its four metadata
+labels (`DAPI-5060C-ZHE-ZERO`, `LED-FITC-A-ZHE-ZERO`, `LED-TRITC-ZERO`,
+`CY5-4040C`).
+
+**Line profiles:** the XY toolbar has a temporary `Line profile` tool modelled on
+the old viewer. Dragging keeps the measurement line visible and opens a closeable
+raw-intensity plot for every enabled channel, using channel names and colours. The
+server samples the pyramid level currently appropriate for the pane, caps the line
+at 1,024 samples, and reads only crossed chunks through the shared session cache.
+The endpoints, pixel distance and Z selection remain in level-zero voxel coordinates;
+the server also transforms both endpoints through NGFF level-zero metadata and returns
+the physical distance and shared XY unit. Both lengths are printed on the image line and
+in the plot (`64964.4 px · 21113.42 µm` in the live R1 browser check).
+The plot is an absolute overlay above the bottom controls; it does not enter the
+viewer flex layout, so opening it cannot resize a pane or invalidate the image and
+annotation transforms. A live R1 browser check kept both the XY pane rectangle and
+an existing annotation path byte-for-byte unchanged across a profile drag.
+
+The XY tools use compact SVG glyphs with full tooltip names. Rectangle and ellipse are
+filled; freehand region and freehand line share the same contour, with only the region
+filled; the profile glyph is a small ruled line. X remains
+a horizontal slider below the view, Y is a vertical slider at the right edge, and
+neither shows a redundant voxel-number readout; Z keeps its slice-number readout.
+
+**2D and 3D display controls are separate.** Each channel has a compact two-thumb 2D contrast
+range. Its entire track handles pointer capture: dragging follows the selected endpoint and a
+track click moves the nearest endpoint. The resulting windows travel in immutable tile URLs and
+do not mutate the session transfer used by 3D. Volumetric datasets show a second compact 3D
+contrast range. Enabled state, colour and opacity remain shared. The 3D ray-depth control spans
+the full 0.05×–100× logarithmic range on a 240 px track and also accepts a numeric value.
 
 **Depth control:** the 3D scene's logarithmic Depth slider now reaches 100× (session accepts
 0.05×–100×); its prior 10× slider ceiling was too shallow. The slice-axis sliders are separate.

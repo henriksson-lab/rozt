@@ -271,6 +271,7 @@ pub struct LayerChannelSummary {
 #[serde(rename_all = "camelCase")]
 pub struct ChannelSummary {
     pub source_index: usize,
+    pub label: Option<String>,
     pub enabled: bool,
     pub color_srgb: [u8; 3],
     pub window_start: f64,
@@ -740,23 +741,33 @@ impl LocalSession {
             .layers()
             .iter()
             .filter(|layer| layer.kind == newvolim_scene::LayerKind::Image)
-            .map(|layer| LayerChannelSummary {
-                layer_id: layer.id.0,
-                name: layer.name.clone(),
-                visible: layer.visible,
-                channels: layer
-                    .channels
-                    .iter()
-                    .enumerate()
-                    .map(|(source_index, state)| ChannelSummary {
-                        source_index,
-                        enabled: state.enabled,
-                        color_srgb: state.color_srgb,
-                        window_start: state.window.start,
-                        window_end: state.window.end,
-                        opacity: state.opacity,
-                    })
-                    .collect(),
+            .map(|layer| {
+                let metadata = self.layer_dataset(layer.id).ok().map(|(_, metadata)| metadata);
+                LayerChannelSummary {
+                    layer_id: layer.id.0,
+                    name: layer.name.clone(),
+                    visible: layer.visible,
+                    channels: layer
+                        .channels
+                        .iter()
+                        .enumerate()
+                        .map(|(source_index, state)| ChannelSummary {
+                            source_index,
+                            label: metadata
+                                .and_then(|metadata| metadata.omero.as_ref())
+                                .and_then(|omero| omero.channels.get(source_index))
+                                .and_then(|channel| channel.label.as_deref())
+                                .map(str::trim)
+                                .filter(|label| !label.is_empty())
+                                .map(str::to_owned),
+                            enabled: state.enabled,
+                            color_srgb: state.color_srgb,
+                            window_start: state.window.start,
+                            window_end: state.window.end,
+                            opacity: state.opacity,
+                        })
+                        .collect(),
+                }
             })
             .collect()
     }
@@ -1202,6 +1213,25 @@ impl LocalSession {
                 Ok(transform.scale.map(|value| value.abs() as f32))
             })
             .collect()
+    }
+
+    /// Shared physical unit of an image layer's X and Y axes, when both declare the same unit.
+    pub fn portable_layer_xy_unit(&self, layer_id: LayerId) -> Result<Option<String>, SessionError> {
+        let (_, metadata) = self.layer_dataset(layer_id)?;
+        let multiscale = metadata.multiscales.first().ok_or_else(|| {
+            SessionError::LayerSource("dataset has no multiscale metadata".into())
+        })?;
+        let unit = |name: &str| {
+            multiscale
+                .axes
+                .iter()
+                .find(|axis| axis.name.eq_ignore_ascii_case(name))
+                .and_then(|axis| axis.unit.as_deref())
+        };
+        Ok(match (unit("x"), unit("y")) {
+            (Some(x), Some(y)) if x.eq_ignore_ascii_case(y) => Some(x.to_owned()),
+            _ => None,
+        })
     }
 
     /// Native portable-renderer admission: descriptors and local source bindings are derived
@@ -3194,7 +3224,7 @@ mod tests {
         std::fs::write(root.join(".zgroup"), r#"{"zarr_format":2}"#).unwrap();
         std::fs::write(
             root.join(".zattrs"),
-            r#"{"multiscales":[{"axes":[{"name":"c","type":"channel"},{"name":"z","type":"space","unit":"micrometer"},{"name":"y","type":"space","unit":"micrometer"},{"name":"x","type":"space","unit":"micrometer"}],"datasets":[{"path":"0","coordinateTransformations":[{"type":"scale","scale":[1.0,0.5,0.36,0.36]}]}],"version":"0.4"}],"omero":{"channels":[{"active":true,"color":"0000FF","window":{"start":0,"end":1500,"min":0,"max":65535}},{"active":true,"color":"FFFF00","window":{"start":0,"end":1500,"min":0,"max":65535}}]}}"#,
+            r#"{"multiscales":[{"axes":[{"name":"c","type":"channel"},{"name":"z","type":"space","unit":"micrometer"},{"name":"y","type":"space","unit":"micrometer"},{"name":"x","type":"space","unit":"micrometer"}],"datasets":[{"path":"0","coordinateTransformations":[{"type":"scale","scale":[1.0,0.5,0.36,0.36]}]}],"version":"0.4"}],"omero":{"channels":[{"active":true,"color":"0000FF","label":"DAPI","window":{"start":0,"end":1500,"min":0,"max":65535}},{"active":true,"color":"FFFF00","label":"FITC","window":{"start":0,"end":1500,"min":0,"max":65535}}]}}"#,
         )
         .unwrap();
         // The `.zarray` is the IDR one, key for key. `zarrs` writes the chunks; its own
@@ -3219,6 +3249,31 @@ mod tests {
         let mut session = LocalSession::default();
         session.open_local_omezarr(&root).unwrap();
         session.prepare_default_portable_image_layer().unwrap();
+        assert_eq!(
+            session.layer_channels()[0]
+                .channels
+                .iter()
+                .map(|channel| channel.label.as_deref())
+                .collect::<Vec<_>>(),
+            [Some("DAPI"), Some("FITC")]
+        );
+        let profile = crate::routes::portable_xy_line_profile(
+            &session,
+            0,
+            [0.0, 2.0],
+            [6.0, 2.0],
+            1.0,
+            &[0, 1],
+            1024,
+        )
+        .unwrap();
+        assert_eq!(profile.samples.len(), 7);
+        assert_eq!(profile.samples.last().unwrap().distance, 6.0);
+        assert_eq!(profile.pixel_length, 6.0);
+        assert_eq!(profile.physical_length, Some(2.16));
+        assert_eq!(profile.physical_unit.as_deref(), Some("micrometer"));
+        assert_eq!(profile.channels[0].values, vec![120.0, 121.0, 122.0, 123.0, 124.0, 125.0, 126.0]);
+        assert_eq!(profile.channels[1].values, vec![1120.0, 1121.0, 1122.0, 1123.0, 1124.0, 1125.0, 1126.0]);
         let limits = LayerRenderLimits::new(4, 4);
         let chunks = [[0_u64, 0, 0], [0, 0, 1], [0, 0, 2]];
         let plans = session

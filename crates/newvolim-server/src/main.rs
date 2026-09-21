@@ -16,7 +16,9 @@ use std::{
 };
 
 mod annotation_store;
-use annotation_store::{AnnotationLayer, AnnotationSaveReport, AnnotationStore, RoiSaveReport, RoiTableSummary};
+use annotation_store::{
+    AnnotationLayer, AnnotationSaveReport, AnnotationStore, RoiSaveReport, RoiTableSummary,
+};
 
 use axum::{
     extract::{
@@ -31,10 +33,14 @@ use axum::{
 use base64::{engine::general_purpose::STANDARD, Engine};
 use clap::Parser;
 use newvolim_io::{read_array_info, read_dataset_metadata, LocalSourcePolicy};
+#[cfg(test)]
+use newvolim_portable::routes::scene_route_frame;
 use newvolim_portable::{
     routes::{
-        composite_palace_scene_annotations, demand_scene_plan, demand_scene_plan_only, full_level_scene_inputs_fitting, layer_chunk_words,
-        portable_orthogonal_slice_pngs_for_view, portable_xy_tile_png, scene_route_frame_for_display, ChannelStateInput, NativePortableDrawRequest, RouteRenderer,
+        composite_palace_scene_annotations, demand_scene_plan, demand_scene_plan_only,
+        full_level_scene_inputs_fitting, layer_chunk_words,
+        portable_orthogonal_slice_pngs_for_view, portable_xy_line_profile, portable_xy_tile_png,
+        scene_route_frame_for_display, ChannelStateInput, NativePortableDrawRequest, RouteRenderer,
     },
     session::{LayerChannelSummary, LocalSession},
 };
@@ -45,8 +51,6 @@ use palace_frame::{
     FrameSize,
 };
 use serde::{Deserialize, Serialize};
-#[cfg(test)]
-use newvolim_portable::routes::scene_route_frame;
 use tokio::sync::{mpsc, oneshot};
 use tower_http::{cors::CorsLayer, services::ServeDir};
 
@@ -160,7 +164,12 @@ impl SessionStore {
 
     /// Apply one channel edit to the dataset's session and return every layer's channels.
     /// Set the dataset session's see-through depth scale; returns the settings as stored.
-    fn set_depth_scale(&self, dataset: &str, root: &Path, scale: f32) -> Result<SceneSettings, String> {
+    fn set_depth_scale(
+        &self,
+        dataset: &str,
+        root: &Path,
+        scale: f32,
+    ) -> Result<SceneSettings, String> {
         self.session_for(dataset, root)?;
         let mut sessions = self
             .sessions
@@ -169,8 +178,12 @@ impl SessionStore {
         let session = sessions
             .get_mut(dataset)
             .ok_or_else(|| "session vanished while setting the depth scale".to_owned())?;
-        session.set_depth_scale(scale).map_err(|error| error.to_string())?;
-        Ok(SceneSettings { depth_scale: session.depth_scale() })
+        session
+            .set_depth_scale(scale)
+            .map_err(|error| error.to_string())?;
+        Ok(SceneSettings {
+            depth_scale: session.depth_scale(),
+        })
     }
 
     fn set_channel_state(
@@ -190,7 +203,11 @@ impl SessionStore {
             .get_mut(dataset)
             .ok_or_else(|| "portable session vanished while editing".to_owned())?;
         session
-            .set_channel_state(newvolim_scene::LayerId(layer_id), channel, state.into_state()?)
+            .set_channel_state(
+                newvolim_scene::LayerId(layer_id),
+                channel,
+                state.into_state()?,
+            )
             .map_err(|error| error.to_string())?;
         Ok(session.layer_channels())
     }
@@ -262,8 +279,9 @@ fn render_volume_frame(
             Err(portable_error) => {
                 // Vulkan is the last resort; when it fails too, the portable route's reason is
                 // the one worth reading.
-                let attachments = render_local_zarr_with_camera_attachments(root, size, controls)
-                    .map_err(|error| format!("{error} (portable route: {portable_error})"))?;
+                let attachments =
+                    render_local_zarr_with_camera_attachments(root, size, controls)
+                        .map_err(|error| format!("{error} (portable route: {portable_error})"))?;
                 let (png, pfm) = palace_png::encode_attachments(&attachments).into_parts();
                 return Ok((png, pfm, "vulkan"));
             }
@@ -482,32 +500,102 @@ fn app_router(
             get(dataset_xy_tile),
         )
         .route(
+            "/v1/datasets/{dataset}/profile/xy",
+            get(dataset_xy_profile),
+        )
+        .route(
             "/v1/datasets/{dataset}/channels",
             get(dataset_channels).post(set_dataset_channel),
         )
         .route("/v1/datasets/{dataset}/layers", post(add_dataset_layer))
-        .route("/v1/datasets/{dataset}/annotations", get(annotation_layers).post(create_annotation_layer))
-        .route("/v1/datasets/{dataset}/annotations/projection", get(annotation_projection))
-        .route("/v1/datasets/{dataset}/annotations/roi-tables", get(annotation_roi_tables))
-        .route("/v1/datasets/{dataset}/annotations/roi-tables/{name}", post(import_annotation_roi))
-        .route("/v1/datasets/{dataset}/annotations/{layer}", get(annotation_layer).post(add_annotation).delete(delete_annotation_layer).layer(DefaultBodyLimit::max(annotation_store::MAX_ANNOTATION_BYTES)))
-        .route("/v1/datasets/{dataset}/annotations/{layer}/geojson", get(export_annotation_geojson).put(import_annotation_geojson).layer(DefaultBodyLimit::max(annotation_store::MAX_ANNOTATION_BYTES)))
-        .route("/v1/datasets/{dataset}/annotations/{layer}/state", put(replace_annotation_state).layer(DefaultBodyLimit::max(annotation_store::MAX_ANNOTATION_BYTES)))
-        .route("/v1/datasets/{dataset}/annotations/{layer}/visibility", put(set_annotation_visibility))
-        .route("/v1/datasets/{dataset}/annotations/{layer}/save", post(save_annotation_layer))
-        .route("/v1/datasets/{dataset}/annotations/{layer}/save-to", post(save_annotation_to))
-        .route("/v1/datasets/{dataset}/annotations/{layer}/save-roi", post(save_annotation_roi))
-        .route("/v1/datasets/{dataset}/annotations/{layer}/renest", post(renest_annotation_layer))
-        .route("/v1/datasets/{dataset}/annotations/{layer}/{id}", put(update_annotation).delete(delete_annotation).layer(DefaultBodyLimit::max(annotation_store::MAX_ANNOTATION_BYTES)))
-        .route("/v1/datasets/{dataset}/annotations/{layer}/{id}/detach", post(detach_annotation))
+        .route(
+            "/v1/datasets/{dataset}/annotations",
+            get(annotation_layers).post(create_annotation_layer),
+        )
+        .route(
+            "/v1/datasets/{dataset}/annotations/projection",
+            get(annotation_projection),
+        )
+        .route(
+            "/v1/datasets/{dataset}/annotations/roi-tables",
+            get(annotation_roi_tables),
+        )
+        .route(
+            "/v1/datasets/{dataset}/annotations/roi-tables/{name}",
+            post(import_annotation_roi),
+        )
+        .route(
+            "/v1/datasets/{dataset}/annotations/{layer}",
+            get(annotation_layer)
+                .post(add_annotation)
+                .delete(delete_annotation_layer)
+                .layer(DefaultBodyLimit::max(
+                    annotation_store::MAX_ANNOTATION_BYTES,
+                )),
+        )
+        .route(
+            "/v1/datasets/{dataset}/annotations/{layer}/geojson",
+            get(export_annotation_geojson)
+                .put(import_annotation_geojson)
+                .layer(DefaultBodyLimit::max(
+                    annotation_store::MAX_ANNOTATION_BYTES,
+                )),
+        )
+        .route(
+            "/v1/datasets/{dataset}/annotations/{layer}/state",
+            put(replace_annotation_state).layer(DefaultBodyLimit::max(
+                annotation_store::MAX_ANNOTATION_BYTES,
+            )),
+        )
+        .route(
+            "/v1/datasets/{dataset}/annotations/{layer}/visibility",
+            put(set_annotation_visibility),
+        )
+        .route(
+            "/v1/datasets/{dataset}/annotations/{layer}/save",
+            post(save_annotation_layer),
+        )
+        .route(
+            "/v1/datasets/{dataset}/annotations/{layer}/save-to",
+            post(save_annotation_to),
+        )
+        .route(
+            "/v1/datasets/{dataset}/annotations/{layer}/save-roi",
+            post(save_annotation_roi),
+        )
+        .route(
+            "/v1/datasets/{dataset}/annotations/{layer}/renest",
+            post(renest_annotation_layer),
+        )
+        .route(
+            "/v1/datasets/{dataset}/annotations/{layer}/{id}",
+            put(update_annotation)
+                .delete(delete_annotation)
+                .layer(DefaultBodyLimit::max(
+                    annotation_store::MAX_ANNOTATION_BYTES,
+                )),
+        )
+        .route(
+            "/v1/datasets/{dataset}/annotations/{layer}/{id}/detach",
+            post(detach_annotation),
+        )
         .route(
             "/v1/datasets/{dataset}/settings",
             get(dataset_settings).post(set_dataset_settings),
         )
         .route("/v1/datasets/{dataset}/portable/scene", get(browser_scene))
-        .route("/v1/datasets/{dataset}/portable/plan", get(browser_scene_plan))
-        .route("/v1/datasets/{dataset}/portable/rays", get(browser_scene_rays))
-        .route("/v1/datasets/{dataset}/portable/chunks", post(browser_scene_chunks))
+        .route(
+            "/v1/datasets/{dataset}/portable/plan",
+            get(browser_scene_plan),
+        )
+        .route(
+            "/v1/datasets/{dataset}/portable/rays",
+            get(browser_scene_rays),
+        )
+        .route(
+            "/v1/datasets/{dataset}/portable/chunks",
+            post(browser_scene_chunks),
+        )
         .with_state(state)
         .layer(CorsLayer::new().allow_origin(cors_origins));
     match page_dir {
@@ -524,130 +612,301 @@ fn annotation_dataset(state: &AppState, dataset: &str) -> Result<PathBuf, ApiErr
 }
 
 #[derive(Deserialize)]
-struct NewAnnotationLayer { name: String }
-
-async fn annotation_layers(State(state): State<AppState>, AxumPath(dataset): AxumPath<String>) -> Result<Json<Vec<AnnotationLayer>>, ApiError> {
-    let root = annotation_dataset(&state, &dataset)?;
-    state.annotations.layers(&dataset, &root).map(Json).map_err(|message| (StatusCode::BAD_REQUEST, message))
+struct NewAnnotationLayer {
+    name: String,
 }
 
-async fn create_annotation_layer(State(state): State<AppState>, AxumPath(dataset): AxumPath<String>, Json(body): Json<NewAnnotationLayer>) -> Result<Json<AnnotationLayer>, ApiError> {
+async fn annotation_layers(
+    State(state): State<AppState>,
+    AxumPath(dataset): AxumPath<String>,
+) -> Result<Json<Vec<AnnotationLayer>>, ApiError> {
     let root = annotation_dataset(&state, &dataset)?;
-    state.annotations.create(&dataset, &root, body.name).map(Json).map_err(|message| (StatusCode::BAD_REQUEST, message))
+    state
+        .annotations
+        .layers(&dataset, &root)
+        .map(Json)
+        .map_err(|message| (StatusCode::BAD_REQUEST, message))
 }
 
-async fn annotation_layer(State(state): State<AppState>, AxumPath((dataset, layer)): AxumPath<(String, u64)>) -> Result<Json<AnnotationLayer>, ApiError> {
+async fn create_annotation_layer(
+    State(state): State<AppState>,
+    AxumPath(dataset): AxumPath<String>,
+    Json(body): Json<NewAnnotationLayer>,
+) -> Result<Json<AnnotationLayer>, ApiError> {
     let root = annotation_dataset(&state, &dataset)?;
-    state.annotations.edit(&dataset, &root, layer, |item| Ok(item.clone())).map(Json).map_err(|message| (StatusCode::NOT_FOUND, message))
+    state
+        .annotations
+        .create(&dataset, &root, body.name)
+        .map(Json)
+        .map_err(|message| (StatusCode::BAD_REQUEST, message))
 }
 
-async fn delete_annotation_layer(State(state): State<AppState>, AxumPath((dataset, layer)): AxumPath<(String, u64)>) -> Result<StatusCode, ApiError> {
+async fn annotation_layer(
+    State(state): State<AppState>,
+    AxumPath((dataset, layer)): AxumPath<(String, u64)>,
+) -> Result<Json<AnnotationLayer>, ApiError> {
     let root = annotation_dataset(&state, &dataset)?;
-    state.annotations.remove_layer(&dataset, &root, layer)
-        .map(|()| StatusCode::NO_CONTENT).map_err(|message| (StatusCode::NOT_FOUND, message))
+    state
+        .annotations
+        .edit(&dataset, &root, layer, |item| Ok(item.clone()))
+        .map(Json)
+        .map_err(|message| (StatusCode::NOT_FOUND, message))
 }
 
-#[derive(Deserialize)]
-struct AnnotationVisibility { visible: bool }
-
-async fn set_annotation_visibility(State(state): State<AppState>, AxumPath((dataset, layer)): AxumPath<(String, u64)>, Json(body): Json<AnnotationVisibility>) -> Result<Json<AnnotationLayer>, ApiError> {
+async fn delete_annotation_layer(
+    State(state): State<AppState>,
+    AxumPath((dataset, layer)): AxumPath<(String, u64)>,
+) -> Result<StatusCode, ApiError> {
     let root = annotation_dataset(&state, &dataset)?;
-    state.annotations.edit(&dataset, &root, layer, |item| { item.visible = body.visible; Ok(item.clone()) })
-        .map(Json).map_err(|message| (StatusCode::BAD_REQUEST, message))
-}
-
-async fn add_annotation(State(state): State<AppState>, AxumPath((dataset, layer)): AxumPath<(String, u64)>, Json(body): Json<QuPathAnnotation>) -> Result<Json<QuPathAnnotation>, ApiError> {
-    let root = annotation_dataset(&state, &dataset)?;
-    state.annotations.edit(&dataset, &root, layer, |item| item.add(body)).map(Json).map_err(|message| (StatusCode::BAD_REQUEST, message))
-}
-
-async fn update_annotation(State(state): State<AppState>, AxumPath((dataset, layer, id)): AxumPath<(String, u64, u64)>, Json(body): Json<QuPathAnnotation>) -> Result<Json<QuPathAnnotation>, ApiError> {
-    let root = annotation_dataset(&state, &dataset)?;
-    state.annotations.edit(&dataset, &root, layer, |item| item.update(id, body)).map(Json).map_err(|message| (StatusCode::BAD_REQUEST, message))
-}
-
-async fn delete_annotation(State(state): State<AppState>, AxumPath((dataset, layer, id)): AxumPath<(String, u64, u64)>) -> Result<StatusCode, ApiError> {
-    let root = annotation_dataset(&state, &dataset)?;
-    state.annotations.edit(&dataset, &root, layer, |item| item.remove(id)).map(|()| StatusCode::NO_CONTENT).map_err(|message| (StatusCode::BAD_REQUEST, message))
-}
-
-async fn detach_annotation(State(state): State<AppState>, AxumPath((dataset, layer, id)): AxumPath<(String, u64, u64)>) -> Result<StatusCode, ApiError> {
-    let root = annotation_dataset(&state, &dataset)?;
-    state.annotations.edit(&dataset, &root, layer, |item| item.detach(id)).map(|()| StatusCode::NO_CONTENT).map_err(|message| (StatusCode::BAD_REQUEST, message))
-}
-
-async fn renest_annotation_layer(State(state): State<AppState>, AxumPath((dataset, layer)): AxumPath<(String, u64)>) -> Result<StatusCode, ApiError> {
-    let root = annotation_dataset(&state, &dataset)?;
-    state.annotations.edit(&dataset, &root, layer, |item| { item.renest(); Ok(()) }).map(|()| StatusCode::NO_CONTENT).map_err(|message| (StatusCode::BAD_REQUEST, message))
-}
-
-async fn save_annotation_layer(State(state): State<AppState>, AxumPath((dataset, layer)): AxumPath<(String, u64)>) -> Result<Json<String>, ApiError> {
-    let root = annotation_dataset(&state, &dataset)?;
-    state.annotations.save(&dataset, &root, layer).map(Json).map_err(|message| (StatusCode::BAD_REQUEST, message))
+    state
+        .annotations
+        .remove_layer(&dataset, &root, layer)
+        .map(|()| StatusCode::NO_CONTENT)
+        .map_err(|message| (StatusCode::NOT_FOUND, message))
 }
 
 #[derive(Deserialize)]
-struct AnnotationSaveTarget { target: String }
-
-async fn save_annotation_to(State(state): State<AppState>, AxumPath((dataset, layer)): AxumPath<(String, u64)>, Json(body): Json<AnnotationSaveTarget>) -> Result<Json<AnnotationSaveReport>, ApiError> {
-    let root = annotation_dataset(&state, &dataset)?;
-    let session = state.sessions.session_for(&dataset, &root).map_err(|message| (StatusCode::BAD_REQUEST, message))?;
-    state.annotations.save_to(&dataset, &root, layer, &session, &body.target)
-        .map(Json).map_err(|message| (StatusCode::BAD_REQUEST, message))
+struct AnnotationVisibility {
+    visible: bool,
 }
 
-async fn save_annotation_roi(State(state): State<AppState>, AxumPath((dataset, layer)): AxumPath<(String, u64)>) -> Result<Json<RoiSaveReport>, ApiError> {
+async fn set_annotation_visibility(
+    State(state): State<AppState>,
+    AxumPath((dataset, layer)): AxumPath<(String, u64)>,
+    Json(body): Json<AnnotationVisibility>,
+) -> Result<Json<AnnotationLayer>, ApiError> {
     let root = annotation_dataset(&state, &dataset)?;
-    let session = state.sessions.session_for(&dataset, &root).map_err(|message| (StatusCode::BAD_REQUEST, message))?;
-    state.annotations.save_roi_csv(&dataset, &root, layer, &session).map(Json).map_err(|message| (StatusCode::BAD_REQUEST, message))
+    state
+        .annotations
+        .edit(&dataset, &root, layer, |item| {
+            item.visible = body.visible;
+            Ok(item.clone())
+        })
+        .map(Json)
+        .map_err(|message| (StatusCode::BAD_REQUEST, message))
 }
 
-async fn annotation_roi_tables(State(state): State<AppState>, AxumPath(dataset): AxumPath<String>) -> Result<Json<Vec<RoiTableSummary>>, ApiError> {
+async fn add_annotation(
+    State(state): State<AppState>,
+    AxumPath((dataset, layer)): AxumPath<(String, u64)>,
+    Json(body): Json<QuPathAnnotation>,
+) -> Result<Json<QuPathAnnotation>, ApiError> {
     let root = annotation_dataset(&state, &dataset)?;
-    AnnotationStore::roi_tables(&root).map(Json).map_err(|message| (StatusCode::BAD_REQUEST, message))
+    state
+        .annotations
+        .edit(&dataset, &root, layer, |item| item.add(body))
+        .map(Json)
+        .map_err(|message| (StatusCode::BAD_REQUEST, message))
 }
 
-async fn import_annotation_roi(State(state): State<AppState>, AxumPath((dataset, name)): AxumPath<(String, String)>) -> Result<Json<AnnotationLayer>, ApiError> {
+async fn update_annotation(
+    State(state): State<AppState>,
+    AxumPath((dataset, layer, id)): AxumPath<(String, u64, u64)>,
+    Json(body): Json<QuPathAnnotation>,
+) -> Result<Json<QuPathAnnotation>, ApiError> {
     let root = annotation_dataset(&state, &dataset)?;
-    let session = state.sessions.session_for(&dataset, &root).map_err(|message| (StatusCode::BAD_REQUEST, message))?;
-    state.annotations.import_roi_table(&dataset, &root, &session, &name).map(Json).map_err(|message| (StatusCode::BAD_REQUEST, message))
+    state
+        .annotations
+        .edit(&dataset, &root, layer, |item| item.update(id, body))
+        .map(Json)
+        .map_err(|message| (StatusCode::BAD_REQUEST, message))
 }
 
-async fn export_annotation_geojson(State(state): State<AppState>, AxumPath((dataset, layer)): AxumPath<(String, u64)>) -> Result<([(axum::http::HeaderName, &'static str); 1], Vec<u8>), ApiError> {
+async fn delete_annotation(
+    State(state): State<AppState>,
+    AxumPath((dataset, layer, id)): AxumPath<(String, u64, u64)>,
+) -> Result<StatusCode, ApiError> {
     let root = annotation_dataset(&state, &dataset)?;
-    let bytes = state.annotations.edit(&dataset, &root, layer, |item| qupath_geojson::write(&item.annotations).map_err(|error| error.to_string()))
+    state
+        .annotations
+        .edit(&dataset, &root, layer, |item| item.remove(id))
+        .map(|()| StatusCode::NO_CONTENT)
+        .map_err(|message| (StatusCode::BAD_REQUEST, message))
+}
+
+async fn detach_annotation(
+    State(state): State<AppState>,
+    AxumPath((dataset, layer, id)): AxumPath<(String, u64, u64)>,
+) -> Result<StatusCode, ApiError> {
+    let root = annotation_dataset(&state, &dataset)?;
+    state
+        .annotations
+        .edit(&dataset, &root, layer, |item| item.detach(id))
+        .map(|()| StatusCode::NO_CONTENT)
+        .map_err(|message| (StatusCode::BAD_REQUEST, message))
+}
+
+async fn renest_annotation_layer(
+    State(state): State<AppState>,
+    AxumPath((dataset, layer)): AxumPath<(String, u64)>,
+) -> Result<StatusCode, ApiError> {
+    let root = annotation_dataset(&state, &dataset)?;
+    state
+        .annotations
+        .edit(&dataset, &root, layer, |item| {
+            item.renest();
+            Ok(())
+        })
+        .map(|()| StatusCode::NO_CONTENT)
+        .map_err(|message| (StatusCode::BAD_REQUEST, message))
+}
+
+async fn save_annotation_layer(
+    State(state): State<AppState>,
+    AxumPath((dataset, layer)): AxumPath<(String, u64)>,
+) -> Result<Json<String>, ApiError> {
+    let root = annotation_dataset(&state, &dataset)?;
+    state
+        .annotations
+        .save(&dataset, &root, layer)
+        .map(Json)
+        .map_err(|message| (StatusCode::BAD_REQUEST, message))
+}
+
+#[derive(Deserialize)]
+struct AnnotationSaveTarget {
+    target: String,
+}
+
+async fn save_annotation_to(
+    State(state): State<AppState>,
+    AxumPath((dataset, layer)): AxumPath<(String, u64)>,
+    Json(body): Json<AnnotationSaveTarget>,
+) -> Result<Json<AnnotationSaveReport>, ApiError> {
+    let root = annotation_dataset(&state, &dataset)?;
+    let session = state
+        .sessions
+        .session_for(&dataset, &root)
+        .map_err(|message| (StatusCode::BAD_REQUEST, message))?;
+    state
+        .annotations
+        .save_to(&dataset, &root, layer, &session, &body.target)
+        .map(Json)
+        .map_err(|message| (StatusCode::BAD_REQUEST, message))
+}
+
+async fn save_annotation_roi(
+    State(state): State<AppState>,
+    AxumPath((dataset, layer)): AxumPath<(String, u64)>,
+) -> Result<Json<RoiSaveReport>, ApiError> {
+    let root = annotation_dataset(&state, &dataset)?;
+    let session = state
+        .sessions
+        .session_for(&dataset, &root)
+        .map_err(|message| (StatusCode::BAD_REQUEST, message))?;
+    state
+        .annotations
+        .save_roi_csv(&dataset, &root, layer, &session)
+        .map(Json)
+        .map_err(|message| (StatusCode::BAD_REQUEST, message))
+}
+
+async fn annotation_roi_tables(
+    State(state): State<AppState>,
+    AxumPath(dataset): AxumPath<String>,
+) -> Result<Json<Vec<RoiTableSummary>>, ApiError> {
+    let root = annotation_dataset(&state, &dataset)?;
+    AnnotationStore::roi_tables(&root)
+        .map(Json)
+        .map_err(|message| (StatusCode::BAD_REQUEST, message))
+}
+
+async fn import_annotation_roi(
+    State(state): State<AppState>,
+    AxumPath((dataset, name)): AxumPath<(String, String)>,
+) -> Result<Json<AnnotationLayer>, ApiError> {
+    let root = annotation_dataset(&state, &dataset)?;
+    let session = state
+        .sessions
+        .session_for(&dataset, &root)
+        .map_err(|message| (StatusCode::BAD_REQUEST, message))?;
+    state
+        .annotations
+        .import_roi_table(&dataset, &root, &session, &name)
+        .map(Json)
+        .map_err(|message| (StatusCode::BAD_REQUEST, message))
+}
+
+async fn export_annotation_geojson(
+    State(state): State<AppState>,
+    AxumPath((dataset, layer)): AxumPath<(String, u64)>,
+) -> Result<([(axum::http::HeaderName, &'static str); 1], Vec<u8>), ApiError> {
+    let root = annotation_dataset(&state, &dataset)?;
+    let bytes = state
+        .annotations
+        .edit(&dataset, &root, layer, |item| {
+            qupath_geojson::write(&item.annotations).map_err(|error| error.to_string())
+        })
         .map_err(|message| (StatusCode::BAD_REQUEST, message))?;
     Ok(([(header::CONTENT_TYPE, "application/geo+json")], bytes))
 }
 
-async fn import_annotation_geojson(State(state): State<AppState>, AxumPath((dataset, layer)): AxumPath<(String, u64)>, body: axum::body::Bytes) -> Result<Json<AnnotationLayer>, ApiError> {
+async fn import_annotation_geojson(
+    State(state): State<AppState>,
+    AxumPath((dataset, layer)): AxumPath<(String, u64)>,
+    body: axum::body::Bytes,
+) -> Result<Json<AnnotationLayer>, ApiError> {
     let root = annotation_dataset(&state, &dataset)?;
-    state.annotations.replace_from_geojson(&dataset, &root, layer, &body).map(Json).map_err(|message| (StatusCode::BAD_REQUEST, message))
+    state
+        .annotations
+        .replace_from_geojson(&dataset, &root, layer, &body)
+        .map(Json)
+        .map_err(|message| (StatusCode::BAD_REQUEST, message))
 }
 
-async fn replace_annotation_state(State(state): State<AppState>, AxumPath((dataset, layer)): AxumPath<(String, u64)>, Json(items): Json<Vec<QuPathAnnotation>>) -> Result<Json<AnnotationLayer>, ApiError> {
+async fn replace_annotation_state(
+    State(state): State<AppState>,
+    AxumPath((dataset, layer)): AxumPath<(String, u64)>,
+    Json(items): Json<Vec<QuPathAnnotation>>,
+) -> Result<Json<AnnotationLayer>, ApiError> {
     let root = annotation_dataset(&state, &dataset)?;
-    state.annotations.edit(&dataset, &root, layer, |current| { current.replace_items(items)?; Ok(current.clone()) })
-        .map(Json).map_err(|message| (StatusCode::BAD_REQUEST, message))
+    state
+        .annotations
+        .edit(&dataset, &root, layer, |current| {
+            current.replace_items(items)?;
+            Ok(current.clone())
+        })
+        .map(Json)
+        .map_err(|message| (StatusCode::BAD_REQUEST, message))
 }
 
 async fn annotation_projection(
-    State(state): State<AppState>, AxumPath(dataset): AxumPath<String>, Query(query): Query<SceneQuery>,
+    State(state): State<AppState>,
+    AxumPath(dataset): AxumPath<String>,
+    Query(query): Query<SceneQuery>,
 ) -> Result<Json<Vec<u32>>, ApiError> {
     let root = annotation_dataset(&state, &dataset)?;
-    validate_render_extent(query.width, query.height, RenderView::Volume).map_err(|message| (StatusCode::BAD_REQUEST, message))?;
-    let size = FrameSize::new(query.width, query.height).map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
+    validate_render_extent(query.width, query.height, RenderView::Volume)
+        .map_err(|message| (StatusCode::BAD_REQUEST, message))?;
+    let size = FrameSize::new(query.width, query.height)
+        .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
     let controls = CameraControls {
-        orbit_delta: [query.orbit_x, query.orbit_y], zoom: query.zoom,
+        orbit_delta: [query.orbit_x, query.orbit_y],
+        zoom: query.zoom,
         orientation: parse_orientation_query(query.orientation.as_deref())?,
         focus_xyz: parse_focus_query(query.focus_xyz.as_deref())?,
-    }.validate().map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
-    let mut session = state.sessions.session_for(&dataset, &root).map_err(|message| (StatusCode::BAD_REQUEST, message))?;
-    let layers = state.annotations.layers(&dataset, &root).map_err(|message| (StatusCode::BAD_REQUEST, message))?;
-    let visible = layers.iter().filter(|layer| layer.visible).flat_map(|layer| layer.annotations.iter().cloned()).collect::<Vec<_>>();
-    session.set_qupath_annotations(&visible).map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
+    }
+    .validate()
+    .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
+    let mut session = state
+        .sessions
+        .session_for(&dataset, &root)
+        .map_err(|message| (StatusCode::BAD_REQUEST, message))?;
+    let layers = state
+        .annotations
+        .layers(&dataset, &root)
+        .map_err(|message| (StatusCode::BAD_REQUEST, message))?;
+    let visible = layers
+        .iter()
+        .filter(|layer| layer.visible)
+        .flat_map(|layer| layer.annotations.iter().cloned())
+        .collect::<Vec<_>>();
+    session
+        .set_qupath_annotations(&visible)
+        .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
     newvolim_portable::routes::project_session_annotation_words(&session, &root, size, controls)
-        .map(Json).map_err(|message| (StatusCode::BAD_REQUEST, message))
+        .map(Json)
+        .map_err(|message| (StatusCode::BAD_REQUEST, message))
 }
 
 /// One channel edit for a dataset's portable session, over HTTP or the frame socket.
@@ -697,7 +956,12 @@ async fn dataset_channels(
     let root = resolve_frame_dataset(&state.datasets, &dataset)?;
     let session = tokio::task::spawn_blocking(move || state.sessions.session_for(&dataset, &root))
         .await
-        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "session task failed".to_owned()))?
+        .map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "session task failed".to_owned(),
+            )
+        })?
         .map_err(|message| (StatusCode::BAD_REQUEST, message))?;
     Ok(Json(session.layer_channels()))
 }
@@ -717,9 +981,16 @@ async fn dataset_settings(
     let root = resolve_frame_dataset(&state.datasets, &dataset)?;
     let session = tokio::task::spawn_blocking(move || state.sessions.session_for(&dataset, &root))
         .await
-        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "session task failed".to_owned()))?
+        .map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "session task failed".to_owned(),
+            )
+        })?
         .map_err(|message| (StatusCode::BAD_REQUEST, message))?;
-    Ok(Json(SceneSettings { depth_scale: session.depth_scale() }))
+    Ok(Json(SceneSettings {
+        depth_scale: session.depth_scale(),
+    }))
 }
 
 async fn set_dataset_settings(
@@ -729,11 +1000,18 @@ async fn set_dataset_settings(
 ) -> Result<Json<SceneSettings>, (StatusCode, String)> {
     let root = resolve_frame_dataset(&state.datasets, &dataset)?;
     let sessions = state.sessions.clone();
-    tokio::task::spawn_blocking(move || sessions.set_depth_scale(&dataset, &root, settings.depth_scale))
-        .await
-        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "settings task failed".to_owned()))?
-        .map_err(|message| (StatusCode::BAD_REQUEST, message))
-        .map(Json)
+    tokio::task::spawn_blocking(move || {
+        sessions.set_depth_scale(&dataset, &root, settings.depth_scale)
+    })
+    .await
+    .map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "settings task failed".to_owned(),
+        )
+    })?
+    .map_err(|message| (StatusCode::BAD_REQUEST, message))
+    .map(Json)
 }
 
 /// The camera for a browser scene packet; the same controls a frame request carries.
@@ -837,7 +1115,12 @@ async fn browser_scene_plan(
         demand_scene_plan_only(&session, request, levels.as_deref())
     })
     .await
-    .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "plan task failed".to_owned()))?
+    .map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "plan task failed".to_owned(),
+        )
+    })?
     .map_err(|message| (StatusCode::BAD_REQUEST, message))
     .map(Json)
 }
@@ -854,12 +1137,24 @@ async fn browser_scene_rays(
     let sessions = state.sessions.clone();
     let words = tokio::task::spawn_blocking(move || {
         let session = sessions.session_for(&dataset, &root)?;
-        demand_scene_plan(&session, request, levels.as_deref()).map(|(_, rays)| newvolim_residency::ray_words(&rays))
+        demand_scene_plan(&session, request, levels.as_deref())
+            .map(|(_, rays)| newvolim_residency::ray_words(&rays))
     })
     .await
-    .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "rays task failed".to_owned()))?
+    .map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "rays task failed".to_owned(),
+        )
+    })?
     .map_err(|message| (StatusCode::BAD_REQUEST, message))?;
-    Ok(([(header::CONTENT_TYPE, HeaderValue::from_static("application/octet-stream"))], words_le_bytes(&words)))
+    Ok((
+        [(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/octet-stream"),
+        )],
+        words_le_bytes(&words),
+    ))
 }
 
 /// Client residency, step three: the words of the chunks the shader missed. The body names one
@@ -871,23 +1166,43 @@ async fn browser_scene_chunks(
     Json(body): Json<SceneChunksRequest>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     if body.chunks.is_empty() || body.chunks.len() > MAX_SCENE_CHUNKS_PER_REQUEST {
-        return Err((StatusCode::BAD_REQUEST, format!("ask for 1..={MAX_SCENE_CHUNKS_PER_REQUEST} chunks per request")));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("ask for 1..={MAX_SCENE_CHUNKS_PER_REQUEST} chunks per request"),
+        ));
     }
     let root = resolve_frame_dataset(&state.datasets, &dataset)?;
     let sessions = state.sessions.clone();
     let chunks = tokio::task::spawn_blocking(move || {
         let session = sessions.session_for(&dataset, &root)?;
-        layer_chunk_words(&session, body.layer_id, body.level, body.source_index, &body.chunks)
+        layer_chunk_words(
+            &session,
+            body.layer_id,
+            body.level,
+            body.source_index,
+            &body.chunks,
+        )
     })
     .await
-    .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "chunks task failed".to_owned()))?
+    .map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "chunks task failed".to_owned(),
+        )
+    })?
     .map_err(|message| (StatusCode::BAD_REQUEST, message))?;
     let mut bytes = Vec::new();
     for words in &chunks {
         bytes.extend_from_slice(&(words.len() as u32).to_le_bytes());
         bytes.extend_from_slice(&words_le_bytes(words));
     }
-    Ok(([(header::CONTENT_TYPE, HeaderValue::from_static("application/octet-stream"))], bytes))
+    Ok((
+        [(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/octet-stream"),
+        )],
+        bytes,
+    ))
 }
 
 /// One request's worth of chunks: a bound on the work one client can queue at once.
@@ -922,14 +1237,23 @@ struct SceneChunksRequest {
     chunks: Vec<[u32; 3]>,
 }
 
-fn scene_plan_request(query: &ScenePlanQuery) -> Result<(NativePortableDrawRequest, Option<Vec<u32>>), (StatusCode, String)> {
+fn scene_plan_request(
+    query: &ScenePlanQuery,
+) -> Result<(NativePortableDrawRequest, Option<Vec<u32>>), (StatusCode, String)> {
     validate_render_extent(query.width, query.height, RenderView::Volume)
         .map_err(|message| (StatusCode::BAD_REQUEST, message))?;
     let levels = match &query.levels {
         None => None,
         Some(text) => Some(
             text.split(',')
-                .map(|level| level.trim().parse::<u32>().map_err(|_| (StatusCode::BAD_REQUEST, format!("levels {text:?} are not integers"))))
+                .map(|level| {
+                    level.trim().parse::<u32>().map_err(|_| {
+                        (
+                            StatusCode::BAD_REQUEST,
+                            format!("levels {text:?} are not integers"),
+                        )
+                    })
+                })
                 .collect::<Result<Vec<_>, _>>()?,
         ),
     };
@@ -951,24 +1275,57 @@ fn scene_plan_request(query: &ScenePlanQuery) -> Result<(NativePortableDrawReque
 
 fn parse_orientation_query(value: Option<&str>) -> Result<Option<[f32; 4]>, (StatusCode, String)> {
     let Some(value) = value else { return Ok(None) };
-    let components = value.split(',').map(str::parse::<f32>).collect::<Result<Vec<_>, _>>()
-        .map_err(|_| (StatusCode::BAD_REQUEST, "orientation must be four finite XYZW numbers".to_owned()))?;
-    let quaternion: [f32; 4] = components.try_into()
-        .map_err(|_| (StatusCode::BAD_REQUEST, "orientation must have four XYZW components".to_owned()))?;
+    let components = value
+        .split(',')
+        .map(str::parse::<f32>)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| {
+            (
+                StatusCode::BAD_REQUEST,
+                "orientation must be four finite XYZW numbers".to_owned(),
+            )
+        })?;
+    let quaternion: [f32; 4] = components.try_into().map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            "orientation must have four XYZW components".to_owned(),
+        )
+    })?;
     if quaternion.iter().any(|component| !component.is_finite()) {
-        return Err((StatusCode::BAD_REQUEST, "orientation must be finite".to_owned()));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "orientation must be finite".to_owned(),
+        ));
     }
     Ok(Some(quaternion))
 }
 
 fn parse_focus_query(value: Option<&str>) -> Result<Option<[f32; 3]>, (StatusCode, String)> {
     let Some(value) = value else { return Ok(None) };
-    let components = value.split(',').map(str::parse::<f32>).collect::<Result<Vec<_>, _>>()
-        .map_err(|_| (StatusCode::BAD_REQUEST, "focusXyz must be three normalized XYZ numbers".to_owned()))?;
-    let focus: [f32; 3] = components.try_into()
-        .map_err(|_| (StatusCode::BAD_REQUEST, "focusXyz must have three XYZ components".to_owned()))?;
-    if focus.iter().any(|value| !value.is_finite() || !(0.0..=1.0).contains(value)) {
-        return Err((StatusCode::BAD_REQUEST, "focusXyz must be within 0..=1".to_owned()));
+    let components = value
+        .split(',')
+        .map(str::parse::<f32>)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| {
+            (
+                StatusCode::BAD_REQUEST,
+                "focusXyz must be three normalized XYZ numbers".to_owned(),
+            )
+        })?;
+    let focus: [f32; 3] = components.try_into().map_err(|_| {
+        (
+            StatusCode::BAD_REQUEST,
+            "focusXyz must have three XYZ components".to_owned(),
+        )
+    })?;
+    if focus
+        .iter()
+        .any(|value| !value.is_finite() || !(0.0..=1.0).contains(value))
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "focusXyz must be within 0..=1".to_owned(),
+        ));
     }
     Ok(Some(focus))
 }
@@ -1001,7 +1358,12 @@ async fn browser_scene(
         browser_scene_packet(&session, size, controls)
     })
     .await
-    .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "scene task failed".to_owned()))?
+    .map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "scene task failed".to_owned(),
+        )
+    })?
     .map_err(|message| (StatusCode::BAD_REQUEST, message))
     .map(Json)
 }
@@ -1023,7 +1385,12 @@ async fn add_dataset_layer(
     let sessions = state.sessions.clone();
     tokio::task::spawn_blocking(move || sessions.add_layer(&dataset, &root, &layer_root))
         .await
-        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "session task failed".to_owned()))?
+        .map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "session task failed".to_owned(),
+            )
+        })?
         .map_err(|message| (StatusCode::BAD_REQUEST, message))
         .map(Json)
 }
@@ -1048,7 +1415,12 @@ async fn apply_channel_edit(
         sessions.set_channel_state(&dataset, &root, edit.layer_id, edit.channel, edit.state)
     })
     .await
-    .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "session task failed".to_owned()))?
+    .map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "session task failed".to_owned(),
+        )
+    })?
     .map_err(|message| (StatusCode::BAD_REQUEST, message))
 }
 
@@ -1063,20 +1435,62 @@ async fn list_datasets(State(state): State<AppState>) -> Json<DatasetList> {
 }
 
 const XY_TILE_EDGE: u32 = 512;
+const MAX_PROFILE_SAMPLES: usize = 1024;
+
+#[derive(Default, Deserialize)]
+struct XyTileQuery {
+    windows: Option<String>,
+}
+
+fn parse_xy_tile_windows(encoded: Option<&str>) -> Result<Vec<(usize, [f64; 2])>, String> {
+    let Some(encoded) = encoded.filter(|value| !value.is_empty()) else {
+        return Ok(Vec::new());
+    };
+    encoded
+        .split(',')
+        .map(|entry| {
+            let mut fields = entry.split(':');
+            let channel = fields
+                .next()
+                .and_then(|value| value.parse().ok())
+                .ok_or_else(|| format!("invalid 2D channel window {entry:?}"))?;
+            let start: f64 = fields
+                .next()
+                .and_then(|value| value.parse().ok())
+                .ok_or_else(|| format!("invalid 2D channel window {entry:?}"))?;
+            let end: f64 = fields
+                .next()
+                .and_then(|value| value.parse().ok())
+                .ok_or_else(|| format!("invalid 2D channel window {entry:?}"))?;
+            if fields.next().is_some() || !start.is_finite() || !end.is_finite() || start >= end {
+                return Err(format!("invalid 2D channel window {entry:?}"));
+            }
+            Ok((channel, [start, end]))
+        })
+        .collect()
+}
 
 async fn dataset_xy_tile(
     State(state): State<AppState>,
     AxumPath((dataset, level, tile_x, tile_y)): AxumPath<(String, u32, u32, u32)>,
+    Query(query): Query<XyTileQuery>,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     let root = resolve_frame_dataset(&state.datasets, &dataset)?;
+    let windows = parse_xy_tile_windows(query.windows.as_deref())
+        .map_err(|message| (StatusCode::BAD_REQUEST, message))?;
     let sessions = state.sessions.clone();
     let png = tokio::task::spawn_blocking(move || {
         let session = sessions.session_for(&dataset, &root)?;
-        portable_xy_tile_png(&session, level, tile_x, tile_y, XY_TILE_EDGE)
+        portable_xy_tile_png(&session, level, tile_x, tile_y, XY_TILE_EDGE, &windows)
             .map(|(png, _)| png)
     })
     .await
-    .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "tile task failed".to_owned()))?
+    .map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "tile task failed".to_owned(),
+        )
+    })?
     .map_err(|message| (StatusCode::BAD_REQUEST, message))?;
     Ok((
         [
@@ -1088,6 +1502,69 @@ async fn dataset_xy_tile(
         ],
         png,
     ))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct XyProfileQuery {
+    level: u32,
+    x0: f64,
+    y0: f64,
+    x1: f64,
+    y1: f64,
+    #[serde(default)]
+    z: f64,
+    channels: String,
+}
+
+fn parse_profile_channels(encoded: &str) -> Result<Vec<usize>, String> {
+    let mut channels = encoded
+        .split(',')
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            value
+                .parse::<usize>()
+                .map_err(|_| format!("invalid profile channel {value:?}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    channels.sort_unstable();
+    channels.dedup();
+    if channels.is_empty() {
+        return Err("profile needs at least one channel".into());
+    }
+    Ok(channels)
+}
+
+async fn dataset_xy_profile(
+    State(state): State<AppState>,
+    AxumPath(dataset): AxumPath<String>,
+    Query(query): Query<XyProfileQuery>,
+) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let root = resolve_frame_dataset(&state.datasets, &dataset)?;
+    let channels = parse_profile_channels(&query.channels)
+        .map_err(|message| (StatusCode::BAD_REQUEST, message))?;
+    let sessions = state.sessions.clone();
+    let profile = tokio::task::spawn_blocking(move || {
+        let session = sessions.session_for(&dataset, &root)?;
+        portable_xy_line_profile(
+            &session,
+            query.level,
+            [query.x0, query.y0],
+            [query.x1, query.y1],
+            query.z,
+            &channels,
+            MAX_PROFILE_SAMPLES,
+        )
+    })
+    .await
+    .map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "profile task failed".to_owned(),
+        )
+    })?
+    .map_err(|message| (StatusCode::BAD_REQUEST, message))?;
+    Ok(Json(profile))
 }
 
 /// Serve a configured dataset asset without exposing its local path. This is intentionally a
@@ -1209,12 +1686,12 @@ async fn render_frame(
         "render;dur={:.3}, route;desc=\"{}\"",
         rendered.render_ms, rendered.renderer
     ))
-        .map_err(|_| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "could not encode render timing header".to_owned(),
-            )
-        })?;
+    .map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "could not encode render timing header".to_owned(),
+        )
+    })?;
     Ok((
         [
             (header::CONTENT_TYPE, HeaderValue::from_static("image/png")),
@@ -1251,9 +1728,7 @@ async fn enqueue_render(
         orientation: request.orientation,
         focus_xyz: request.focus_xyz,
     };
-    let slice_zooms = request
-        .slice_zooms
-        .unwrap_or([f64::from(request.zoom); 3]);
+    let slice_zooms = request.slice_zooms.unwrap_or([f64::from(request.zoom); 3]);
     let controls = match request.view {
         RenderView::Volume => controls
             .validate()
@@ -1593,38 +2068,49 @@ fn start_render(job: FrameJob, completed_tx: &mpsc::UnboundedSender<RenderComple
             RenderView::Volume => {
                 let mut session = job.sessions.session_for(&job.dataset, &job.root).ok();
                 let prepared = if let Some(session) = session.as_mut() {
-                    job.annotations.layers(&job.dataset, &job.root).and_then(|layers| {
-                        let visible = layers.iter().filter(|layer| layer.visible)
-                            .flat_map(|layer| layer.annotations.iter().cloned()).collect::<Vec<_>>();
-                        session.set_qupath_annotations(&visible).map_err(|error| error.to_string())
+                    job.annotations
+                        .layers(&job.dataset, &job.root)
+                        .and_then(|layers| {
+                            let visible = layers
+                                .iter()
+                                .filter(|layer| layer.visible)
+                                .flat_map(|layer| layer.annotations.iter().cloned())
+                                .collect::<Vec<_>>();
+                            session
+                                .set_qupath_annotations(&visible)
+                                .map_err(|error| error.to_string())
+                        })
+                } else {
+                    Ok(())
+                };
+                prepared
+                    .and_then(|()| {
+                        render_volume_frame(session.as_ref(), &job.root, job.size, job.controls)
                     })
-                } else { Ok(()) };
-                prepared.and_then(|()| render_volume_frame(session.as_ref(), &job.root, job.size, job.controls)).map(
-                    |(png, ray_distance_pfm, renderer)| {
+                    .map(|(png, ray_distance_pfm, renderer)| {
                         RenderOutput::Volume(RenderedFrame {
                             png,
                             ray_distance_pfm,
                             render_ms: started.elapsed().as_secs_f64() * 1_000.0,
                             renderer,
                         })
-                    },
-                )
+                    })
             }
             RenderView::Orthogonal => {
                 // Select a level from pane size and 2D zoom, then slice the whole base layer on
                 // the CPU. Palace's Vulkan slicer remains the fallback for unsupported stores.
-                let portable = job
-                    .sessions
-                    .session_for(&job.dataset, &job.root)
-                    .and_then(|session| {
-                        portable_orthogonal_slice_pngs_for_view(
-                            &session,
-                            job.crosshair,
-                            [job.size.width, job.size.height],
-                            job.slice_zooms,
-                            job.controls.focus_xyz,
-                        )
-                    });
+                let portable =
+                    job.sessions
+                        .session_for(&job.dataset, &job.root)
+                        .and_then(|session| {
+                            portable_orthogonal_slice_pngs_for_view(
+                                &session,
+                                job.crosshair,
+                                [job.size.width, job.size.height],
+                                job.slice_zooms,
+                                job.controls.focus_xyz,
+                            )
+                        });
                 match portable {
                     Ok((png, slices)) => Ok(RenderOutput::Orthogonal(RenderedOrthogonal {
                         png,
@@ -1822,14 +2308,23 @@ mod tests {
             r#"{"dataset":"cells3d","width":32,"height":24,"requestId":7,"zoom":1.5}"#,
         )
         .unwrap();
-        assert!(matches!(frame, SocketRequest::Frame(request) if request.request_id == 7 && request.zoom == 1.5));
+        assert!(
+            matches!(frame, SocketRequest::Frame(request) if request.request_id == 7 && request.zoom == 1.5)
+        );
         let edit = serde_json::from_str::<SocketRequest>(
             r#"{"dataset":"cells3d","requestId":9,"layerId":1,"channel":0,"state":{"enabled":true,"colorSrgb":[255,0,0],"windowStart":100,"windowEnd":4000,"opacity":0.5}}"#,
         )
         .unwrap();
         match edit {
             SocketRequest::Channel(request) => {
-                assert_eq!((request.request_id, request.edit.layer_id, request.edit.channel), (9, 1, 0));
+                assert_eq!(
+                    (
+                        request.request_id,
+                        request.edit.layer_id,
+                        request.edit.channel
+                    ),
+                    (9, 1, 0)
+                );
                 assert_eq!(request.edit.state.into_state().unwrap().opacity, 0.5);
             }
             SocketRequest::Frame(_) => panic!("a message carrying `state` is a channel edit"),
@@ -1896,7 +2391,14 @@ mod tests {
         let layers = store.add_layer("cells3d", &cells, &gradient).unwrap();
         assert_eq!(layers.len(), 2);
         assert_eq!(layers[1].channels.len(), 2);
-        assert_eq!(store.session_for("cells3d", &cells).unwrap().layer_channels().len(), 2);
+        assert_eq!(
+            store
+                .session_for("cells3d", &cells)
+                .unwrap()
+                .layer_channels()
+                .len(),
+            2
+        );
     }
 
     /// The browser packet, consumed exactly as the page consumes it — decoded from base64,
@@ -1921,7 +2423,10 @@ mod tests {
         .unwrap();
         let packet = browser_scene_packet(&session, size, controls).unwrap();
         assert_eq!((packet.width, packet.height), (96, 64));
-        assert_eq!(packet.output_words, 96 * 64 * 2 + palace_wgpu::SCENE_TRACE_WORDS as u32);
+        assert_eq!(
+            packet.output_words,
+            96 * 64 * 2 + palace_wgpu::SCENE_TRACE_WORDS as u32
+        );
         let words = |encoded: &str| -> Vec<u32> {
             STANDARD
                 .decode(encoded)
@@ -1942,13 +2447,20 @@ mod tests {
         }))
         .unwrap();
         let storage = |label: &str, words: &[u32], writable: bool| {
-            let bytes = words.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<_>>();
+            let bytes = words
+                .iter()
+                .flat_map(|w| w.to_le_bytes())
+                .collect::<Vec<_>>();
             let buffer = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some(label),
                 size: bytes.len().max(4) as u64,
                 usage: wgpu::BufferUsages::STORAGE
                     | wgpu::BufferUsages::COPY_DST
-                    | if writable { wgpu::BufferUsages::COPY_SRC } else { wgpu::BufferUsages::empty() },
+                    | if writable {
+                        wgpu::BufferUsages::COPY_SRC
+                    } else {
+                        wgpu::BufferUsages::empty()
+                    },
                 mapped_at_creation: false,
             });
             if !bytes.is_empty() {
@@ -1974,9 +2486,17 @@ mod tests {
         queue.write_buffer(
             &uniform,
             0,
-            &packet.params.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<_>>(),
+            &packet
+                .params
+                .iter()
+                .flat_map(|w| w.to_le_bytes())
+                .collect::<Vec<_>>(),
         );
-        let requests = storage("requests", &vec![u32::MAX; packet.request_capacity as usize], true);
+        let requests = storage(
+            "requests",
+            &vec![u32::MAX; packet.request_capacity as usize],
+            true,
+        );
         let entry = |binding: u32, read_only: bool| wgpu::BindGroupLayoutEntry {
             binding,
             visibility: wgpu::ShaderStages::COMPUTE,
@@ -2097,7 +2617,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(desktop.renderer, RouteRenderer::Demand);
-        assert_eq!(frame.first_opacity_distance, desktop.attachments.first_opacity_distance);
+        assert_eq!(
+            frame.first_opacity_distance,
+            desktop.attachments.first_opacity_distance
+        );
         assert_eq!(frame.rgba, desktop.attachments.rgba);
         assert!(frame.first_opacity_distance.iter().any(|d| d.is_finite()));
     }
@@ -2114,11 +2637,17 @@ mod tests {
         let body = &source[start..];
         let body = &body[..body.find("async function present(").unwrap_or(body.len())];
         // The page fetches a fitted camera plan and chunks, then expands the rays locally.
-        let api = std::fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../newvolim-ui/src/api.rs")).unwrap();
+        let api = std::fs::read_to_string(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../newvolim-ui/src/api.rs"),
+        )
+        .unwrap();
         for route in ["/portable/plan?", "/portable/chunks"] {
             assert!(api.contains(route), "the page does not name {route}");
         }
-        let app = std::fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../newvolim-ui/src/app.rs")).unwrap();
+        let app = std::fs::read_to_string(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../newvolim-ui/src/app.rs"),
+        )
+        .unwrap();
         assert!(app.contains("ray_words_for_plan(&plan)"));
         assert!(!app.contains("scene_rays_url("));
         let mut last = 0;
@@ -2134,7 +2663,9 @@ mod tests {
             (8, "requests"),
         ] {
             let needle = format!("{{ binding: {binding}, resource: {{ buffer: {resource} }} }}");
-            let at = body.find(&needle).unwrap_or_else(|| panic!("missing {needle}"));
+            let at = body
+                .find(&needle)
+                .unwrap_or_else(|| panic!("missing {needle}"));
             assert!(at > last, "binding {binding} is out of order");
             last = at;
         }
@@ -2276,19 +2807,29 @@ mod tests {
             orientation: quaternion.orientation,
             orbit_delta: [0, 0],
             zoom: 1.0,
-        }.validate().is_ok());
+        }
+        .validate()
+        .is_ok());
         assert!(parse_orientation_query(Some("0,-0.47942555,0,0.87758255")).is_ok());
         assert!(parse_orientation_query(Some("0,0,0")).is_err());
         let focused: FrameRequest = serde_json::from_str(
             r#"{"dataset":"cells3d","width":32,"height":24,"focusXyz":[0.25,0.5,0.75]}"#,
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(focused.focus_xyz, Some([0.25, 0.5, 0.75]));
-        assert_eq!(parse_focus_query(Some("0.25,0.5,0.75")).unwrap(), focused.focus_xyz);
+        assert_eq!(
+            parse_focus_query(Some("0.25,0.5,0.75")).unwrap(),
+            focused.focus_xyz
+        );
         assert!(parse_focus_query(Some("1.01,0.5,0.5")).is_err());
         assert!(CameraControls {
             focus_xyz: None,
-            orientation: Some([0.0; 4]), orbit_delta: [0, 0], zoom: 1.0,
-        }.validate().is_err());
+            orientation: Some([0.0; 4]),
+            orbit_delta: [0, 0],
+            zoom: 1.0,
+        }
+        .validate()
+        .is_err());
 
         let socket_request: FrameRequest =
             serde_json::from_str(r#"{"dataset":"cells3d","width":32,"height":24,"requestId":73}"#)
@@ -2418,6 +2959,24 @@ mod tests {
         ));
         assert_eq!(pending.by_session.len(), MAX_PENDING_SESSIONS);
         assert!(!pending.by_session.contains_key(&SessionId(99)));
+    }
+
+    #[test]
+    fn xy_tile_windows_are_validated_before_rendering() {
+        assert_eq!(
+            parse_xy_tile_windows(Some("0:10:200,3:4.5:9")).unwrap(),
+            vec![(0, [10.0, 200.0]), (3, [4.5, 9.0])]
+        );
+        assert!(parse_xy_tile_windows(Some("0:200:10")).is_err());
+        assert!(parse_xy_tile_windows(Some("0:nan:10")).is_err());
+        assert!(parse_xy_tile_windows(Some("0:1")).is_err());
+    }
+
+    #[test]
+    fn profile_channels_are_nonempty_numeric_and_deduplicated() {
+        assert_eq!(parse_profile_channels("3,1,3,0").unwrap(), vec![0, 1, 3]);
+        assert!(parse_profile_channels("").is_err());
+        assert!(parse_profile_channels("0,DAPI").is_err());
     }
 
     #[test]
@@ -2710,7 +3269,11 @@ mod tests {
             .canonicalize()
             .unwrap();
         let page = tempfile::tempdir().unwrap();
-        std::fs::write(page.path().join("index.html"), "<title>newvolim page</title>").unwrap();
+        std::fs::write(
+            page.path().join("index.html"),
+            "<title>newvolim page</title>",
+        )
+        .unwrap();
         std::fs::write(page.path().join("app.js"), "window.newvolim = 1;").unwrap();
         let state = || {
             let (render_queue, _receiver) = mpsc::channel(1);
@@ -2734,7 +3297,11 @@ mod tests {
                 let body = axum::body::to_bytes(response.into_body(), 1 << 20)
                     .await
                     .unwrap();
-                (status, content_type, String::from_utf8_lossy(&body).into_owned())
+                (
+                    status,
+                    content_type,
+                    String::from_utf8_lossy(&body).into_owned(),
+                )
             }
         };
 
@@ -2745,10 +3312,20 @@ mod tests {
         assert_eq!(body, "<title>newvolim page</title>");
         let (status, content_type, body) = get(app.clone(), "/app.js").await;
         assert_eq!(status, StatusCode::OK);
-        assert!(content_type.as_deref().unwrap().starts_with("text/javascript"), "{content_type:?}");
+        assert!(
+            content_type
+                .as_deref()
+                .unwrap()
+                .starts_with("text/javascript"),
+            "{content_type:?}"
+        );
         assert_eq!(body, "window.newvolim = 1;");
         let (status, _, body) = get(app.clone(), "/v1/datasets").await;
-        assert_eq!(status, StatusCode::OK, "API routes take precedence over files");
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "API routes take precedence over files"
+        );
         assert!(body.contains("cells3d"));
         let (status, _, _) = get(app.clone(), "/missing.js").await;
         assert_eq!(status, StatusCode::NOT_FOUND);
@@ -2782,22 +3359,44 @@ mod tests {
             if body.is_some() {
                 request = request.header(header::CONTENT_TYPE, "application/json");
             }
-            let request = request.body(body.map(Body::from).unwrap_or_else(Body::empty)).unwrap();
+            let request = request
+                .body(body.map(Body::from).unwrap_or_else(Body::empty))
+                .unwrap();
             async move {
                 let response = app.oneshot(request).await.unwrap();
                 let status = response.status();
-                let bytes = axum::body::to_bytes(response.into_body(), 1 << 24).await.unwrap();
+                let bytes = axum::body::to_bytes(response.into_body(), 1 << 24)
+                    .await
+                    .unwrap();
                 (status, String::from_utf8_lossy(&bytes).into_owned())
             }
         };
         let (status, body) = call(app.clone(), "GET", "/v1/datasets/cells3d/settings", None).await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(serde_json::from_str::<serde_json::Value>(&body).unwrap(), serde_json::json!({"depthScale": 1.0}));
-        let (status, plan_body) = call(app.clone(), "GET", "/v1/datasets/cells3d/portable/plan?width=32&height=24", None).await;
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&body).unwrap(),
+            serde_json::json!({"depthScale": 1.0})
+        );
+        let (status, plan_body) = call(
+            app.clone(),
+            "GET",
+            "/v1/datasets/cells3d/portable/plan?width=32&height=24",
+            None,
+        )
+        .await;
         assert_eq!(status, StatusCode::OK);
         let plan_at_one: serde_json::Value = serde_json::from_str(&plan_body).unwrap();
-        assert_eq!(plan_at_one["camera"]["forwardZyx"].as_array().unwrap().len(), 3);
-        assert!(plan_body.len() < 20_000, "the plan should carry a fitted camera, not 768 pixel rays");
+        assert_eq!(
+            plan_at_one["camera"]["forwardZyx"]
+                .as_array()
+                .unwrap()
+                .len(),
+            3
+        );
+        assert!(
+            plan_body.len() < 20_000,
+            "the plan should carry a fitted camera, not 768 pixel rays"
+        );
         let (status, oriented_body) = call(
             app.clone(), "GET",
             "/v1/datasets/cells3d/portable/plan?width=32&height=24&orientation=0,-0.47942555,0,0.87758255",
@@ -2805,49 +3404,123 @@ mod tests {
         ).await;
         assert_eq!(status, StatusCode::OK, "{oriented_body}");
         let oriented: serde_json::Value = serde_json::from_str(&oriented_body).unwrap();
-        assert_ne!(oriented["camera"]["originZyx"], plan_at_one["camera"]["originZyx"]);
+        assert_ne!(
+            oriented["camera"]["originZyx"],
+            plan_at_one["camera"]["originZyx"]
+        );
         let (status, focused_body) = call(
-            app.clone(), "GET",
+            app.clone(),
+            "GET",
             "/v1/datasets/cells3d/portable/plan?width=32&height=24&focusXyz=0.25,0.5,0.75",
             None,
-        ).await;
+        )
+        .await;
         assert_eq!(status, StatusCode::OK, "{focused_body}");
         let focused: serde_json::Value = serde_json::from_str(&focused_body).unwrap();
-        assert_ne!(focused["camera"]["originZyx"], plan_at_one["camera"]["originZyx"]);
-        let (status, body) = call(app.clone(), "POST", "/v1/datasets/cells3d/settings", Some(r#"{"depthScale": 2.5}"#.into())).await;
+        assert_ne!(
+            focused["camera"]["originZyx"],
+            plan_at_one["camera"]["originZyx"]
+        );
+        let (status, body) = call(
+            app.clone(),
+            "POST",
+            "/v1/datasets/cells3d/settings",
+            Some(r#"{"depthScale": 2.5}"#.into()),
+        )
+        .await;
         assert_eq!(status, StatusCode::OK, "{body}");
-        assert_eq!(serde_json::from_str::<serde_json::Value>(&body).unwrap(), serde_json::json!({"depthScale": 2.5}));
-        let (status, body) = call(app.clone(), "POST", "/v1/datasets/cells3d/settings", Some(r#"{"depthScale": 0}"#.into())).await;
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&body).unwrap(),
+            serde_json::json!({"depthScale": 2.5})
+        );
+        let (status, body) = call(
+            app.clone(),
+            "POST",
+            "/v1/datasets/cells3d/settings",
+            Some(r#"{"depthScale": 0}"#.into()),
+        )
+        .await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
         let (_, body) = call(app.clone(), "GET", "/v1/datasets/cells3d/settings", None).await;
-        assert_eq!(serde_json::from_str::<serde_json::Value>(&body).unwrap()["depthScale"], 2.5, "a refused write leaves the old scale");
-        let plan_at_two_and_a_half: serde_json::Value = serde_json::from_str(&call(app.clone(), "GET", "/v1/datasets/cells3d/portable/plan?width=32&height=24", None).await.1).unwrap();
-        let ratio = plan_at_two_and_a_half["opacityReference"].as_f64().unwrap() / plan_at_one["opacityReference"].as_f64().unwrap();
-        assert!((ratio - 2.5).abs() < 1e-4, "the plan's opacity reference scales: {ratio}");
-        let (status, body) = call(app.clone(), "POST", "/v1/datasets/cells3d/settings", Some(r#"{"depthScale":100}"#.into())).await;
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&body).unwrap()["depthScale"],
+            2.5,
+            "a refused write leaves the old scale"
+        );
+        let plan_at_two_and_a_half: serde_json::Value = serde_json::from_str(
+            &call(
+                app.clone(),
+                "GET",
+                "/v1/datasets/cells3d/portable/plan?width=32&height=24",
+                None,
+            )
+            .await
+            .1,
+        )
+        .unwrap();
+        let ratio = plan_at_two_and_a_half["opacityReference"].as_f64().unwrap()
+            / plan_at_one["opacityReference"].as_f64().unwrap();
+        assert!(
+            (ratio - 2.5).abs() < 1e-4,
+            "the plan's opacity reference scales: {ratio}"
+        );
+        let (status, body) = call(
+            app.clone(),
+            "POST",
+            "/v1/datasets/cells3d/settings",
+            Some(r#"{"depthScale":100}"#.into()),
+        )
+        .await;
         assert_eq!(status, StatusCode::OK, "{body}");
-        let plan_at_hundred: serde_json::Value = serde_json::from_str(&call(app.clone(), "GET", "/v1/datasets/cells3d/portable/plan?width=32&height=24", None).await.1).unwrap();
-        let ratio = plan_at_hundred["opacityReference"].as_f64().unwrap() / plan_at_one["opacityReference"].as_f64().unwrap();
-        assert!((ratio - 100.0).abs() < 1e-3, "the plan reaches the slider maximum: {ratio}");
-        let (status, _) = call(app, "POST", "/v1/datasets/cells3d/settings", Some(r#"{"depthScale":100.01}"#.into())).await;
+        let plan_at_hundred: serde_json::Value = serde_json::from_str(
+            &call(
+                app.clone(),
+                "GET",
+                "/v1/datasets/cells3d/portable/plan?width=32&height=24",
+                None,
+            )
+            .await
+            .1,
+        )
+        .unwrap();
+        let ratio = plan_at_hundred["opacityReference"].as_f64().unwrap()
+            / plan_at_one["opacityReference"].as_f64().unwrap();
+        assert!(
+            (ratio - 100.0).abs() < 1e-3,
+            "the plan reaches the slider maximum: {ratio}"
+        );
+        let (status, _) = call(
+            app,
+            "POST",
+            "/v1/datasets/cells3d/settings",
+            Some(r#"{"depthScale":100.01}"#.into()),
+        )
+        .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
     async fn annotation_routes_edit_geojson_and_project_into_the_3d_camera() {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../test-data/cells3d-anisotropic.ome.zarr").canonicalize().unwrap();
+            .join("../../test-data/cells3d-anisotropic.ome.zarr")
+            .canonicalize()
+            .unwrap();
         let (render_queue, _receiver) = mpsc::channel(1);
         let state = AppState {
             datasets: Arc::new(HashMap::from([("cells3d".into(), root)])),
-            render_queue, next_session_id: Arc::new(AtomicU64::new(1)),
-            sessions: SessionStore::default(), annotations: AnnotationStore::default(),
+            render_queue,
+            next_session_id: Arc::new(AtomicU64::new(1)),
+            sessions: SessionStore::default(),
+            annotations: AnnotationStore::default(),
         };
         let app = app_router(state, vec![], None);
         let call = |app: Router, method: &str, uri: String, body: Option<String>| {
-            let request = Request::builder().method(method).uri(uri)
+            let request = Request::builder()
+                .method(method)
+                .uri(uri)
                 .header(header::CONTENT_TYPE, "application/json")
-                .body(body.map(Body::from).unwrap_or_else(Body::empty)).unwrap();
+                .body(body.map(Body::from).unwrap_or_else(Body::empty))
+                .unwrap();
             async move {
                 let response = app.oneshot(request).await.unwrap();
                 let status = response.status();
@@ -2856,54 +3529,129 @@ mod tests {
             }
         };
         let prefix = "/v1/datasets/cells3d/annotations";
-        let (status, layer) = call(app.clone(), "POST", prefix.into(), Some(r#"{"name":"test"}"#.into())).await;
+        let (status, layer) = call(
+            app.clone(),
+            "POST",
+            prefix.into(),
+            Some(r#"{"name":"test"}"#.into()),
+        )
+        .await;
         assert_eq!(status, StatusCode::OK);
         let layer: AnnotationLayer = serde_json::from_slice(&layer).unwrap();
         let uri = format!("{prefix}/{}", layer.id);
         let mut point = QuPathAnnotation::point(8.0, 8.0, newvolim_scene::qupath::Plane::at(1, 0));
         point.z_extent = 2;
-        let (status, stored) = call(app.clone(), "POST", uri.clone(), Some(serde_json::to_string(&point).unwrap())).await;
-        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&stored));
+        let (status, stored) = call(
+            app.clone(),
+            "POST",
+            uri.clone(),
+            Some(serde_json::to_string(&point).unwrap()),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{}",
+            String::from_utf8_lossy(&stored)
+        );
         let stored: QuPathAnnotation = serde_json::from_slice(&stored).unwrap();
         assert_eq!(stored.id, 1);
         let (status, exported) = call(app.clone(), "GET", format!("{uri}/geojson"), None).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(qupath_geojson::parse(&exported).unwrap().len(), 1);
-        let (status, projection) = call(app.clone(), "GET", format!("{prefix}/projection?width=64&height=48"), None).await;
-        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&projection));
+        let (status, projection) = call(
+            app.clone(),
+            "GET",
+            format!("{prefix}/projection?width=64&height=48"),
+            None,
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{}",
+            String::from_utf8_lossy(&projection)
+        );
         let words: Vec<u32> = serde_json::from_slice(&projection).unwrap();
         assert!(!words.is_empty());
         assert_eq!(words.len() % 13, 0);
-        assert!(words.len() >= 39, "a Z span projects its start, end and connector");
-        let (status, hidden) = call(app.clone(), "PUT", format!("{uri}/visibility"), Some(r#"{"visible":false}"#.into())).await;
+        assert!(
+            words.len() >= 39,
+            "a Z span projects its start, end and connector"
+        );
+        let (status, hidden) = call(
+            app.clone(),
+            "PUT",
+            format!("{uri}/visibility"),
+            Some(r#"{"visible":false}"#.into()),
+        )
+        .await;
         assert_eq!(status, StatusCode::OK);
-        assert!(!serde_json::from_slice::<AnnotationLayer>(&hidden).unwrap().visible);
-        let (status, projection) = call(app.clone(), "GET", format!("{prefix}/projection?width=64&height=48"), None).await;
+        assert!(
+            !serde_json::from_slice::<AnnotationLayer>(&hidden)
+                .unwrap()
+                .visible
+        );
+        let (status, projection) = call(
+            app.clone(),
+            "GET",
+            format!("{prefix}/projection?width=64&height=48"),
+            None,
+        )
+        .await;
         assert_eq!(status, StatusCode::OK);
-        assert!(serde_json::from_slice::<Vec<u32>>(&projection).unwrap().is_empty());
-        let (status, _) = call(app.clone(), "PUT", format!("{uri}/visibility"), Some(r#"{"visible":true}"#.into())).await;
+        assert!(serde_json::from_slice::<Vec<u32>>(&projection)
+            .unwrap()
+            .is_empty());
+        let (status, _) = call(
+            app.clone(),
+            "PUT",
+            format!("{uri}/visibility"),
+            Some(r#"{"visible":true}"#.into()),
+        )
+        .await;
         assert_eq!(status, StatusCode::OK);
         let (status, _) = call(app.clone(), "DELETE", format!("{uri}/{}", stored.id), None).await;
         assert_eq!(status, StatusCode::NO_CONTENT);
-        let (status, projection) = call(app.clone(), "GET", format!("{prefix}/projection?width=64&height=48"), None).await;
+        let (status, projection) = call(
+            app.clone(),
+            "GET",
+            format!("{prefix}/projection?width=64&height=48"),
+            None,
+        )
+        .await;
         assert_eq!(status, StatusCode::OK);
-        assert!(serde_json::from_slice::<Vec<u32>>(&projection).unwrap().is_empty());
+        assert!(serde_json::from_slice::<Vec<u32>>(&projection)
+            .unwrap()
+            .is_empty());
         let (status, _) = call(app.clone(), "DELETE", uri.clone(), None).await;
         assert_eq!(status, StatusCode::NO_CONTENT);
         let (status, layers) = call(app, "GET", prefix.into(), None).await;
         assert_eq!(status, StatusCode::OK);
-        assert!(serde_json::from_slice::<Vec<AnnotationLayer>>(&layers).unwrap().is_empty());
+        assert!(serde_json::from_slice::<Vec<AnnotationLayer>>(&layers)
+            .unwrap()
+            .is_empty());
     }
 
     /// A socket frame request carries the ray-distance PFM only when it asks (`depth: true`);
     /// the page never asks, which saves 888 KB of base64 per pane-sized frame.
     #[test]
     fn socket_frame_requests_ask_for_depth_explicitly() {
-        let plain = serde_json::from_str::<SocketRequest>(r#"{"dataset":"d","width":2,"height":1,"requestId":1,"view":"volume"}"#).unwrap();
-        let SocketRequest::Frame(plain) = plain else { panic!("a frame request") };
+        let plain = serde_json::from_str::<SocketRequest>(
+            r#"{"dataset":"d","width":2,"height":1,"requestId":1,"view":"volume"}"#,
+        )
+        .unwrap();
+        let SocketRequest::Frame(plain) = plain else {
+            panic!("a frame request")
+        };
         assert!(!plain.depth);
-        let with = serde_json::from_str::<SocketRequest>(r#"{"dataset":"d","width":2,"height":1,"requestId":1,"view":"volume","depth":true}"#).unwrap();
-        let SocketRequest::Frame(with) = with else { panic!("a frame request") };
+        let with = serde_json::from_str::<SocketRequest>(
+            r#"{"dataset":"d","width":2,"height":1,"requestId":1,"view":"volume","depth":true}"#,
+        )
+        .unwrap();
+        let SocketRequest::Frame(with) = with else {
+            panic!("a frame request")
+        };
         assert!(with.depth);
         // The socket branch drops the PFM unless asked: pinned by reading the branch itself.
         let source = include_str!("main.rs");
@@ -2979,9 +3727,14 @@ mod tests {
         // The second metric names the route; on a host with a WGPU adapter that is the portable
         // demand route, otherwise Palace's Vulkan raycaster.
         assert!(
-            ["portable-demand", "portable-palace", "portable-native", "vulkan"]
-                .iter()
-                .any(|route| timing.contains(&format!("route;desc=\"{route}\""))),
+            [
+                "portable-demand",
+                "portable-palace",
+                "portable-native",
+                "vulkan"
+            ]
+            .iter()
+            .any(|route| timing.contains(&format!("route;desc=\"{route}\""))),
             "frame route did not name its renderer: {timing:?}"
         );
         let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();

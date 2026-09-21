@@ -6,6 +6,7 @@ use std::{
     sync::Mutex,
 };
 
+use crate::session::{LocalLayerRenderRequest, LocalSession, SpatialChunkRegion};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use newvolim_render::{
     annotation_overlay, pick_annotation_overlays, project_annotation_overlays, AnnotationProjector,
@@ -13,9 +14,10 @@ use newvolim_render::{
     PhysicalExtent, ProjectedAnnotationVertex, RenderTarget,
 };
 use newvolim_scene::{Annotation, ChannelState, ChannelWindow};
-use palace_frame::{camera_ray_for_local_zarr, project_point_for_local_zarr, CameraControls, FrameSize};
+use palace_frame::{
+    camera_ray_for_local_zarr, project_point_for_local_zarr, CameraControls, FrameSize,
+};
 use serde::{Deserialize, Serialize};
-use crate::session::{LocalLayerRenderRequest, LocalSession, SpatialChunkRegion};
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -189,7 +191,6 @@ impl FramePayload {
             ),
         })
     }
-
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -354,8 +355,15 @@ struct FittedAnnotationProjector<'a> {
 impl FittedAnnotationProjector<'_> {
     fn projection(&self, position: [f64; 3]) -> Option<ProjectedAnnotationVertex> {
         let [x, y, z] = self.session.physical_point_voxel_xyz_f64(position).ok()?;
-        let projection = palace_frame::project_point_with_basis(self.basis, self.size, [z as f32, y as f32, x as f32])?;
-        Some(ProjectedAnnotationVertex { pixel: projection.pixel, ray_distance: projection.ray_distance })
+        let projection = palace_frame::project_point_with_basis(
+            self.basis,
+            self.size,
+            [z as f32, y as f32, x as f32],
+        )?;
+        Some(ProjectedAnnotationVertex {
+            pixel: projection.pixel,
+            ray_distance: projection.ray_distance,
+        })
     }
 }
 
@@ -366,12 +374,21 @@ impl AnnotationProjector for FittedAnnotationProjector<'_> {
 
     fn project_radius(&self, center: [f64; 3], radius: f32) -> Option<f32> {
         let center_projection = self.projection(center)?;
-        [[radius as f64, 0.0, 0.0], [0.0, radius as f64, 0.0], [0.0, 0.0, radius as f64]]
-            .into_iter()
-            .filter_map(|offset| self.projection(std::array::from_fn(|axis| center[axis] + offset[axis])))
-            .map(|projection| (projection.pixel[0] - center_projection.pixel[0]).hypot(projection.pixel[1] - center_projection.pixel[1]))
-            .reduce(f32::max)
-            .filter(|radius| radius.is_finite() && *radius > 0.0)
+        [
+            [radius as f64, 0.0, 0.0],
+            [0.0, radius as f64, 0.0],
+            [0.0, 0.0, radius as f64],
+        ]
+        .into_iter()
+        .filter_map(|offset| {
+            self.projection(std::array::from_fn(|axis| center[axis] + offset[axis]))
+        })
+        .map(|projection| {
+            (projection.pixel[0] - center_projection.pixel[0])
+                .hypot(projection.pixel[1] - center_projection.pixel[1])
+        })
+        .reduce(f32::max)
+        .filter(|radius| radius.is_finite() && *radius > 0.0)
     }
 }
 
@@ -450,16 +467,31 @@ pub fn project_session_annotation_records(
         .iter()
         .map(|annotation| annotation_overlay(annotation, ANNOTATION_PICK_STYLE))
         .collect::<Vec<_>>();
-    let shape = session.summary().voxel_shape_xyz.ok_or("annotation projection needs level-zero XYZ shape")?;
-    let dimensions_zyx = [shape[2], shape[1], shape[0]].map(|value| u32::try_from(value).map_err(|_| "annotation volume dimension exceeds u32"))
-        .into_iter().collect::<Result<Vec<_>, _>>()?;
-    let spacing = session.portable_level_spacings().map_err(|error| error.to_string())?
-        .into_iter().next().ok_or("annotation projection needs level-zero spacing")?;
+    let shape = session
+        .summary()
+        .voxel_shape_xyz
+        .ok_or("annotation projection needs level-zero XYZ shape")?;
+    let dimensions_zyx = [shape[2], shape[1], shape[0]]
+        .map(|value| u32::try_from(value).map_err(|_| "annotation volume dimension exceeds u32"))
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()?;
+    let spacing = session
+        .portable_level_spacings()
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .next()
+        .ok_or("annotation projection needs level-zero spacing")?;
     let basis = palace_frame::camera_ray_basis_for_geometry(
         [dimensions_zyx[0], dimensions_zyx[1], dimensions_zyx[2]],
-        [spacing[2], spacing[1], spacing[0]], controls,
-    ).map_err(|error| error.to_string())?;
-    let projector = FittedAnnotationProjector { session, basis, size };
+        [spacing[2], spacing[1], spacing[0]],
+        controls,
+    )
+    .map_err(|error| error.to_string())?;
+    let projector = FittedAnnotationProjector {
+        session,
+        basis,
+        size,
+    };
     let extent = PhysicalExtent::new(size.width, size.height).map_err(|error| error.to_string())?;
     let mut records = Vec::new();
     for overlay in &overlays {
@@ -467,8 +499,10 @@ pub fn project_session_annotation_records(
             Ok(mut projected) => records.append(&mut projected),
             // When a close camera crosses an annotation plane, a vertex can lie behind the
             // eye. The volume frame remains valid; only that overlay is unavailable.
-            Err(newvolim_render::AnnotationProjectionError::ProjectionUnavailable(_)
-                | newvolim_render::AnnotationProjectionError::InvalidRadius(_)) => {}
+            Err(
+                newvolim_render::AnnotationProjectionError::ProjectionUnavailable(_)
+                | newvolim_render::AnnotationProjectionError::InvalidRadius(_),
+            ) => {}
             Err(error) => return Err(error.to_string()),
         }
     }
@@ -858,9 +892,10 @@ pub fn render_palace_portable_camera_draw(
         )
         .ok_or_else(|| "portable Palace DVR raymarch input is not admitted".to_owned())?;
     let transfer = palace_transfer_from_native_camera(input)?;
-    let opacity_reference = scene_opacity_reference(session, std::array::from_fn(|axis| {
-        (level.maximum()[axis] - level.minimum()[axis]).abs()
-    }))?;
+    let opacity_reference = scene_opacity_reference(
+        session,
+        std::array::from_fn(|axis| (level.maximum()[axis] - level.minimum()[axis]).abs()),
+    )?;
     // The oracle is the fallback, not a preamble: this path has local-adapter parity, so rendering
     // every frame twice would be pure cost.
     if let Some((device, queue)) = session.portable_device() {
@@ -1112,9 +1147,7 @@ pub fn palace_scene_slice_rgba_with_sampling(
                 channels: layer.channels.clone(),
             };
             let pages = (0..layer.channels.len())
-                .map(|channel| {
-                    palace_channel_pages(&volume, channel)
-                })
+                .map(|channel| palace_channel_pages(&volume, channel))
                 .collect::<Result<Vec<_>, _>>()?;
             Ok((
                 layer
@@ -1268,8 +1301,7 @@ pub fn layer_world_box(
 ) -> ([f32; 3], [f32; 3]) {
     let corner = |offset: f64| -> [f32; 3] {
         std::array::from_fn(|axis| {
-            (transform.translation[axis]
-                + transform.scale[axis] * (origin[axis] as f64 + offset))
+            (transform.translation[axis] + transform.scale[axis] * (origin[axis] as f64 + offset))
                 as f32
         })
     };
@@ -1458,7 +1490,9 @@ fn scene_route_frame_inner(
     let packet = native_portable_scene_camera_draw_for_session(request, session)
         .map_err(|error| format!("{error} (demand route: {demand_error})"))?;
     let rays = if include_pick_rays {
-        packet.rays.iter()
+        packet
+            .rays
+            .iter()
             .map(|ray| {
                 newvolim_render::PickRay::new(ray.origin_world, ray.direction_world)
                     .map_err(|error| error.to_string())
@@ -1501,8 +1535,11 @@ pub fn palace_dvr_scene_from_native_camera(
     let pages = &scene.frame.page_submission.pages;
     let mut layers = Vec::new();
     for layer in &scene.layers {
-        let (minimum, maximum) =
-            layer_world_box(layer.transform, layer.voxel_origin_xyz, layer.dimensions_xyz);
+        let (minimum, maximum) = layer_world_box(
+            layer.transform,
+            layer.voxel_origin_xyz,
+            layer.dimensions_xyz,
+        );
         let mut channels = Vec::new();
         for channel in &layer.channels {
             let first = channel.page_offset as usize;
@@ -1560,16 +1597,22 @@ pub fn palace_dvr_scene_from_native_camera(
         .layers
         .iter()
         .fold([f32::INFINITY; 3], |minimum, layer| {
-            let (origin, _) =
-                layer_world_box(layer.transform, layer.voxel_origin_xyz, layer.dimensions_xyz);
+            let (origin, _) = layer_world_box(
+                layer.transform,
+                layer.voxel_origin_xyz,
+                layer.dimensions_xyz,
+            );
             std::array::from_fn(|axis| minimum[axis].min(origin[axis]))
         });
     let scene_maximum = scene
         .layers
         .iter()
         .fold([f32::NEG_INFINITY; 3], |maximum, layer| {
-            let (_, end) =
-                layer_world_box(layer.transform, layer.voxel_origin_xyz, layer.dimensions_xyz);
+            let (_, end) = layer_world_box(
+                layer.transform,
+                layer.voxel_origin_xyz,
+                layer.dimensions_xyz,
+            );
             std::array::from_fn(|axis| maximum[axis].max(end[axis]))
         });
     // A framed camera necessarily has pixels that miss the admitted scene.  Such a ray is
@@ -1586,9 +1629,7 @@ pub fn palace_dvr_scene_from_native_camera(
             let ray = palace_core::gpu::PortableRayInterval::new(origin, direction, 0.0, f32::MAX)
                 .ok_or("scene world ray is invalid")?;
             ray.clipped_to_aabb(scene_minimum, scene_maximum)
-                .or_else(|| {
-                    palace_core::gpu::PortableRayInterval::new(origin, direction, 0.0, 0.0)
-                })
+                .or_else(|| palace_core::gpu::PortableRayInterval::new(origin, direction, 0.0, 0.0))
                 .ok_or("scene world ray is not representable as a transparent interval")
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -1671,9 +1712,9 @@ pub fn composite_palace_scene_annotations(
     if let Some(composited) = palace_annotation_composite_on_adapter(session, &input) {
         return Ok(composited);
     }
-    input
-        .composite_cpu()
-        .ok_or_else(|| "portable annotation composite oracle rejected its admitted input".to_owned())
+    input.composite_cpu().ok_or_else(|| {
+        "portable annotation composite oracle rejected its admitted input".to_owned()
+    })
 }
 
 /// Acquire a local adapter and composite, returning `None` for every host-capability or recording
@@ -1789,9 +1830,13 @@ fn demand_scene_whole_level_words(session: &LocalSession, levels: &[u32]) -> Res
         .sum())
 }
 
-fn demand_scene_whole_level_may_fit(session: &LocalSession, levels: &[u32]) -> Result<bool, String> {
+fn demand_scene_whole_level_may_fit(
+    session: &LocalSession,
+    levels: &[u32],
+) -> Result<bool, String> {
     let budget_words = u64::from(newvolim_render::PortablePageSubmission::PAGE_COUNT)
-        * newvolim_render::PortablePageSubmission::PAGE_BYTES / 4;
+        * newvolim_render::PortablePageSubmission::PAGE_BYTES
+        / 4;
     Ok(demand_scene_whole_level_words(session, levels)? <= budget_words)
 }
 
@@ -1926,7 +1971,8 @@ fn prepare_demand_scene_inner(
         total_channels += channels.len();
         let source = &request.source;
         let dimensions: [u32; 3] = std::array::from_fn(|axis| source.spatial_shape(axis) as u32);
-        let chunk_shape: [u32; 3] = std::array::from_fn(|axis| source.spatial_chunk_shape(axis) as u32);
+        let chunk_shape: [u32; 3] =
+            std::array::from_fn(|axis| source.spatial_chunk_shape(axis) as u32);
         let grid = palace_core::gpu::PortableChunkGrid::new(dimensions, chunk_shape)
             .ok_or("source chunk grid is not admitted")?;
         // The layer occupies the same physical box at every level, so its AABB and the camera
@@ -1985,9 +2031,10 @@ fn prepare_demand_scene_inner(
         .iter()
         .map(|layer| demand_scene_step_size(layer.transform))
         .fold(f32::INFINITY, f32::min);
-    let opacity_reference = scene_opacity_reference(session, std::array::from_fn(|axis| {
-        (scene_maximum[axis] - scene_minimum[axis]).abs()
-    }))?;
+    let opacity_reference = scene_opacity_reference(
+        session,
+        std::array::from_fn(|axis| (scene_maximum[axis] - scene_minimum[axis]).abs()),
+    )?;
 
     // One residency loop per (layer, channel), numbered by a scene-wide ordinal: every
     // demand-resident channel resolves through one page table and one request table, so the
@@ -2145,13 +2192,21 @@ fn demand_scene_feedback_at_levels(
     session: &LocalSession,
     request: NativePortableDrawRequest,
     levels: &[u32],
-) -> Result<(palace_core::gpu::PortableFrameAttachments, Vec<palace_core::gpu::PortableRayInterval>), String> {
+) -> Result<
+    (
+        palace_core::gpu::PortableFrameAttachments,
+        Vec<palace_core::gpu::PortableRayInterval>,
+    ),
+    String,
+> {
     let mut scene = prepare_demand_scene(session, request, levels)?;
     // Probe a subset of the exact full-size rays before paying for a full feedback pass. If
     // these rays alone need more than four pages, the full pass cannot fit either. A probe
     // that fits changes nothing: the ordinary full-size feedback still decides the frame.
     if sparse_feedback_exceeds_page_bound(session, &scene)? {
-        return Err(format!("{DEMAND_EXCEEDS_PAGE_BOUND}: sampled rays alone exceed four pages"));
+        return Err(format!(
+            "{DEMAND_EXCEEDS_PAGE_BOUND}: sampled rays alone exceed four pages"
+        ));
     }
     for _ in 0..=DEMAND_SCENE_MAX_ITERATIONS {
         let (input, table) = assemble_demand_scene(session, &scene)?;
@@ -2164,8 +2219,7 @@ fn demand_scene_feedback_at_levels(
             let key =
                 palace_core::gpu::PortableFeedbackKey::new(packed & 0x00ff_ffff, packed >> 24)
                     .ok_or("scene shader recorded an invalid chunk key")?;
-            let ordinal =
-                palace_core::gpu::PortableResidencyTag::channel(key.level()) as usize;
+            let ordinal = palace_core::gpu::PortableResidencyTag::channel(key.level()) as usize;
             per_loop
                 .get_mut(ordinal)
                 .ok_or("scene shader recorded a key for an unadmitted channel")?
@@ -2182,8 +2236,12 @@ fn demand_scene_feedback_at_levels(
                 palace_core::gpu::PortableResidencyStep::Planned => complete = false,
                 // A working set beyond the portable bound is a deterministic Vulkan fallback, and
                 // an exhausted or desynchronized loop must not be presented as a finished frame.
-                palace_core::gpu::PortableResidencyStep::ExceedsPortableBound { required_pages } => {
-                    return Err(format!("{DEMAND_EXCEEDS_PAGE_BOUND}: {required_pages} pages needed"))
+                palace_core::gpu::PortableResidencyStep::ExceedsPortableBound {
+                    required_pages,
+                } => {
+                    return Err(format!(
+                        "{DEMAND_EXCEEDS_PAGE_BOUND}: {required_pages} pages needed"
+                    ))
                 }
                 other => return Err(format!("demand-driven scene stopped: {other:?}")),
             }
@@ -2195,33 +2253,55 @@ fn demand_scene_feedback_at_levels(
     Err("demand-driven scene exceeded its iteration budget".into())
 }
 
-fn sparse_feedback_exceeds_page_bound(session: &LocalSession, scene: &PreparedDemandScene) -> Result<bool, String> {
+fn sparse_feedback_exceeds_page_bound(
+    session: &LocalSession,
+    scene: &PreparedDemandScene,
+) -> Result<bool, String> {
     const STRIDE: u32 = 8;
     let (input, table) = assemble_demand_scene(session, scene)?;
     let width = scene.size.width.div_ceil(STRIDE);
     let height = scene.size.height.div_ceil(STRIDE);
     let original_rays = input.rays();
     let rays = (0..height)
-        .flat_map(|y| (0..width).map(move |x| original_rays[(y * STRIDE * scene.size.width + x * STRIDE) as usize]))
+        .flat_map(|y| {
+            (0..width)
+                .map(move |x| original_rays[(y * STRIDE * scene.size.width + x * STRIDE) as usize])
+        })
         .collect();
     let sampled = palace_core::gpu::PortableDvrSceneFrameInput::new(
-        width, height, input.layers().to_vec(), rays, input.step_size(), input.opacity_reference(),
-    ).ok_or("sparse feedback scene is not admitted")?;
+        width,
+        height,
+        input.layers().to_vec(),
+        rays,
+        input.step_size(),
+        input.opacity_reference(),
+    )
+    .ok_or("sparse feedback scene is not admitted")?;
     let (_, _, requests) = palace_demand_scene_on_adapter(session, &sampled, &table)
         .ok_or("sparse feedback needs an eligible WGPU adapter")?;
-    let keys: Vec<_> = requests.into_iter().filter(|word| *word != u32::MAX)
-        .map(|packed| palace_core::gpu::PortableFeedbackKey::new(packed & 0x00ff_ffff, packed >> 24)
-            .ok_or("sparse feedback returned an invalid chunk key"))
+    let keys: Vec<_> = requests
+        .into_iter()
+        .filter(|word| *word != u32::MAX)
+        .map(|packed| {
+            palace_core::gpu::PortableFeedbackKey::new(packed & 0x00ff_ffff, packed >> 24)
+                .ok_or("sparse feedback returned an invalid chunk key")
+        })
         .collect::<Result<_, _>>()?;
     let mut pages = 0_usize;
     for (layer_index, _, tag, _) in &scene.loops {
         let channel_keys = keys.iter().copied().filter(|key| key.level() == *tag);
         let outcome = palace_core::gpu::PortableChunkPlan::from_demand(
-            *tag, scene.layers[*layer_index].grid, channel_keys, 1,
-        ).ok_or("sparse feedback returned a chunk outside its level")?;
+            *tag,
+            scene.layers[*layer_index].grid,
+            channel_keys,
+            1,
+        )
+        .ok_or("sparse feedback returned a chunk outside its level")?;
         pages += match outcome {
             palace_core::gpu::PortableChunkPlanOutcome::Planned(plan) => plan.page_owners().len(),
-            palace_core::gpu::PortableChunkPlanOutcome::ExceedsPortableBound { required_pages } => required_pages,
+            palace_core::gpu::PortableChunkPlanOutcome::ExceedsPortableBound { required_pages } => {
+                required_pages
+            }
         };
         if pages > palace_core::gpu::PortableDvrPageFrameInput::MAX_PAGES {
             return Ok(true);
@@ -2263,7 +2343,9 @@ pub fn full_level_scene_inputs(
             palace_core::gpu::PortableResidencyStep::Planned
             | palace_core::gpu::PortableResidencyStep::Complete => {}
             palace_core::gpu::PortableResidencyStep::ExceedsPortableBound { required_pages } => {
-                return Err(format!("{DEMAND_EXCEEDS_PAGE_BOUND}: {required_pages} pages needed"))
+                return Err(format!(
+                    "{DEMAND_EXCEEDS_PAGE_BOUND}: {required_pages} pages needed"
+                ))
             }
             other => return Err(format!("full-level planning stopped: {other:?}")),
         }
@@ -2320,10 +2402,13 @@ pub fn portable_orthogonal_slices_for_view(
         .next()
         .ok_or_else(|| "no image layer to slice".to_owned())?;
     let shape0 = spatial_shape(&base)?;
-    let voxel_shape_xyz: [u32; 3] = std::array::from_fn(|axis| u32::try_from(shape0[axis]).unwrap_or(u32::MAX));
+    let voxel_shape_xyz: [u32; 3] =
+        std::array::from_fn(|axis| u32::try_from(shape0[axis]).unwrap_or(u32::MAX));
     let channel_count = base.layer.channels.len().max(1) as u64;
     let meets_view = |shape: [u64; 3]| {
-        let Some(([pane_width, pane_height], zoom, axis)) = view else { return false };
+        let Some(([pane_width, pane_height], zoom, axis)) = view else {
+            return false;
+        };
         let plane = |shape: [u64; 3]| match axis {
             0 => [shape[1], shape[2]],
             1 => [shape[0], shape[2]],
@@ -2342,12 +2427,22 @@ pub fn portable_orthogonal_slices_for_view(
     // on the CPU and may produce a larger image, still from at most four bounded source pages.
     let mut chosen = None;
     for level in 0.. {
-        let Ok(requests) = session.local_layer_render_requests_at_level(limits, level) else { break };
-        let Some(request) = requests.into_iter().next() else { break };
+        let Ok(requests) = session.local_layer_render_requests_at_level(limits, level) else {
+            break;
+        };
+        let Some(request) = requests.into_iter().next() else {
+            break;
+        };
         let shape = spatial_shape(&request)?;
         let words = shape.iter().product::<u64>().saturating_mul(channel_count);
-        let largest_plane_words = [shape[0].saturating_mul(shape[1]), shape[0].saturating_mul(shape[2]), shape[1].saturating_mul(shape[2])]
-            .into_iter().max().unwrap_or(0);
+        let largest_plane_words = [
+            shape[0].saturating_mul(shape[1]),
+            shape[0].saturating_mul(shape[2]),
+            shape[1].saturating_mul(shape[2]),
+        ]
+        .into_iter()
+        .max()
+        .unwrap_or(0);
         if words > budget_words {
             continue;
         }
@@ -2363,7 +2458,8 @@ pub fn portable_orthogonal_slices_for_view(
     let (level, request, shape) = chosen.ok_or_else(|| {
         "no pyramid level of the base layer fits the portable page budget".to_owned()
     })?;
-    let chunk_shape: [u64; 3] = std::array::from_fn(|axis| request.source.spatial_chunk_shape(axis).max(1));
+    let chunk_shape: [u64; 3] =
+        std::array::from_fn(|axis| request.source.spatial_chunk_shape(axis).max(1));
     let counts: [u64; 3] = std::array::from_fn(|axis| shape[axis].div_ceil(chunk_shape[axis]));
     let mut chunks = Vec::with_capacity((counts[0] * counts[1] * counts[2]) as usize);
     for z in 0..counts[2] {
@@ -2375,7 +2471,12 @@ pub fn portable_orthogonal_slices_for_view(
     }
     let layer_id = request.layer.layer_id;
     let plans = session
-        .local_layer_chunk_plan_for_chunks_at_level(limits, level, &chunks, chunks.len().max(1) * 64)
+        .local_layer_chunk_plan_for_chunks_at_level(
+            limits,
+            level,
+            &chunks,
+            chunks.len().max(1) * 64,
+        )
         .map_err(|error| error.to_string())?
         .into_iter()
         .filter(|plan| plan.request.layer.layer_id == layer_id)
@@ -2383,24 +2484,39 @@ pub fn portable_orthogonal_slices_for_view(
     let loaded = session
         .read_local_layer_chunks(&plans, 64 * 1024 * 1024, 256 * 1024 * 1024)
         .map_err(|error| error.to_string())?;
-    let (descriptors, _) = session.native_layer_admission(limits).map_err(|error| error.to_string())?;
-    let descriptors = descriptors.into_iter().filter(|descriptor| descriptor.layer_id == layer_id).collect::<Vec<_>>();
+    let (descriptors, _) = session
+        .native_layer_admission(limits)
+        .map_err(|error| error.to_string())?;
+    let descriptors = descriptors
+        .into_iter()
+        .filter(|descriptor| descriptor.layer_id == layer_id)
+        .collect::<Vec<_>>();
     let scene = session
         .native_portable_scene_page_admission(descriptors, &plans, &loaded)
         .map_err(|error| error.to_string())?;
-    let first = scene.layers.first().ok_or_else(|| "portable orthogonal scene has no layers".to_owned())?;
+    let first = scene
+        .layers
+        .first()
+        .ok_or_else(|| "portable orthogonal scene has no layers".to_owned())?;
     let requested = crosshair_xyz.unwrap_or(std::array::from_fn(|axis| voxel_shape_xyz[axis] / 2));
     let crosshair_xyz: [u32; 3] =
         std::array::from_fn(|axis| requested[axis].min(voxel_shape_xyz[axis].saturating_sub(1)));
     // Level-zero voxel to this level's voxel: the same fraction along the axis.
     let local: [u32; 3] = std::array::from_fn(|axis| {
         let at = u64::from(crosshair_xyz[axis]) * shape[axis] / shape0[axis].max(1);
-        u32::try_from(at).unwrap_or(u32::MAX).min(first.dimensions_xyz[axis].saturating_sub(1))
+        u32::try_from(at)
+            .unwrap_or(u32::MAX)
+            .min(first.dimensions_xyz[axis].saturating_sub(1))
     });
     let xy = palace_scene_slice_rgba(&scene, 2, local[2])?;
     let xz = palace_scene_slice_rgba(&scene, 1, local[1])?;
     let yz = palace_scene_slice_rgba(&scene, 0, local[0])?;
-    Ok(PortableOrthogonalSlices { planes: [xy, xz, yz], level, voxel_shape_xyz, crosshair_xyz })
+    Ok(PortableOrthogonalSlices {
+        planes: [xy, xz, yz],
+        level,
+        voxel_shape_xyz,
+        crosshair_xyz,
+    })
 }
 
 /// [`portable_orthogonal_slices`] encoded as three PNGs, in XY, XZ, YZ order.
@@ -2410,10 +2526,15 @@ pub fn portable_orthogonal_slice_pngs(
 ) -> Result<([Vec<u8>; 3], PortableOrthogonalSlices), String> {
     let slices = portable_orthogonal_slices(session, crosshair_xyz)?;
     let encode = |plane: &(u32, u32, Vec<u8>)| -> Result<Vec<u8>, String> {
-        let frame = palace_png::RgbaFrame::new(plane.0, plane.1, plane.2.clone()).map_err(|error| error.to_string())?;
+        let frame = palace_png::RgbaFrame::new(plane.0, plane.1, plane.2.clone())
+            .map_err(|error| error.to_string())?;
         Ok(palace_png::encode_rgba(&frame))
     };
-    let pngs = [encode(&slices.planes[0])?, encode(&slices.planes[1])?, encode(&slices.planes[2])?];
+    let pngs = [
+        encode(&slices.planes[0])?,
+        encode(&slices.planes[1])?,
+        encode(&slices.planes[2])?,
+    ];
     Ok((pngs, slices))
 }
 
@@ -2424,6 +2545,203 @@ pub struct PortableOrthogonalViewSlices {
     pub voxel_shape_xyz: [u32; 3],
     pub crosshair_xyz: [u32; 3],
     pub pyramid_shapes_xyz: Vec<[u32; 3]>,
+}
+
+/// One point along a temporary XY intensity profile. Coordinates and distance are expressed in
+/// level-zero voxel units so the plot keeps the same scale regardless of the sampled pyramid.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProfileSample {
+    pub distance: f32,
+    pub x: f32,
+    pub y: f32,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProfileChannel {
+    pub index: usize,
+    pub values: Vec<f32>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LineProfile {
+    pub level: u32,
+    pub z: u32,
+    pub pixel_length: f64,
+    pub physical_length: Option<f64>,
+    pub physical_unit: Option<String>,
+    pub samples: Vec<ProfileSample>,
+    pub channels: Vec<ProfileChannel>,
+}
+
+/// Sample raw channel values along an XY line while reading only the chunks crossed by it.
+/// The endpoints and Z coordinate use level-zero voxel coordinates; `level` selects the pyramid
+/// that supplies the samples, normally the level currently displayed by the browser.
+pub fn portable_xy_line_profile(
+    session: &LocalSession,
+    level: u32,
+    from: [f64; 2],
+    to: [f64; 2],
+    z: f64,
+    channels: &[usize],
+    maximum_samples: usize,
+) -> Result<LineProfile, String> {
+    if from
+        .iter()
+        .chain(&to)
+        .chain(std::iter::once(&z))
+        .any(|value| !value.is_finite())
+    {
+        return Err("profile coordinates must be finite".into());
+    }
+    if channels.is_empty() {
+        return Err("profile needs at least one channel".into());
+    }
+    if maximum_samples < 2 {
+        return Err("profile sample limit must be at least two".into());
+    }
+    let limits = LayerRenderLimits::new(4, 4);
+    let request = session
+        .local_layer_render_requests_at_level(limits, level)
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .next()
+        .ok_or_else(|| "no image layer to sample".to_owned())?;
+    let shape: [u64; 3] = std::array::from_fn(|axis| request.source.spatial_shape(axis).max(1));
+    let shape0: [u64; 3] = session
+        .local_layer_render_requests_at_level(limits, 0)
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .next()
+        .map(|request| std::array::from_fn(|axis| request.source.spatial_shape(axis).max(1)))
+        .ok_or_else(|| "no level-zero image layer to sample".to_owned())?;
+    let source_point = |point: [f64; 2]| {
+        [
+            (point[0] * shape[0] as f64 / shape0[0] as f64)
+                .clamp(0.0, shape[0].saturating_sub(1) as f64),
+            (point[1] * shape[1] as f64 / shape0[1] as f64)
+                .clamp(0.0, shape[1].saturating_sub(1) as f64),
+        ]
+    };
+    let source_from = source_point(from);
+    let source_to = source_point(to);
+    let source_length = (source_to[0] - source_from[0]).hypot(source_to[1] - source_from[1]);
+    let count = ((source_length.ceil() as usize).saturating_add(1))
+        .clamp(2, maximum_samples);
+    let source_z = (z * shape[2] as f64 / shape0[2] as f64)
+        .floor()
+        .clamp(0.0, shape[2].saturating_sub(1) as f64) as u64;
+    let coordinates = (0..count)
+        .map(|sample| {
+            let t = sample as f64 / (count - 1) as f64;
+            [
+                (source_from[0] + (source_to[0] - source_from[0]) * t).round() as u64,
+                (source_from[1] + (source_to[1] - source_from[1]) * t).round() as u64,
+                source_z,
+            ]
+        })
+        .collect::<Vec<_>>();
+    let chunk_shape: [u64; 3] =
+        std::array::from_fn(|axis| request.source.spatial_chunk_shape(axis).max(1));
+    let chunk_counts: [u64; 3] =
+        std::array::from_fn(|axis| shape[axis].div_ceil(chunk_shape[axis]));
+    let chunk_index = |coordinate: [u64; 3]| {
+        let chunk: [u64; 3] =
+            std::array::from_fn(|axis| coordinate[axis] / chunk_shape[axis]);
+        u32::try_from(chunk[0] + chunk_counts[0] * (chunk[1] + chunk_counts[1] * chunk[2]))
+            .map_err(|_| "profile chunk index exceeds u32".to_owned())
+    };
+    let mut indices = coordinates
+        .iter()
+        .copied()
+        .map(chunk_index)
+        .collect::<Result<Vec<_>, _>>()?;
+    indices.sort_unstable();
+    indices.dedup();
+    let line_length = (to[0] - from[0]).hypot(to[1] - from[1]);
+    let physical_length = session
+        .voxel_point_physical_f64([from[0], from[1], z])
+        .and_then(|start| {
+            session
+                .voxel_point_physical_f64([to[0], to[1], z])
+                .map(|end| (end[0] - start[0]).hypot(end[1] - start[1]))
+        })
+        .ok()
+        .filter(|length| length.is_finite());
+    let physical_unit = session
+        .portable_layer_xy_unit(request.layer.layer_id)
+        .ok()
+        .flatten();
+    let samples = (0..count)
+        .map(|sample| {
+            let t = sample as f64 / (count - 1) as f64;
+            ProfileSample {
+                distance: (line_length * t) as f32,
+                x: (from[0] + (to[0] - from[0]) * t) as f32,
+                y: (from[1] + (to[1] - from[1]) * t) as f32,
+            }
+        })
+        .collect::<Vec<_>>();
+    let channels = channels
+        .iter()
+        .map(|&channel| {
+            if !request
+                .layer
+                .channels
+                .iter()
+                .any(|item| item.source_index as usize == channel)
+            {
+                return Err(format!("profile channel {channel} is outside the image"));
+            }
+            let source_channel = u32::try_from(channel)
+                .map_err(|_| format!("profile channel {channel} exceeds u32"))?;
+            let words = session
+                .layer_chunk_words_cached(
+                    limits,
+                    request.layer.layer_id,
+                    level,
+                    source_channel,
+                    &indices,
+                )
+                .map_err(|error| error.to_string())?;
+            let values = coordinates
+                .iter()
+                .copied()
+                .map(|coordinate| {
+                    let chunk: [u64; 3] =
+                        std::array::from_fn(|axis| coordinate[axis] / chunk_shape[axis]);
+                    let index = chunk_index(coordinate)?;
+                    let position = indices
+                        .binary_search(&index)
+                        .expect("profile planned every sampled chunk");
+                    let local: [u64; 3] = std::array::from_fn(|axis| {
+                        coordinate[axis] - chunk[axis] * chunk_shape[axis]
+                    });
+                    let logical: [u64; 3] = std::array::from_fn(|axis| {
+                        (shape[axis] - chunk[axis] * chunk_shape[axis]).min(chunk_shape[axis])
+                    });
+                    let offset =
+                        (local[0] + logical[0] * (local[1] + logical[1] * local[2])) as usize;
+                    Ok(words[position][offset] as f32)
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            Ok(ProfileChannel {
+                index: channel,
+                values,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok(LineProfile {
+        level,
+        z: z.clamp(0.0, shape0[2].saturating_sub(1) as f64) as u32,
+        pixel_length: line_length,
+        physical_length,
+        physical_unit,
+        samples,
+        channels,
+    })
 }
 
 pub fn portable_pyramid_shapes_xyz(session: &LocalSession) -> Result<Vec<[u32; 3]>, String> {
@@ -2459,6 +2777,7 @@ pub fn portable_xy_tile_png(
     tile_x: u32,
     tile_y: u32,
     tile_edge: u32,
+    window_overrides: &[(usize, [f64; 2])],
 ) -> Result<(Vec<u8>, [u32; 2]), String> {
     let limits = LayerRenderLimits::new(4, 4);
     let request = session
@@ -2468,7 +2787,10 @@ pub fn portable_xy_tile_png(
         .next()
         .ok_or_else(|| "no image layer to tile".to_owned())?;
     let shape: [u64; 3] = std::array::from_fn(|axis| request.source.spatial_shape(axis));
-    let origin = [u64::from(tile_x) * u64::from(tile_edge), u64::from(tile_y) * u64::from(tile_edge)];
+    let origin = [
+        u64::from(tile_x) * u64::from(tile_edge),
+        u64::from(tile_y) * u64::from(tile_edge),
+    ];
     if origin[0] >= shape[0] || origin[1] >= shape[1] {
         return Err("XY tile is outside the pyramid level".into());
     }
@@ -2478,8 +2800,7 @@ pub fn portable_xy_tile_png(
     ];
     let chunk_shape: [u64; 3] =
         std::array::from_fn(|axis| request.source.spatial_chunk_shape(axis).max(1));
-    let counts: [u64; 3] =
-        std::array::from_fn(|axis| shape[axis].div_ceil(chunk_shape[axis]));
+    let counts: [u64; 3] = std::array::from_fn(|axis| shape[axis].div_ceil(chunk_shape[axis]));
     let chunk_min = [origin[0] / chunk_shape[0], origin[1] / chunk_shape[1]];
     let chunk_max = [
         (origin[0] + u64::from(extent[0]) - 1) / chunk_shape[0],
@@ -2489,32 +2810,80 @@ pub fn portable_xy_tile_png(
     let mut indices = Vec::new();
     for y in chunk_min[1]..=chunk_max[1] {
         for x in chunk_min[0]..=chunk_max[0] {
-            indices.push(u32::try_from(x + counts[0] * (y + counts[1] * z))
-                .map_err(|_| "XY tile chunk index exceeds u32")?);
+            indices.push(
+                u32::try_from(x + counts[0] * (y + counts[1] * z))
+                    .map_err(|_| "XY tile chunk index exceeds u32")?,
+            );
         }
     }
-    let words = request.layer.channels.iter().map(|channel| {
-        session.layer_chunk_words_cached(limits, request.layer.layer_id, level, channel.source_index, &indices)
-            .map_err(|error| error.to_string())
-    }).collect::<Result<Vec<_>, _>>()?;
-    let transfers = request.layer.channels.iter()
-        .map(newvolim_render::PortableChannelTransfer::from).collect::<Vec<_>>();
+    let words = request
+        .layer
+        .channels
+        .iter()
+        .map(|channel| {
+            session
+                .layer_chunk_words_cached(
+                    limits,
+                    request.layer.layer_id,
+                    level,
+                    channel.source_index,
+                    &indices,
+                )
+                .map_err(|error| error.to_string())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let transfers = request
+        .layer
+        .channels
+        .iter()
+        .map(|channel| {
+            let mut transfer = newvolim_render::PortableChannelTransfer::from(channel);
+            if let Some((_, [start, end])) = window_overrides
+                .iter()
+                .find(|(source_index, _)| *source_index == channel.source_index as usize)
+            {
+                if !start.is_finite() || !end.is_finite() || start >= end {
+                    return Err(format!(
+                        "invalid 2D window {start}..{end} for channel {}",
+                        channel.source_index
+                    ));
+                }
+                transfer.window_start = *start;
+                transfer.window_end = *end;
+            }
+            Ok(transfer)
+        })
+        .collect::<Result<Vec<_>, String>>()?;
     let rgba = (0..usize::try_from(u64::from(extent[0]) * u64::from(extent[1])).unwrap())
         .flat_map(|pixel| {
-            let coordinate = [origin[0] + pixel as u64 % u64::from(extent[0]), origin[1] + pixel as u64 / u64::from(extent[0]), 0];
-            let chunk: [u64; 3] =
-                std::array::from_fn(|axis| coordinate[axis] / chunk_shape[axis]);
+            let coordinate = [
+                origin[0] + pixel as u64 % u64::from(extent[0]),
+                origin[1] + pixel as u64 / u64::from(extent[0]),
+                0,
+            ];
+            let chunk: [u64; 3] = std::array::from_fn(|axis| coordinate[axis] / chunk_shape[axis]);
             let index = (chunk[0] + counts[0] * (chunk[1] + counts[1] * chunk[2])) as u32;
-            let position = indices.binary_search(&index).expect("tile planned its pixel chunk");
-            let local: [u64; 3] = std::array::from_fn(|axis| coordinate[axis] - chunk[axis] * chunk_shape[axis]);
-            let logical: [u64; 3] = std::array::from_fn(|axis| (shape[axis] - chunk[axis] * chunk_shape[axis]).min(chunk_shape[axis]));
+            let position = indices
+                .binary_search(&index)
+                .expect("tile planned its pixel chunk");
+            let local: [u64; 3] =
+                std::array::from_fn(|axis| coordinate[axis] - chunk[axis] * chunk_shape[axis]);
+            let logical: [u64; 3] = std::array::from_fn(|axis| {
+                (shape[axis] - chunk[axis] * chunk_shape[axis]).min(chunk_shape[axis])
+            });
             let offset = (local[0] + logical[0] * (local[1] + logical[1] * local[2])) as usize;
-            let samples = words.iter().map(|channel| channel[position][offset] as f64).collect::<Vec<_>>();
-            let linear = newvolim_render::composite_portable_scene_samples(&[(&transfers, &samples)])
-                .expect("XY tile channel samples match transfers");
+            let samples = words
+                .iter()
+                .map(|channel| channel[position][offset] as f64)
+                .collect::<Vec<_>>();
+            let linear =
+                newvolim_render::composite_portable_scene_samples(&[(&transfers, &samples)])
+                    .expect("XY tile channel samples match transfers");
             portable_linear_premultiplied_to_srgb8(linear)
-        }).collect::<Vec<_>>();
-    let frame = palace_png::RgbaFrame::new(extent[0], extent[1], rgba).map_err(|error| error.to_string())?;
+        })
+        .collect::<Vec<_>>();
+    let frame = palace_png::RgbaFrame::new(extent[0], extent[1], rgba)
+        .map_err(|error| error.to_string())?;
     Ok((palace_png::encode_rgba(&frame), extent))
 }
 
@@ -2545,10 +2914,8 @@ fn portable_orthogonal_view_plane(
         return Err("orthogonal viewport scale is invalid".into());
     }
     let meets_screen = |shape: [u64; 3]| {
-        shape[horizontal_axis] as f64
-            >= shape0[horizontal_axis] as f64 * scale
-            && shape[vertical_axis] as f64
-                >= shape0[vertical_axis] as f64 * scale
+        shape[horizontal_axis] as f64 >= shape0[horizontal_axis] as f64 * scale
+            && shape[vertical_axis] as f64 >= shape0[vertical_axis] as f64 * scale
     };
     let mut chosen = None;
     for level in 0.. {
@@ -2579,12 +2946,14 @@ fn portable_orthogonal_view_plane(
         let first = source_at(axis, 0.0, extent);
         let last = source_at(axis, extent.saturating_sub(1) as f64, extent);
         let maximum = shape[axis].saturating_sub(1) as i64;
-        (first.min(last).clamp(0, maximum) as u64, first.max(last).clamp(0, maximum) as u64)
+        (
+            first.min(last).clamp(0, maximum) as u64,
+            first.max(last).clamp(0, maximum) as u64,
+        )
     };
     let (horizontal_min, horizontal_max) = axis_range(horizontal_axis, width);
     let (vertical_min, vertical_max) = axis_range(vertical_axis, height);
-    let cut = (u64::from(crosshair_xyz[cut_axis]) * shape[cut_axis]
-        / shape0[cut_axis].max(1))
+    let cut = (u64::from(crosshair_xyz[cut_axis]) * shape[cut_axis] / shape0[cut_axis].max(1))
         .min(shape[cut_axis].saturating_sub(1));
     let mut voxel_min = [0; 3];
     let mut voxel_max = shape.map(|extent| extent.saturating_sub(1));
@@ -2601,7 +2970,8 @@ fn portable_orthogonal_view_plane(
         for y in chunk_min[1]..=chunk_max[1] {
             for x in chunk_min[0]..=chunk_max[0] {
                 let index = x + chunk_counts[0] * (y + chunk_counts[1] * z);
-                chunk_indices.push(u32::try_from(index).map_err(|_| "slice chunk index exceeds u32")?);
+                chunk_indices
+                    .push(u32::try_from(index).map_err(|_| "slice chunk index exceeds u32")?);
             }
         }
     }
@@ -2650,8 +3020,7 @@ fn portable_orthogonal_view_plane(
                     let chunk_xyz: [u64; 3] =
                         std::array::from_fn(|axis| coordinate[axis] as u64 / chunk_shape[axis]);
                     let chunk_index = (chunk_xyz[0]
-                        + chunk_counts[0]
-                            * (chunk_xyz[1] + chunk_counts[1] * chunk_xyz[2]))
+                        + chunk_counts[0] * (chunk_xyz[1] + chunk_counts[1] * chunk_xyz[2]))
                         as u32;
                     let Ok(chunk_position) = chunk_indices.binary_search(&chunk_index) else {
                         return f64::NAN;
@@ -2670,8 +3039,9 @@ fn portable_orthogonal_view_plane(
                         .unwrap_or(f64::NAN)
                 })
                 .collect::<Vec<_>>();
-            let linear = newvolim_render::composite_portable_scene_samples(&[(&transfers, &samples)])
-                .expect("orthogonal viewport channel samples match transfers");
+            let linear =
+                newvolim_render::composite_portable_scene_samples(&[(&transfers, &samples)])
+                    .expect("orthogonal viewport channel samples match transfers");
             portable_linear_premultiplied_to_srgb8(linear)
         })
         .collect();
@@ -2698,9 +3068,8 @@ pub fn portable_orthogonal_slice_pngs_for_view(
     let voxel_shape_xyz: [u32; 3] =
         std::array::from_fn(|axis| u32::try_from(shape0[axis]).unwrap_or(u32::MAX));
     let requested = crosshair_xyz.unwrap_or(std::array::from_fn(|axis| voxel_shape_xyz[axis] / 2));
-    let crosshair_xyz: [u32; 3] = std::array::from_fn(|axis| {
-        requested[axis].min(voxel_shape_xyz[axis].saturating_sub(1))
-    });
+    let crosshair_xyz: [u32; 3] =
+        std::array::from_fn(|axis| requested[axis].min(voxel_shape_xyz[axis].saturating_sub(1)));
     let focus_xyz: [f64; 3] = focus_normalized_xyz
         .map(|focus| std::array::from_fn(|axis| f64::from(focus[axis]) * shape0[axis] as f64))
         .unwrap_or_else(|| crosshair_xyz.map(|value| value as f64 + 0.5));
@@ -2790,7 +3159,13 @@ pub fn demand_scene_plan(
     session: &LocalSession,
     request: NativePortableDrawRequest,
     levels: Option<&[u32]>,
-) -> Result<(newvolim_residency::ScenePlan, Vec<palace_core::gpu::PortableRayInterval>), String> {
+) -> Result<
+    (
+        newvolim_residency::ScenePlan,
+        Vec<palace_core::gpu::PortableRayInterval>,
+    ),
+    String,
+> {
     demand_scene_plan_inner(session, request, levels, true)
 }
 
@@ -2808,7 +3183,13 @@ fn demand_scene_plan_inner(
     request: NativePortableDrawRequest,
     levels: Option<&[u32]>,
     include_rays: bool,
-) -> Result<(newvolim_residency::ScenePlan, Vec<palace_core::gpu::PortableRayInterval>), String> {
+) -> Result<
+    (
+        newvolim_residency::ScenePlan,
+        Vec<palace_core::gpu::PortableRayInterval>,
+    ),
+    String,
+> {
     let size = desktop_frame_size(request.width, request.height, 1)?;
     let controls = CameraControls {
         focus_xyz: request.focus_xyz,
@@ -2825,7 +3206,11 @@ fn demand_scene_plan_inner(
     let scene = prepare_demand_scene_inner(session, request, &levels, include_rays)?;
     let level_counts = demand_scene_level_counts(session)?;
     let reference = &scene.layers[0];
-    let dimensions_zyx = [reference.dimensions[2], reference.dimensions[1], reference.dimensions[0]];
+    let dimensions_zyx = [
+        reference.dimensions[2],
+        reference.dimensions[1],
+        reference.dimensions[0],
+    ];
     let spacing_zyx = [
         reference.transform.scale[2].abs() as f32,
         reference.transform.scale[1].abs() as f32,
@@ -2834,10 +3219,18 @@ fn demand_scene_plan_inner(
     let basis = palace_frame::camera_ray_basis_for_geometry(dimensions_zyx, spacing_zyx, controls)
         .map_err(|error| error.to_string())?;
     let scene_minimum = std::array::from_fn(|axis| {
-        scene.layers.iter().map(|layer| layer.minimum[axis]).fold(f32::INFINITY, f32::min)
+        scene
+            .layers
+            .iter()
+            .map(|layer| layer.minimum[axis])
+            .fold(f32::INFINITY, f32::min)
     });
     let scene_maximum = std::array::from_fn(|axis| {
-        scene.layers.iter().map(|layer| layer.maximum[axis]).fold(f32::NEG_INFINITY, f32::max)
+        scene
+            .layers
+            .iter()
+            .map(|layer| layer.maximum[axis])
+            .fold(f32::NEG_INFINITY, f32::max)
     });
     let mut layers = Vec::with_capacity(scene.layers.len());
     let mut loop_index = 0_usize;
@@ -2910,7 +3303,10 @@ pub fn layer_chunk_words(
         .find(|request| request.layer.layer_id.0 == layer_id)
         .ok_or_else(|| format!("layer {layer_id} is not in the render plan"))?;
     let counts: [u32; 3] = std::array::from_fn(|axis| {
-        request.source.spatial_shape(axis).div_ceil(request.source.spatial_chunk_shape(axis).max(1)) as u32
+        request
+            .source
+            .spatial_shape(axis)
+            .div_ceil(request.source.spatial_chunk_shape(axis).max(1)) as u32
     });
     let indices = chunks_xyz
         .iter()
@@ -2921,7 +3317,13 @@ pub fn layer_chunk_words(
         })
         .collect::<Result<Vec<_>, _>>()?;
     session
-        .layer_chunk_words_cached(limits, newvolim_scene::LayerId(layer_id), level, source_index, &indices)
+        .layer_chunk_words_cached(
+            limits,
+            newvolim_scene::LayerId(layer_id),
+            level,
+            source_index,
+            &indices,
+        )
         .map(|words| words.iter().map(|words| words.as_ref().clone()).collect())
         .map_err(|error| error.to_string())
 }
@@ -2945,7 +3347,9 @@ pub fn demand_scene_levels(
         .layer_id;
     requests
         .iter()
-        .map(|request| demand_scene_layer_level(session, request.layer.layer_id, reference, size, controls))
+        .map(|request| {
+            demand_scene_layer_level(session, request.layer.layer_id, reference, size, controls)
+        })
         .collect()
 }
 
@@ -3050,7 +3454,10 @@ pub fn demand_scene_layer_level(
 /// The scene's opacity reference: the geometric default scaled by the session's depth scale,
 /// so both the demand route and the direct route see through the volume as far as the user
 /// asked. Every frame route takes its reference from here.
-pub fn scene_opacity_reference(session: &LocalSession, extent_physical: [f32; 3]) -> Result<f32, String> {
+pub fn scene_opacity_reference(
+    session: &LocalSession,
+    extent_physical: [f32; 3],
+) -> Result<f32, String> {
     Ok(portable_opacity_reference(extent_physical)? * session.depth_scale())
 }
 
@@ -3083,24 +3490,37 @@ pub fn demand_scene_layer_pages(
         // The placeholder still needs this channel's own owner: page owners must not alias across
         // the whole scene, so a shared placeholder owner makes a multi-channel bootstrap frame
         // unadmittable.
-        return Ok(vec![
-            palace_core::gpu::PortableTensorPage::new(owner_base, vec![0])
-                .ok_or("placeholder page is not admitted")?,
-        ]);
+        return Ok(vec![palace_core::gpu::PortableTensorPage::new(
+            owner_base,
+            vec![0],
+        )
+        .ok_or("placeholder page is not admitted")?]);
     }
-    if let Some(pages) = session.packed_pages_for_plan(layer_id, level, channel, residency.plan())
-        .map_err(|error| error.to_string())? {
+    if let Some(pages) = session
+        .packed_pages_for_plan(layer_id, level, channel, residency.plan())
+        .map_err(|error| error.to_string())?
+    {
         return Ok(pages);
     }
     // Chunk words from the session cache (disk only for chunks no frame has read), placed by
     // the shared page assembler the browser uses too.
-    let indices: Vec<u32> = residency.plan().chunks().iter().map(|chunk| chunk.chunk_index).collect();
+    let indices: Vec<u32> = residency
+        .plan()
+        .chunks()
+        .iter()
+        .map(|chunk| chunk.chunk_index)
+        .collect();
     let words = session
         .layer_chunk_words_cached(limits, layer_id, level, channel, &indices)
         .map_err(|error| error.to_string())?;
-    let by_index: std::collections::HashMap<u32, &[u32]> =
-        indices.iter().copied().zip(words.iter().map(|words| words.as_slice())).collect();
-    let words = newvolim_residency::assemble_pages(residency.plan(), |index| by_index.get(&index).copied())?;
+    let by_index: std::collections::HashMap<u32, &[u32]> = indices
+        .iter()
+        .copied()
+        .zip(words.iter().map(|words| words.as_slice()))
+        .collect();
+    let words = newvolim_residency::assemble_pages(residency.plan(), |index| {
+        by_index.get(&index).copied()
+    })?;
     let pages: Vec<_> = words
         .into_iter()
         .zip(residency.plan().page_owners())
@@ -3109,7 +3529,8 @@ pub fn demand_scene_layer_pages(
                 .ok_or_else(|| "planned page exceeds the portable page bound".to_owned())
         })
         .collect::<Result<_, _>>()?;
-    session.remember_packed_pages(layer_id, level, channel, residency.plan(), &pages)
+    session
+        .remember_packed_pages(layer_id, level, channel, residency.plan(), &pages)
         .map_err(|error| error.to_string())?;
     Ok(pages)
 }
@@ -3128,7 +3549,11 @@ pub fn palace_demand_scene_on_adapter(
     session: &LocalSession,
     scene: &palace_core::gpu::PortableDvrSceneFrameInput,
     page_table: &palace_core::gpu::PortablePageTable,
-) -> Option<(palace_core::gpu::PortableFrameAttachments, Vec<u32>, Vec<u32>)> {
+) -> Option<(
+    palace_core::gpu::PortableFrameAttachments,
+    Vec<u32>,
+    Vec<u32>,
+)> {
     let (device, queue) = session.portable_device()?;
     palace_wgpu::WgpuOperatorRecorder::new(device, queue)
         .record_dvr_scene_frame_with_residency(scene, Some(page_table), 4_096, 16)
@@ -3162,7 +3587,8 @@ pub fn portable_demand_world_rays(
         transform.scale[1].abs() as f32,
         transform.scale[0].abs() as f32,
     ];
-    let count = (size.width as usize).checked_mul(size.height as usize)
+    let count = (size.width as usize)
+        .checked_mul(size.height as usize)
         .ok_or_else(|| "demand-driven ray count overflows usize".to_owned())?;
     // Fit once and expand directly into clipped world rays. Independent scanline groups can
     // run on native worker threads; each group keeps pixel order, preserving the exact ray
@@ -3171,18 +3597,28 @@ pub fn portable_demand_world_rays(
         .map_err(|error| error.to_string())?;
     #[cfg(not(target_arch = "wasm32"))]
     if count >= 65_536 {
-        let workers = std::thread::available_parallelism().map(|count| count.get().min(8)).unwrap_or(1);
+        let workers = std::thread::available_parallelism()
+            .map(|count| count.get().min(8))
+            .unwrap_or(1);
         if workers > 1 {
             let rows_per_worker = (size.height as usize).div_ceil(workers);
             return std::thread::scope(|scope| {
                 let mut handles = Vec::new();
                 for start in (0..size.height).step_by(rows_per_worker) {
-                    let end = start.saturating_add(rows_per_worker as u32).min(size.height);
-                    handles.push(scope.spawn(move || demand_world_ray_rows(basis, size, transform, minimum, maximum, start, end)));
+                    let end = start
+                        .saturating_add(rows_per_worker as u32)
+                        .min(size.height);
+                    handles.push(scope.spawn(move || {
+                        demand_world_ray_rows(basis, size, transform, minimum, maximum, start, end)
+                    }));
                 }
                 let mut rays = Vec::with_capacity(count);
                 for handle in handles {
-                    rays.extend(handle.join().map_err(|_| "demand ray worker panicked".to_owned())??);
+                    rays.extend(
+                        handle
+                            .join()
+                            .map_err(|_| "demand ray worker panicked".to_owned())??,
+                    );
                 }
                 Ok(rays)
             });
@@ -3213,7 +3649,7 @@ fn demand_world_ray_rows(
             let direction = (forward
                 + right.scale(horizontal * aspect * basis.focal_scale)
                 + up.scale(vertical * basis.focal_scale))
-                .normalized();
+            .normalized();
             let ray = palace_frame::CameraRay {
                 origin: basis.origin,
                 direction: [direction[0], direction[1], direction[2]],
@@ -3550,50 +3986,120 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         // Level 0 is 256×256×96 = 6.3 M words, beyond the four pages (4.2 M); level 1 is
         // 128×128×48 = 0.8 M words in 8 chunks of 64×64×32 (the last z chunk half-height).
-        let root = chunked_two_level_store(dir.path(), [(256, 256, 96), (128, 128, 48)], [1, 32, 64, 64]);
+        let root = chunked_two_level_store(
+            dir.path(),
+            [(256, 256, 96), (128, 128, 48)],
+            [1, 32, 64, 64],
+        );
         let mut session = LocalSession::default();
         session.open_local_omezarr(&root).unwrap();
         session.prepare_default_portable_image_layer().unwrap();
         let limits = LayerRenderLimits::new(4, 4);
-        let layer_id = session.local_layer_render_requests(limits).unwrap()[0].layer.layer_id;
+        let layer_id = session.local_layer_render_requests(limits).unwrap()[0]
+            .layer
+            .layer_id;
         // Level 1: demand every chunk twice.
         let grid = palace_core::gpu::PortableChunkGrid::new([128, 128, 48], [64, 64, 32]).unwrap();
         let tag = palace_core::gpu::PortableResidencyTag::compose(0, 1).unwrap();
-        let mut residency = palace_core::gpu::PortableResidencyLoop::new(tag, grid, 1, 4_096, 16, 24).unwrap();
-        let keys: Vec<_> = (0..8).map(|index| palace_core::gpu::PortableFeedbackKey::new(index, tag).unwrap()).collect();
-        assert!(matches!(residency.absorb(keys).unwrap(), palace_core::gpu::PortableResidencyStep::Planned));
-        let first = demand_scene_layer_pages(&session, limits, layer_id, 1, &residency, 0, 1).unwrap();
+        let mut residency =
+            palace_core::gpu::PortableResidencyLoop::new(tag, grid, 1, 4_096, 16, 24).unwrap();
+        let keys: Vec<_> = (0..8)
+            .map(|index| palace_core::gpu::PortableFeedbackKey::new(index, tag).unwrap())
+            .collect();
+        assert!(matches!(
+            residency.absorb(keys).unwrap(),
+            palace_core::gpu::PortableResidencyStep::Planned
+        ));
+        let first =
+            demand_scene_layer_pages(&session, limits, layer_id, 1, &residency, 0, 1).unwrap();
         let (hits, misses, held, words) = session.chunk_cache_stats();
-        assert_eq!((hits, misses, held, words), (0, 8, 8, 4 * 131072 + 4 * 65536), "first frame reads every chunk");
+        assert_eq!(
+            (hits, misses, held, words),
+            (0, 8, 8, 4 * 131072 + 4 * 65536),
+            "first frame reads every chunk"
+        );
         assert_eq!(session.page_cache_stats().0, 0);
-        let second = demand_scene_layer_pages(&session, limits, layer_id, 1, &residency, 0, 1).unwrap();
+        let second =
+            demand_scene_layer_pages(&session, limits, layer_id, 1, &residency, 0, 1).unwrap();
         assert_eq!(first, second);
         let (hits, misses, _, _) = session.chunk_cache_stats();
-        assert_eq!((hits, misses), (0, 8), "second frame does not revisit the chunk cache");
-        assert_eq!(session.page_cache_stats().0, 1, "second frame reuses the packed pages");
+        assert_eq!(
+            (hits, misses),
+            (0, 8),
+            "second frame does not revisit the chunk cache"
+        );
+        assert_eq!(
+            session.page_cache_stats().0,
+            1,
+            "second frame reuses the packed pages"
+        );
         // A clone (what the server hands out) shares the cache.
         let clone = session.clone();
-        let third = demand_scene_layer_pages(&clone, limits, layer_id, 1, &residency, 0, 1).unwrap();
+        let third =
+            demand_scene_layer_pages(&clone, limits, layer_id, 1, &residency, 0, 1).unwrap();
         assert_eq!(first, third);
-        assert_eq!(session.chunk_cache_stats().1, 8, "the clone read nothing either");
-        assert_eq!(session.page_cache_stats().0, 2, "session clones share packed pages");
+        assert_eq!(
+            session.chunk_cache_stats().1,
+            8,
+            "the clone read nothing either"
+        );
+        assert_eq!(
+            session.page_cache_stats().0,
+            2,
+            "session clones share packed pages"
+        );
         // The chunk route reads through the same cache.
         let words = layer_chunk_words(&session, layer_id.0, 1, 0, &[[1, 1, 0]]).unwrap();
-        assert_eq!(words[0].as_slice(), &first[0].words()[3 * 131072..4 * 131072], "chunk 3 is the fourth in page 0");
-        assert!(layer_chunk_words(&session, layer_id.0, 1, 0, &[[2, 0, 0]]).is_err(), "outside the grid");
+        assert_eq!(
+            words[0].as_slice(),
+            &first[0].words()[3 * 131072..4 * 131072],
+            "chunk 3 is the fourth in page 0"
+        );
+        assert!(
+            layer_chunk_words(&session, layer_id.0, 1, 0, &[[2, 0, 0]]).is_err(),
+            "outside the grid"
+        );
 
         // Level choice: the whole store seen at zoom 1 needs level 1; close to the volume the
         // camera's level 0 stands (a fraction of it may be the working set).
         let size = FrameSize::new(640, 480).unwrap();
-        let wide = CameraControls { focus_xyz: None, orientation: None, orbit_delta: [0, 0], zoom: 1.0 };
+        let wide = CameraControls {
+            focus_xyz: None,
+            orientation: None,
+            orbit_delta: [0, 0],
+            zoom: 1.0,
+        };
         assert_eq!(demand_scene_levels(&session, size, wide).unwrap(), vec![0]);
-        assert_eq!(demand_scene_levels_fitting(&session, size, wide).unwrap(), vec![1]);
-        let close = CameraControls { focus_xyz: None, orientation: None, orbit_delta: [0, 0], zoom: 0.4 };
-        assert_eq!(demand_scene_levels_fitting(&session, size, close).unwrap(), vec![0]);
+        assert_eq!(
+            demand_scene_levels_fitting(&session, size, wide).unwrap(),
+            vec![1]
+        );
+        let close = CameraControls {
+            focus_xyz: None,
+            orientation: None,
+            orbit_delta: [0, 0],
+            zoom: 0.4,
+        };
+        assert_eq!(
+            demand_scene_levels_fitting(&session, size, close).unwrap(),
+            vec![0]
+        );
         session.open_local_omezarr(&root).unwrap();
-        assert_eq!(session.chunk_cache_stats(), (0, 0, 0, 0), "reopening discards decoded chunks");
-        assert_eq!(session.page_cache_stats(), (0, 0, 0, 0), "reopening discards packed pages");
-        assert_eq!(clone.page_cache_stats().0, 2, "an earlier clone keeps its own dataset cache");
+        assert_eq!(
+            session.chunk_cache_stats(),
+            (0, 0, 0, 0),
+            "reopening discards decoded chunks"
+        );
+        assert_eq!(
+            session.page_cache_stats(),
+            (0, 0, 0, 0),
+            "reopening discards packed pages"
+        );
+        assert_eq!(
+            clone.page_cache_stats().0,
+            2,
+            "an earlier clone keeps its own dataset cache"
+        );
     }
 
     #[test]
@@ -3606,17 +4112,31 @@ mod tests {
         session.prepare_default_portable_image_layer().unwrap();
         let mut request = NativePortableDrawRequest {
             focus_xyz: None,
-            origin_xyz: [0; 3], extent_xyz: [1; 3], width: 64, height: 48,
-            orbit_x: 0, orbit_y: 0, zoom: 1.0,
+            origin_xyz: [0; 3],
+            extent_xyz: [1; 3],
+            width: 64,
+            height: 48,
+            orbit_x: 0,
+            orbit_y: 0,
+            zoom: 1.0,
             orientation: Some([0.0, -0.24740396, 0.0, 0.9689124]),
         };
         for zoom in [1.0, 0.5, 0.25] {
             request.zoom = zoom;
             let levels = demand_scene_levels_fitting(
-                &session, FrameSize::new(64, 48).unwrap(),
-                CameraControls { focus_xyz: None, orbit_delta: [0, 0], zoom, orientation: request.orientation },
-            ).unwrap();
-            let shortcut = demand_driven_scene_camera_draw_with_rays_at_levels(&session, request, &levels).unwrap();
+                &session,
+                FrameSize::new(64, 48).unwrap(),
+                CameraControls {
+                    focus_xyz: None,
+                    orbit_delta: [0, 0],
+                    zoom,
+                    orientation: request.orientation,
+                },
+            )
+            .unwrap();
+            let shortcut =
+                demand_driven_scene_camera_draw_with_rays_at_levels(&session, request, &levels)
+                    .unwrap();
             let feedback = demand_scene_feedback_at_levels(&session, request, &levels).unwrap();
             assert_eq!(shortcut, feedback, "zoom {zoom}");
             let (display, route) = scene_route_frame_for_display(&session, request).unwrap();
@@ -3639,10 +4159,18 @@ mod tests {
     fn scene_shader_requests_only_chunks_inside_the_grid() {
         let dir = tempfile::tempdir().unwrap();
         let mut roots = vec![
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../test-data/cells3d-anisotropic.ome.zarr"),
-            chunked_two_level_store(dir.path(), [(256, 256, 64), (128, 128, 32)], [1, 32, 64, 64]),
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../test-data/cells3d-anisotropic.ome.zarr"),
+            chunked_two_level_store(
+                dir.path(),
+                [(256, 256, 64), (128, 128, 32)],
+                [1, 32, 64, 64],
+            ),
         ];
-        for mirrored in ["/big/henriksson/omezarr-public/6001240.zarr", "/big/henriksson/omezarr-public/backpack.ome.zarr"] {
+        for mirrored in [
+            "/big/henriksson/omezarr-public/6001240.zarr",
+            "/big/henriksson/omezarr-public/backpack.ome.zarr",
+        ] {
             if PathBuf::from(mirrored).exists() {
                 roots.push(PathBuf::from(mirrored));
             }
@@ -3654,15 +4182,39 @@ mod tests {
             session.prepare_default_portable_image_layer().unwrap();
             let counts = demand_scene_level_counts(&session).unwrap();
             // The last camera is the page's pane at the orbit that first showed the defect.
-            for (orbit, zoom, (width, height)) in [([0, 0], 1.0_f32, (320, 240)), ([30, -20], 1.0, (320, 240)), ([157, 0], 1.0, (320, 240)), ([0, 120], 0.6, (320, 240)), ([200, 60], 2.5, (320, 240)), ([30, -20], 1.0, (560, 406))] {
+            for (orbit, zoom, (width, height)) in [
+                ([0, 0], 1.0_f32, (320, 240)),
+                ([30, -20], 1.0, (320, 240)),
+                ([157, 0], 1.0, (320, 240)),
+                ([0, 120], 0.6, (320, 240)),
+                ([200, 60], 2.5, (320, 240)),
+                ([30, -20], 1.0, (560, 406)),
+            ] {
                 for level in 0..counts[0] as u32 {
-                    let request = NativePortableDrawRequest { focus_xyz: None, orientation: None, origin_xyz: [0; 3], extent_xyz: [1; 3], width, height, orbit_x: orbit[0], orbit_y: orbit[1], zoom };
-                    let scene = prepare_demand_scene(&session, request, &vec![level; counts.len()]).unwrap();
+                    let request = NativePortableDrawRequest {
+                        focus_xyz: None,
+                        orientation: None,
+                        origin_xyz: [0; 3],
+                        extent_xyz: [1; 3],
+                        width,
+                        height,
+                        orbit_x: orbit[0],
+                        orbit_y: orbit[1],
+                        zoom,
+                    };
+                    let scene = prepare_demand_scene(&session, request, &vec![level; counts.len()])
+                        .unwrap();
                     let (input, table) = assemble_demand_scene(&session, &scene).unwrap();
-                    let (_, _, requests) = palace_demand_scene_on_adapter(&session, &input, &table).expect("local adapter");
+                    let (_, _, requests) = palace_demand_scene_on_adapter(&session, &input, &table)
+                        .expect("local adapter");
                     for packed in requests.into_iter().filter(|w| *w != u32::MAX) {
-                        let key = palace_core::gpu::PortableFeedbackKey::new(packed & 0x00ff_ffff, packed >> 24).unwrap();
-                        let ordinal = palace_core::gpu::PortableResidencyTag::channel(key.level()) as usize;
+                        let key = palace_core::gpu::PortableFeedbackKey::new(
+                            packed & 0x00ff_ffff,
+                            packed >> 24,
+                        )
+                        .unwrap();
+                        let ordinal =
+                            palace_core::gpu::PortableResidencyTag::channel(key.level()) as usize;
                         let (layer_index, _, tag, _) = &scene.loops[ordinal];
                         let grid_counts = scene.layers[*layer_index].grid.counts_xyz();
                         let total = grid_counts[0] * grid_counts[1] * grid_counts[2];
@@ -3683,7 +4235,13 @@ mod tests {
     #[ignore = "measurement on the local adapter against the mirrored public stores"]
     fn measure_demand_frame_phases() {
         use std::time::Instant;
-        for (name, root) in [("idr6001240", "/big/henriksson/omezarr-public/6001240.zarr"), ("backpack", "/big/henriksson/omezarr-public/backpack.ome.zarr")] {
+        for (name, root) in [
+            ("idr6001240", "/big/henriksson/omezarr-public/6001240.zarr"),
+            (
+                "backpack",
+                "/big/henriksson/omezarr-public/backpack.ome.zarr",
+            ),
+        ] {
             let root = PathBuf::from(root);
             if !root.exists() {
                 eprintln!("MEASURE {name}: not mirrored, skipped");
@@ -3693,13 +4251,31 @@ mod tests {
             session.open_local_omezarr(&root).unwrap();
             session.prepare_default_portable_image_layer().unwrap();
             let _ = session.portable_device();
-            let request = NativePortableDrawRequest { focus_xyz: None, orientation: None, origin_xyz: [0; 3], extent_xyz: [1; 3], width: 560, height: 406, orbit_x: 30, orbit_y: -20, zoom: 1.0 };
+            let request = NativePortableDrawRequest {
+                focus_xyz: None,
+                orientation: None,
+                origin_xyz: [0; 3],
+                extent_xyz: [1; 3],
+                width: 560,
+                height: 406,
+                orbit_x: 30,
+                orbit_y: -20,
+                zoom: 1.0,
+            };
             let size = FrameSize::new(560, 406).unwrap();
-            let controls = CameraControls { focus_xyz: None, orientation: None, orbit_delta: [30, -20], zoom: 1.0 };
+            let controls = CameraControls {
+                focus_xyz: None,
+                orientation: None,
+                orbit_delta: [30, -20],
+                zoom: 1.0,
+            };
             let t = Instant::now();
             let mut levels = demand_scene_levels_fitting(&session, size, controls).unwrap();
             let counts = demand_scene_level_counts(&session).unwrap();
-            eprintln!("MEASURE {name}: level choice (budget-aware) {levels:?} of {counts:?} in {:.1} ms", t.elapsed().as_secs_f64() * 1e3);
+            eprintln!(
+                "MEASURE {name}: level choice (budget-aware) {levels:?} of {counts:?} in {:.1} ms",
+                t.elapsed().as_secs_f64() * 1e3
+            );
             let whole = Instant::now();
             'levels: loop {
                 let t = Instant::now();
@@ -3709,32 +4285,64 @@ mod tests {
                     let t = Instant::now();
                     let (input, table) = assemble_demand_scene(&session, &scene).unwrap();
                     let assemble_ms = t.elapsed().as_secs_f64() * 1e3;
-                    let planned: usize = scene.loops.iter().map(|(_, _, _, l)| l.plan().chunks().len()).sum();
-                    let words: usize = input.to_gpu_input().map(|g| g.pages.iter().map(Vec::len).sum()).unwrap_or(0);
+                    let planned: usize = scene
+                        .loops
+                        .iter()
+                        .map(|(_, _, _, l)| l.plan().chunks().len())
+                        .sum();
+                    let words: usize = input
+                        .to_gpu_input()
+                        .map(|g| g.pages.iter().map(Vec::len).sum())
+                        .unwrap_or(0);
                     let t = Instant::now();
-                    let (frame, _, requests) = palace_demand_scene_on_adapter(&session, &input, &table).unwrap();
+                    let (frame, _, requests) =
+                        palace_demand_scene_on_adapter(&session, &input, &table).unwrap();
                     let dispatch_ms = t.elapsed().as_secs_f64() * 1e3;
                     let misses = requests.iter().filter(|w| **w != u32::MAX).count();
                     eprintln!("MEASURE {name}: iteration {iteration}: {planned} chunks resident ({:.1} MiB) — read+assemble {assemble_ms:.1} ms, dispatch+readback {dispatch_ms:.1} ms, {misses} misses", words as f64 * 4.0 / 1048576.0);
                     let mut per_loop = vec![Vec::new(); scene.loops.len()];
                     for packed in requests.into_iter().filter(|w| *w != u32::MAX) {
-                        let key = palace_core::gpu::PortableFeedbackKey::new(packed & 0x00ff_ffff, packed >> 24).unwrap();
-                        per_loop[palace_core::gpu::PortableResidencyTag::channel(key.level()) as usize].push(key);
+                        let key = palace_core::gpu::PortableFeedbackKey::new(
+                            packed & 0x00ff_ffff,
+                            packed >> 24,
+                        )
+                        .unwrap();
+                        per_loop
+                            [palace_core::gpu::PortableResidencyTag::channel(key.level()) as usize]
+                            .push(key);
                     }
                     let mut complete = true;
                     let mut exceeded = false;
-                    for ((layer_index, _, tag, residency), keys) in scene.loops.iter_mut().zip(per_loop) {
+                    for ((layer_index, _, tag, residency), keys) in
+                        scene.loops.iter_mut().zip(per_loop)
+                    {
                         let grid = scene.layers[*layer_index].grid;
                         let counts = grid.counts_xyz();
                         let total = counts[0] * counts[1] * counts[2];
-                        let bad: Vec<_> = keys.iter().filter(|k| k.level() != *tag || k.chunk_index() >= total).map(|k| (k.level(), k.chunk_index())).collect();
+                        let bad: Vec<_> = keys
+                            .iter()
+                            .filter(|k| k.level() != *tag || k.chunk_index() >= total)
+                            .map(|k| (k.level(), k.chunk_index()))
+                            .collect();
                         if !bad.is_empty() {
                             eprintln!("MEASURE {name}: loop tag {tag} grid counts {counts:?} ({total} chunks) got {} keys, {} invalid, e.g. {:?}", keys.len(), bad.len(), &bad[..bad.len().min(6)]);
                         }
-                        match residency.absorb(keys.iter().copied().filter(|k| k.level() == *tag && k.chunk_index() < total)).unwrap() {
+                        match residency
+                            .absorb(
+                                keys.iter()
+                                    .copied()
+                                    .filter(|k| k.level() == *tag && k.chunk_index() < total),
+                            )
+                            .unwrap()
+                        {
                             palace_core::gpu::PortableResidencyStep::Complete => {}
                             palace_core::gpu::PortableResidencyStep::Planned => complete = false,
-                            palace_core::gpu::PortableResidencyStep::ExceedsPortableBound { required_pages } => { eprintln!("MEASURE {name}: level {levels:?} exceeds the pages ({required_pages} needed) after {iteration} iterations"); exceeded = true; }
+                            palace_core::gpu::PortableResidencyStep::ExceedsPortableBound {
+                                required_pages,
+                            } => {
+                                eprintln!("MEASURE {name}: level {levels:?} exceeds the pages ({required_pages} needed) after {iteration} iterations");
+                                exceeded = true;
+                            }
                             other => panic!("{other:?}"),
                         }
                     }
@@ -3753,23 +4361,53 @@ mod tests {
             }
             // A second frame, camera nudged: the chunk cache should make it read nothing.
             let t = Instant::now();
-            let nudged = NativePortableDrawRequest { orbit_x: 34, ..request };
-            let (_, ray_table) = demand_driven_scene_camera_draw_with_rays(&session, nudged).unwrap();
+            let nudged = NativePortableDrawRequest {
+                orbit_x: 34,
+                ..request
+            };
+            let (_, ray_table) =
+                demand_driven_scene_camera_draw_with_rays(&session, nudged).unwrap();
             let (hits, misses, held, cached_words) = session.chunk_cache_stats();
             eprintln!("MEASURE {name}: second frame (route, cache warm) {:.0} ms; cache hits {hits} misses {misses}, {held} chunks / {:.1} MiB", t.elapsed().as_secs_f64() * 1e3, cached_words as f64 * 4.0 / 1048576.0);
             let t = Instant::now();
-            let picks: Vec<_> = ray_table.iter().map(|ray| newvolim_render::PickRay::new(ray.origin().map(f64::from), ray.direction().map(f64::from)).unwrap()).collect();
-            eprintln!("MEASURE {name}: display's unused PickRay conversion {} rays in {:.1} ms", picks.len(), t.elapsed().as_secs_f64() * 1e3);
-            let preview = NativePortableDrawRequest { width: 280, height: 203, orbit_x: 38, ..request };
+            let picks: Vec<_> = ray_table
+                .iter()
+                .map(|ray| {
+                    newvolim_render::PickRay::new(
+                        ray.origin().map(f64::from),
+                        ray.direction().map(f64::from),
+                    )
+                    .unwrap()
+                })
+                .collect();
+            eprintln!(
+                "MEASURE {name}: display's unused PickRay conversion {} rays in {:.1} ms",
+                picks.len(),
+                t.elapsed().as_secs_f64() * 1e3
+            );
+            let preview = NativePortableDrawRequest {
+                width: 280,
+                height: 203,
+                orbit_x: 38,
+                ..request
+            };
             let t = Instant::now();
             let _ = demand_driven_scene_camera_draw_with_rays(&session, preview).unwrap();
-            eprintln!("MEASURE {name}: interaction preview (route, cache warm) {:.0} ms", t.elapsed().as_secs_f64() * 1e3);
+            eprintln!(
+                "MEASURE {name}: interaction preview (route, cache warm) {:.0} ms",
+                t.elapsed().as_secs_f64() * 1e3
+            );
             // The same dispatch twice: does the recorder's per-call pipeline creation dominate?
-            let (input, table) = full_level_scene_inputs_fitting(&session, request).map(|(i, t, _, _)| (i, t)).unwrap();
+            let (input, table) = full_level_scene_inputs_fitting(&session, request)
+                .map(|(i, t, _, _)| (i, t))
+                .unwrap();
             for pass in 0..3 {
                 let t = Instant::now();
                 let _ = palace_demand_scene_on_adapter(&session, &input, &table).unwrap();
-                eprintln!("MEASURE {name}: full-level dispatch pass {pass}: {:.1} ms", t.elapsed().as_secs_f64() * 1e3);
+                eprintln!(
+                    "MEASURE {name}: full-level dispatch pass {pass}: {:.1} ms",
+                    t.elapsed().as_secs_f64() * 1e3
+                );
             }
             let t = Instant::now();
             let (input, table, _) = full_level_scene_inputs(&session, nudged, &levels).unwrap();
@@ -3795,26 +4433,56 @@ mod tests {
     /// session refuses a scale outside its bounds.
     #[test]
     fn depth_scale_multiplies_the_opacity_reference_of_every_route() {
-        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../test-data/cells3d-anisotropic.ome.zarr");
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../test-data/cells3d-anisotropic.ome.zarr");
         let mut session = LocalSession::default();
         session.open_local_omezarr(&root).unwrap();
         session.prepare_default_portable_image_layer().unwrap();
-        let request = NativePortableDrawRequest { focus_xyz: None, orientation: None, origin_xyz: [0; 3], extent_xyz: [1; 3], width: 32, height: 24, orbit_x: 0, orbit_y: 0, zoom: 1.0 };
+        let request = NativePortableDrawRequest {
+            focus_xyz: None,
+            orientation: None,
+            origin_xyz: [0; 3],
+            extent_xyz: [1; 3],
+            width: 32,
+            height: 24,
+            orbit_x: 0,
+            orbit_y: 0,
+            zoom: 1.0,
+        };
         let (plan_at_one, _) = demand_scene_plan(&session, request, None).unwrap();
         let direct_at_one = scene_opacity_reference(&session, [3.0, 4.0, 12.0]).unwrap();
-        assert!((direct_at_one - 13.0 / 256.0).abs() < 1e-6, "diagonal / 256 at scale 1: {direct_at_one}");
+        assert!(
+            (direct_at_one - 13.0 / 256.0).abs() < 1e-6,
+            "diagonal / 256 at scale 1: {direct_at_one}"
+        );
         assert_eq!(session.depth_scale(), 1.0);
         session.set_depth_scale(4.0).unwrap();
         let (plan_at_four, _) = demand_scene_plan(&session, request, None).unwrap();
-        assert!((plan_at_four.opacity_reference / plan_at_one.opacity_reference - 4.0).abs() < 1e-5, "{} vs {}", plan_at_four.opacity_reference, plan_at_one.opacity_reference);
-        assert!((scene_opacity_reference(&session, [3.0, 4.0, 12.0]).unwrap() / direct_at_one - 4.0).abs() < 1e-5);
+        assert!(
+            (plan_at_four.opacity_reference / plan_at_one.opacity_reference - 4.0).abs() < 1e-5,
+            "{} vs {}",
+            plan_at_four.opacity_reference,
+            plan_at_one.opacity_reference
+        );
+        assert!(
+            (scene_opacity_reference(&session, [3.0, 4.0, 12.0]).unwrap() / direct_at_one - 4.0)
+                .abs()
+                < 1e-5
+        );
         session.set_depth_scale(100.0).unwrap();
         let (plan_at_hundred, _) = demand_scene_plan(&session, request, None).unwrap();
-        assert!((plan_at_hundred.opacity_reference / plan_at_one.opacity_reference - 100.0).abs() < 1e-3);
+        assert!(
+            (plan_at_hundred.opacity_reference / plan_at_one.opacity_reference - 100.0).abs()
+                < 1e-3
+        );
         for bad in [0.0, -1.0, f32::NAN, f32::INFINITY, 100.01] {
             assert!(session.set_depth_scale(bad).is_err(), "{bad} accepted");
         }
-        assert_eq!(session.depth_scale(), 100.0, "a refused scale leaves the old one");
+        assert_eq!(
+            session.depth_scale(),
+            100.0,
+            "a refused scale leaves the old one"
+        );
     }
 
     #[test]
@@ -3828,11 +4496,17 @@ mod tests {
             let request = NativePortableDrawRequest {
                 focus_xyz: None,
                 orientation: None,
-                origin_xyz: [0; 3], extent_xyz: [1; 3], width: 43, height: 31,
-                orbit_x, orbit_y, zoom,
+                origin_xyz: [0; 3],
+                extent_xyz: [1; 3],
+                width: 43,
+                height: 31,
+                orbit_x,
+                orbit_y,
+                zoom,
             };
             for level in [0, 1] {
-                let (plan, server_rays) = demand_scene_plan(&session, request, Some(&[level])).unwrap();
+                let (plan, server_rays) =
+                    demand_scene_plan(&session, request, Some(&[level])).unwrap();
                 let small_plan = demand_scene_plan_only(&session, request, Some(&[level])).unwrap();
                 assert_eq!(plan, small_plan);
                 let received: newvolim_residency::ScenePlan =
@@ -3848,37 +4522,68 @@ mod tests {
         let oriented_request = NativePortableDrawRequest {
             focus_xyz: None,
             orientation: Some([0.0, -angle.sin(), 0.0, angle.cos()]),
-            origin_xyz: [0; 3], extent_xyz: [1; 3], width: 43, height: 31,
-            orbit_x: 0, orbit_y: 0, zoom: 1.0,
+            origin_xyz: [0; 3],
+            extent_xyz: [1; 3],
+            width: 43,
+            height: 31,
+            orbit_x: 0,
+            orbit_y: 0,
+            zoom: 1.0,
         };
-        let (plan, server_rays) = demand_scene_plan(&session, oriented_request, Some(&[0])).unwrap();
+        let (plan, server_rays) =
+            demand_scene_plan(&session, oriented_request, Some(&[0])).unwrap();
         let received: newvolim_residency::ScenePlan =
             serde_json::from_str(&serde_json::to_string(&plan).unwrap()).unwrap();
-        assert_eq!(newvolim_residency::ray_words_for_plan(&received).unwrap(), newvolim_residency::ray_words(&server_rays));
-        let focused = NativePortableDrawRequest { focus_xyz: Some([0.2, 0.7, 0.4]), ..oriented_request };
-        let (focused_plan, focused_rays) = demand_scene_plan(&session, focused, Some(&[0])).unwrap();
+        assert_eq!(
+            newvolim_residency::ray_words_for_plan(&received).unwrap(),
+            newvolim_residency::ray_words(&server_rays)
+        );
+        let focused = NativePortableDrawRequest {
+            focus_xyz: Some([0.2, 0.7, 0.4]),
+            ..oriented_request
+        };
+        let (focused_plan, focused_rays) =
+            demand_scene_plan(&session, focused, Some(&[0])).unwrap();
         assert_ne!(focused_plan.camera.origin_zyx, plan.camera.origin_zyx);
         let received: newvolim_residency::ScenePlan =
             serde_json::from_str(&serde_json::to_string(&focused_plan).unwrap()).unwrap();
-        assert_eq!(newvolim_residency::ray_words_for_plan(&received).unwrap(), newvolim_residency::ray_words(&focused_rays));
+        assert_eq!(
+            newvolim_residency::ray_words_for_plan(&received).unwrap(),
+            newvolim_residency::ray_words(&focused_rays)
+        );
         // Above the scanline parallelism threshold, the native route must still emit the
         // browser's exact word sequence, including clipping and pixel order.
-        let large_request = NativePortableDrawRequest { width: 320, height: 240, ..oriented_request };
+        let large_request = NativePortableDrawRequest {
+            width: 320,
+            height: 240,
+            ..oriented_request
+        };
         let (plan, server_rays) = demand_scene_plan(&session, large_request, Some(&[0])).unwrap();
-        assert_eq!(newvolim_residency::ray_words_for_plan(&plan).unwrap(), newvolim_residency::ray_words(&server_rays));
+        assert_eq!(
+            newvolim_residency::ray_words_for_plan(&plan).unwrap(),
+            newvolim_residency::ray_words(&server_rays)
+        );
         let gradient = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../test-data/two-channel-gradient.ome.zarr");
         session.add_portable_image_layer(&gradient).unwrap();
         let request = NativePortableDrawRequest {
             focus_xyz: None,
             orientation: None,
-            origin_xyz: [0; 3], extent_xyz: [1; 3], width: 43, height: 31,
-            orbit_x: 37, orbit_y: -21, zoom: 1.4,
+            origin_xyz: [0; 3],
+            extent_xyz: [1; 3],
+            width: 43,
+            height: 31,
+            orbit_x: 37,
+            orbit_y: -21,
+            zoom: 1.4,
         };
         let (plan, server_rays) = demand_scene_plan(&session, request, Some(&[1, 0])).unwrap();
         assert_eq!(plan.layers.len(), 2);
         assert_eq!(
-            newvolim_residency::ray_words_for_plan(&demand_scene_plan_only(&session, request, Some(&[1, 0])).unwrap()).unwrap(),
+            newvolim_residency::ray_words_for_plan(
+                &demand_scene_plan_only(&session, request, Some(&[1, 0])).unwrap()
+            )
+            .unwrap(),
             newvolim_residency::ray_words(&server_rays),
             "the fitted first-layer camera clips to both layers' union box"
         );
@@ -3890,21 +4595,46 @@ mod tests {
     #[test]
     #[ignore = "requires a local WGPU adapter"]
     fn depth_scale_lets_light_through_deeper_on_the_adapter() {
-        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../test-data/cells3d-anisotropic.ome.zarr");
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../test-data/cells3d-anisotropic.ome.zarr");
         let mut session = LocalSession::default();
         session.open_local_omezarr(&root).unwrap();
         session.prepare_default_portable_image_layer().unwrap();
-        let request = NativePortableDrawRequest { focus_xyz: None, orientation: None, origin_xyz: [0; 3], extent_xyz: [1; 3], width: 64, height: 48, orbit_x: 20, orbit_y: -10, zoom: 1.0 };
+        let request = NativePortableDrawRequest {
+            focus_xyz: None,
+            orientation: None,
+            origin_xyz: [0; 3],
+            extent_xyz: [1; 3],
+            width: 64,
+            height: 48,
+            orbit_x: 20,
+            orbit_y: -10,
+            zoom: 1.0,
+        };
         let mut alphas = Vec::new();
         let mut hit_sets = Vec::new();
         for scale in [0.25_f32, 1.0, 4.0] {
             session.set_depth_scale(scale).unwrap();
             let (frame, _) = demand_driven_scene_camera_draw_with_rays(&session, request).unwrap();
-            let alpha: f64 = frame.rgba.chunks_exact(4).map(|px| px[3] as f64).sum::<f64>() / (64.0 * 48.0);
+            let alpha: f64 = frame
+                .rgba
+                .chunks_exact(4)
+                .map(|px| px[3] as f64)
+                .sum::<f64>()
+                / (64.0 * 48.0);
             alphas.push(alpha);
-            hit_sets.push(frame.first_opacity_distance.iter().map(|d| d.is_finite()).collect::<Vec<_>>());
+            hit_sets.push(
+                frame
+                    .first_opacity_distance
+                    .iter()
+                    .map(|d| d.is_finite())
+                    .collect::<Vec<_>>(),
+            );
         }
-        assert!(alphas[0] > alphas[1] && alphas[1] > alphas[2], "mean alpha must fall with depth scale: {alphas:?}");
+        assert!(
+            alphas[0] > alphas[1] && alphas[1] > alphas[2],
+            "mean alpha must fall with depth scale: {alphas:?}"
+        );
         assert_eq!(hit_sets[0], hit_sets[1]);
         assert_eq!(hit_sets[1], hit_sets[2]);
         eprintln!("mean alpha at scale 0.25 / 1 / 4: {alphas:?}");
@@ -3920,11 +4650,25 @@ mod tests {
         // 256×256×64 in 64×64×32 chunks: 32 chunks of 131072 words; every other one demanded
         // is 16 chunks over two full pages, so placement across pages is exercised.
         let dir = tempfile::tempdir().unwrap();
-        let root = chunked_two_level_store(dir.path(), [(256, 256, 64), (128, 128, 32)], [1, 32, 64, 64]);
+        let root = chunked_two_level_store(
+            dir.path(),
+            [(256, 256, 64), (128, 128, 32)],
+            [1, 32, 64, 64],
+        );
         let mut session = LocalSession::default();
         session.open_local_omezarr(&root).unwrap();
         session.prepare_default_portable_image_layer().unwrap();
-        let request = NativePortableDrawRequest { focus_xyz: None, orientation: None, origin_xyz: [0; 3], extent_xyz: [1; 3], width: 96, height: 64, orbit_x: 12, orbit_y: -7, zoom: 1.3 };
+        let request = NativePortableDrawRequest {
+            focus_xyz: None,
+            orientation: None,
+            origin_xyz: [0; 3],
+            extent_xyz: [1; 3],
+            width: 96,
+            height: 64,
+            orbit_x: 12,
+            orbit_y: -7,
+            zoom: 1.3,
+        };
         let levels = vec![0];
 
         // Server side: absorb every other chunk into each loop, assemble, pack.
@@ -3937,42 +4681,86 @@ mod tests {
                 .map(|index| palace_core::gpu::PortableFeedbackKey::new(index, *tag).unwrap())
                 .collect();
             demanded_keys.extend(keys.iter().map(|key| key.packed()));
-            assert!(matches!(residency.absorb(keys).unwrap(), palace_core::gpu::PortableResidencyStep::Planned));
+            assert!(matches!(
+                residency.absorb(keys).unwrap(),
+                palace_core::gpu::PortableResidencyStep::Planned
+            ));
         }
         let (server_input, server_table) = assemble_demand_scene(&session, &scene).unwrap();
-        let server_dispatch = palace_core::gpu::scene_dvr_dispatch(&server_input, Some(&server_table), 4_096, 16).unwrap();
+        let server_dispatch =
+            palace_core::gpu::scene_dvr_dispatch(&server_input, Some(&server_table), 4_096, 16)
+                .unwrap();
         assert_eq!(demanded_keys.len(), 16, "half of the 32 level-zero chunks");
-        assert_eq!(server_dispatch.pages.iter().filter(|page| !page.is_empty()).count(), 2, "two pages in use");
-        assert_eq!(server_dispatch.pages.iter().map(Vec::len).sum::<usize>(), 16 * 64 * 64 * 32);
+        assert_eq!(
+            server_dispatch
+                .pages
+                .iter()
+                .filter(|page| !page.is_empty())
+                .count(),
+            2,
+            "two pages in use"
+        );
+        assert_eq!(
+            server_dispatch.pages.iter().map(Vec::len).sum::<usize>(),
+            16 * 64 * 64 * 32
+        );
 
         // Client side: the plan over the wire, rays expanded locally, the keys through the
         // request buffer, the chunks through the chunk route, then the page assembly.
         let (plan, rays) = demand_scene_plan(&session, request, Some(&levels)).unwrap();
-        let plan: newvolim_residency::ScenePlan = serde_json::from_str(&serde_json::to_string(&plan).unwrap()).unwrap();
+        let plan: newvolim_residency::ScenePlan =
+            serde_json::from_str(&serde_json::to_string(&plan).unwrap()).unwrap();
         let local_rays = newvolim_residency::ray_words_for_plan(&plan).unwrap();
         assert_eq!(local_rays, newvolim_residency::ray_words(&rays));
-        let mut client = newvolim_residency::ClientResidency::new(plan, &local_rays, newvolim_residency::ChunkCache::new(1 << 24)).unwrap();
+        let mut client = newvolim_residency::ClientResidency::new(
+            plan,
+            &local_rays,
+            newvolim_residency::ChunkCache::new(1 << 24),
+        )
+        .unwrap();
         let capacity = newvolim_residency::PAGE_TABLE_CAPACITY;
         let mut requests = vec![u32::MAX; capacity];
         for (slot, key) in demanded_keys.iter().enumerate() {
             requests[slot * 3 % capacity] = *key;
         }
-        assert_eq!(client.absorb_requests(&requests).unwrap(), newvolim_residency::StepOutcome::Planned);
+        assert_eq!(
+            client.absorb_requests(&requests).unwrap(),
+            newvolim_residency::StepOutcome::Planned
+        );
         let missing = client.missing_chunks();
         assert_eq!(missing.len(), demanded_keys.len());
         for request in &missing {
-            let words = layer_chunk_words(&session, request.layer_id, request.level, request.source_index, &[request.chunk_xyz]).unwrap().remove(0);
+            let words = layer_chunk_words(
+                &session,
+                request.layer_id,
+                request.level,
+                request.source_index,
+                &[request.chunk_xyz],
+            )
+            .unwrap()
+            .remove(0);
             client.insert_chunk(request, words);
         }
         let client_dispatch = client.dispatch().unwrap();
         assert_eq!(client_dispatch.params, server_dispatch.params, "uniform");
-        assert_eq!(client_dispatch.scene_data, server_dispatch.scene_data, "scene data and residency map");
+        assert_eq!(
+            client_dispatch.scene_data, server_dispatch.scene_data,
+            "scene data and residency map"
+        );
         assert_eq!(client_dispatch.rays, server_dispatch.rays, "rays");
         for page in 0..4 {
-            assert_eq!(client_dispatch.pages[page], server_dispatch.pages[page], "page {page}");
+            assert_eq!(
+                client_dispatch.pages[page], server_dispatch.pages[page],
+                "page {page}"
+            );
         }
         assert_eq!(client_dispatch, server_dispatch);
-        assert_eq!(client.absorb_requests(&vec![u32::MAX; newvolim_residency::PAGE_TABLE_CAPACITY]).unwrap(), newvolim_residency::StepOutcome::Complete);
+        assert_eq!(
+            client
+                .absorb_requests(&vec![u32::MAX; newvolim_residency::PAGE_TABLE_CAPACITY])
+                .unwrap(),
+            newvolim_residency::StepOutcome::Complete
+        );
     }
 
     /// The client loop, driven on the local adapter with the session's reads for the chunk
@@ -3981,25 +4769,49 @@ mod tests {
     #[test]
     #[ignore = "requires a local WGPU adapter"]
     fn client_residency_loop_renders_the_servers_demand_frame() {
-        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../test-data/cells3d-anisotropic.ome.zarr");
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../test-data/cells3d-anisotropic.ome.zarr");
         let mut session = LocalSession::default();
         session.open_local_omezarr(&root).unwrap();
         session.prepare_default_portable_image_layer().unwrap();
-        let request = NativePortableDrawRequest { focus_xyz: None, orientation: None, origin_xyz: [0; 3], extent_xyz: [1; 3], width: 96, height: 64, orbit_x: 12, orbit_y: -7, zoom: 1.3 };
+        let request = NativePortableDrawRequest {
+            focus_xyz: None,
+            orientation: None,
+            origin_xyz: [0; 3],
+            extent_xyz: [1; 3],
+            width: 96,
+            height: 64,
+            orbit_x: 12,
+            orbit_y: -7,
+            zoom: 1.3,
+        };
         let size = FrameSize::new(96, 64).unwrap();
-        let controls = CameraControls { focus_xyz: None, orientation: None, orbit_delta: [12, -7], zoom: 1.3 };
+        let controls = CameraControls {
+            focus_xyz: None,
+            orientation: None,
+            orbit_delta: [12, -7],
+            zoom: 1.3,
+        };
         let levels = demand_scene_levels(&session, size, controls).unwrap();
-        let (server_frame, _) = demand_driven_scene_camera_draw_with_rays_at_levels(&session, request, &levels).unwrap();
+        let (server_frame, _) =
+            demand_driven_scene_camera_draw_with_rays_at_levels(&session, request, &levels)
+                .unwrap();
 
         let (plan, rays) = demand_scene_plan(&session, request, Some(&levels)).unwrap();
         let local_rays = newvolim_residency::ray_words_for_plan(&plan).unwrap();
         assert_eq!(local_rays, newvolim_residency::ray_words(&rays));
-        let mut client = newvolim_residency::ClientResidency::new(plan, &local_rays, newvolim_residency::ChunkCache::new(1 << 24)).unwrap();
+        let mut client = newvolim_residency::ClientResidency::new(
+            plan,
+            &local_rays,
+            newvolim_residency::ChunkCache::new(1 << 24),
+        )
+        .unwrap();
         let mut fetched = 0_usize;
         let mut frame = None;
         for _ in 0..=newvolim_residency::MAX_ITERATIONS {
             let (input, table) = client.assemble().unwrap();
-            let (attachments, _, requests) = palace_demand_scene_on_adapter(&session, &input, &table).expect("local adapter");
+            let (attachments, _, requests) =
+                palace_demand_scene_on_adapter(&session, &input, &table).expect("local adapter");
             match client.absorb_requests(&requests).unwrap() {
                 newvolim_residency::StepOutcome::Complete => {
                     frame = Some(attachments);
@@ -4007,7 +4819,15 @@ mod tests {
                 }
                 newvolim_residency::StepOutcome::Planned => {
                     for missing in client.missing_chunks() {
-                        let words = layer_chunk_words(&session, missing.layer_id, missing.level, missing.source_index, &[missing.chunk_xyz]).unwrap().remove(0);
+                        let words = layer_chunk_words(
+                            &session,
+                            missing.layer_id,
+                            missing.level,
+                            missing.source_index,
+                            &[missing.chunk_xyz],
+                        )
+                        .unwrap()
+                        .remove(0);
                         client.insert_chunk(&missing, words);
                         fetched += 1;
                     }
@@ -4018,13 +4838,28 @@ mod tests {
         let frame = frame.expect("the client loop converges");
         assert_eq!(frame.width, server_frame.width);
         assert_eq!(frame.rgba, server_frame.rgba, "colour");
-        assert_eq!(frame.first_opacity_distance, server_frame.first_opacity_distance, "depth");
-        let total_chunks: usize = client.plan().layers.iter().map(|layer| {
-            let grid = palace_core::gpu::PortableChunkGrid::new(layer.dimensions_xyz, layer.chunk_shape_xyz).unwrap();
-            let counts = grid.counts_xyz();
-            (counts[0] * counts[1] * counts[2]) as usize * layer.channels.len()
-        }).sum();
-        assert!(fetched > 0 && fetched <= total_chunks, "fetched {fetched} of {total_chunks}");
+        assert_eq!(
+            frame.first_opacity_distance, server_frame.first_opacity_distance,
+            "depth"
+        );
+        let total_chunks: usize = client
+            .plan()
+            .layers
+            .iter()
+            .map(|layer| {
+                let grid = palace_core::gpu::PortableChunkGrid::new(
+                    layer.dimensions_xyz,
+                    layer.chunk_shape_xyz,
+                )
+                .unwrap();
+                let counts = grid.counts_xyz();
+                (counts[0] * counts[1] * counts[2]) as usize * layer.channels.len()
+            })
+            .sum();
+        assert!(
+            fetched > 0 && fetched <= total_chunks,
+            "fetched {fetched} of {total_chunks}"
+        );
         eprintln!("client residency fetched {fetched} of {total_chunks} chunks");
     }
 
@@ -4038,13 +4873,24 @@ mod tests {
     /// so the page's `dx → orbitX, dy → orbitY` is right only if this holds.
     #[test]
     fn horizontal_orbit_yaws_and_vertical_orbit_pitches() {
-        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../test-data/cells3d-anisotropic.ome.zarr");
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../test-data/cells3d-anisotropic.ome.zarr");
         let size = FrameSize::new(400, 300).unwrap();
         let project = |orbit: [i32; 2], point: [f32; 3]| -> [f32; 2] {
-            project_point_for_local_zarr(&root, size, CameraControls { focus_xyz: None, orientation: None, orbit_delta: orbit, zoom: 1.0 }, point)
-                .unwrap()
-                .expect("the point is in front of the camera")
-                .pixel
+            project_point_for_local_zarr(
+                &root,
+                size,
+                CameraControls {
+                    focus_xyz: None,
+                    orientation: None,
+                    orbit_delta: orbit,
+                    zoom: 1.0,
+                },
+                point,
+            )
+            .unwrap()
+            .expect("the point is in front of the camera")
+            .pixel
         };
         // Physical zyx: the centre and points displaced along image x, image y and toward the
         // camera (+z is the near side at rest: the fitted eye sits on +z looking at the centre).
@@ -4052,41 +4898,122 @@ mod tests {
         let plus_x = [4.64, 16.64, 29.952];
         let plus_y = [4.64, 29.952, 16.64];
         let near = [8.352, 16.64, 16.64];
-        let close = |a: [f32; 2], b: [f32; 2]| (a[0] - b[0]).abs() < 0.01 && (a[1] - b[1]).abs() < 0.01;
+        let close =
+            |a: [f32; 2], b: [f32; 2]| (a[0] - b[0]).abs() < 0.01 && (a[1] - b[1]).abs() < 0.01;
         let rest = project([0, 0], centre);
-        assert!(close(rest, [199.5, 149.5]), "the centre is mid-frame: {rest:?}");
-        assert!(close(project([0, 0], near), rest), "the near point is on the view axis at rest");
+        assert!(
+            close(rest, [199.5, 149.5]),
+            "the centre is mid-frame: {rest:?}"
+        );
+        assert!(
+            close(project([0, 0], near), rest),
+            "the near point is on the view axis at rest"
+        );
         let rest_x = project([0, 0], plus_x);
         let rest_y = project([0, 0], plus_y);
-        assert!((rest_x[1] - rest[1]).abs() < 0.01 && rest_x[0] > rest[0] + 50.0, "+x is to the right: {rest_x:?}");
-        assert!((rest_y[0] - rest[0]).abs() < 0.01 && rest_y[1] < rest[1] - 50.0, "+y is up: {rest_y:?}");
+        assert!(
+            (rest_x[1] - rest[1]).abs() < 0.01 && rest_x[0] > rest[0] + 50.0,
+            "+x is to the right: {rest_x:?}"
+        );
+        assert!(
+            (rest_y[0] - rest[0]).abs() < 0.01 && rest_y[1] < rest[1] - 50.0,
+            "+y is up: {rest_y:?}"
+        );
 
         // Horizontal drag to the right: a yaw. The vertical-axis point stays; +x moves along the
         // horizontal axis; the near face moves right.
-        assert!(close(project([200, 0], plus_y), rest_y), "yaw keeps the vertical axis: {:?}", project([200, 0], plus_y));
+        assert!(
+            close(project([200, 0], plus_y), rest_y),
+            "yaw keeps the vertical axis: {:?}",
+            project([200, 0], plus_y)
+        );
         let yawed_x = project([200, 0], plus_x);
-        assert!((yawed_x[1] - rest[1]).abs() < 0.01 && yawed_x[0] < rest_x[0], "yaw moves +x along the horizontal: {yawed_x:?}");
+        assert!(
+            (yawed_x[1] - rest[1]).abs() < 0.01 && yawed_x[0] < rest_x[0],
+            "yaw moves +x along the horizontal: {yawed_x:?}"
+        );
         let yawed_near = project([200, 0], near);
-        assert!(yawed_near[0] > rest[0] + 10.0 && (yawed_near[1] - rest[1]).abs() < 0.01, "near face follows a right drag: {yawed_near:?}");
+        assert!(
+            yawed_near[0] > rest[0] + 10.0 && (yawed_near[1] - rest[1]).abs() < 0.01,
+            "near face follows a right drag: {yawed_near:?}"
+        );
 
         // Vertical drag downward: a pitch. The horizontal-axis point stays; the near face moves down.
-        assert!(close(project([0, 200], plus_x), rest_x), "pitch keeps the horizontal axis: {:?}", project([0, 200], plus_x));
+        assert!(
+            close(project([0, 200], plus_x), rest_x),
+            "pitch keeps the horizontal axis: {:?}",
+            project([0, 200], plus_x)
+        );
         let pitched_near = project([0, 200], near);
-        assert!(pitched_near[1] > rest[1] + 10.0 && (pitched_near[0] - rest[0]).abs() < 0.01, "near face follows a down drag: {pitched_near:?}");
-        assert!(close(project([0, 0], centre), project([200, 200], centre)), "the centre never moves");
+        assert!(
+            pitched_near[1] > rest[1] + 10.0 && (pitched_near[0] - rest[0]).abs() < 0.01,
+            "near face follows a down drag: {pitched_near:?}"
+        );
+        assert!(
+            close(project([0, 0], centre), project([200, 200], centre)),
+            "the centre never moves"
+        );
 
         // A true rotation, not a nudge: a half turn (π / 0.01 rad per pixel = 314 px) shows the
         // volume from behind, so +x is mirrored to the left and the near face is now the far
         // one; a quarter turn puts +x on the view axis. The tilt is clamped short of the poles,
         // so an absurd vertical drag still yields a camera.
         let half_turn = project([314, 0], plus_x);
-        assert!(half_turn[0] < rest[0] - 50.0 && (half_turn[1] - rest[1]).abs() < 0.5, "half turn mirrors +x: {half_turn:?}");
+        assert!(
+            half_turn[0] < rest[0] - 50.0 && (half_turn[1] - rest[1]).abs() < 0.5,
+            "half turn mirrors +x: {half_turn:?}"
+        );
         let quarter_turn = project([157, 0], plus_x);
-        assert!((quarter_turn[0] - rest[0]).abs() < 1.0 && (quarter_turn[1] - rest[1]).abs() < 0.5, "quarter turn puts +x on the view axis: {quarter_turn:?}");
-        let near_behind = project_point_for_local_zarr(&root, size, CameraControls { focus_xyz: None, orientation: None, orbit_delta: [314, 0], zoom: 1.0 }, near).unwrap().unwrap();
-        let near_front = project_point_for_local_zarr(&root, size, CameraControls { focus_xyz: None, orientation: None, orbit_delta: [0, 0], zoom: 1.0 }, near).unwrap().unwrap();
-        assert!(near_behind.ray_distance > near_front.ray_distance + 1.0, "the near face is far after a half turn");
-        assert!(project_point_for_local_zarr(&root, size, CameraControls { focus_xyz: None, orientation: None, orbit_delta: [0, 2000], zoom: 1.0 }, centre).unwrap().is_some(), "tilt is clamped");
+        assert!(
+            (quarter_turn[0] - rest[0]).abs() < 1.0 && (quarter_turn[1] - rest[1]).abs() < 0.5,
+            "quarter turn puts +x on the view axis: {quarter_turn:?}"
+        );
+        let near_behind = project_point_for_local_zarr(
+            &root,
+            size,
+            CameraControls {
+                focus_xyz: None,
+                orientation: None,
+                orbit_delta: [314, 0],
+                zoom: 1.0,
+            },
+            near,
+        )
+        .unwrap()
+        .unwrap();
+        let near_front = project_point_for_local_zarr(
+            &root,
+            size,
+            CameraControls {
+                focus_xyz: None,
+                orientation: None,
+                orbit_delta: [0, 0],
+                zoom: 1.0,
+            },
+            near,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(
+            near_behind.ray_distance > near_front.ray_distance + 1.0,
+            "the near face is far after a half turn"
+        );
+        assert!(
+            project_point_for_local_zarr(
+                &root,
+                size,
+                CameraControls {
+                    focus_xyz: None,
+                    orientation: None,
+                    orbit_delta: [0, 2000],
+                    zoom: 1.0
+                },
+                centre
+            )
+            .unwrap()
+            .is_some(),
+            "tilt is clamped"
+        );
     }
 
     #[test]
@@ -4098,10 +5025,19 @@ mod tests {
         let near = [8.352_f32, 16.64, 16.64];
         let project = |orientation: [f32; 4], point| {
             project_point_for_local_zarr(
-                &root, size,
-                CameraControls { focus_xyz: None, orientation: Some(orientation), orbit_delta: [0, 0], zoom: 1.0 },
+                &root,
+                size,
+                CameraControls {
+                    focus_xyz: None,
+                    orientation: Some(orientation),
+                    orbit_delta: [0, 0],
+                    zoom: 1.0,
+                },
                 point,
-            ).unwrap().unwrap().pixel
+            )
+            .unwrap()
+            .unwrap()
+            .pixel
         };
         let identity = [0.0, 0.0, 0.0, 1.0];
         let rest = project(identity, centre);
@@ -4110,20 +5046,38 @@ mod tests {
         let down = [-angle.sin(), 0.0, 0.0, angle.cos()];
         let moved_right = project(right, near);
         let moved_down = project(down, near);
-        assert!(moved_right[0] > rest[0] + 10.0 && (moved_right[1] - rest[1]).abs() < 0.1, "right drag: {moved_right:?}");
-        assert!(moved_down[1] > rest[1] + 10.0 && (moved_down[0] - rest[0]).abs() < 0.1, "down drag: {moved_down:?}");
+        assert!(
+            moved_right[0] > rest[0] + 10.0 && (moved_right[1] - rest[1]).abs() < 0.1,
+            "right drag: {moved_right:?}"
+        );
+        assert!(
+            moved_down[1] > rest[1] + 10.0 && (moved_down[0] - rest[0]).abs() < 0.1,
+            "down drag: {moved_down:?}"
+        );
         // A vertical half-turn remains valid and retains a rotatable screen-horizontal axis.
         let flipped = [-1.0, 0.0, 0.0, 0.0];
         let flipped_and_turned = [-right[3], 0.0, -right[1], 0.0];
         let geometry = [32, 128, 128];
         let spacing = [0.29, 0.26, 0.26];
-        let basis = |orientation| palace_frame::camera_ray_basis_for_geometry(
-            geometry, spacing,
-            CameraControls { focus_xyz: None, orientation: Some(orientation), orbit_delta: [0, 0], zoom: 1.0 },
-        ).unwrap();
+        let basis = |orientation| {
+            palace_frame::camera_ray_basis_for_geometry(
+                geometry,
+                spacing,
+                CameraControls {
+                    focus_xyz: None,
+                    orientation: Some(orientation),
+                    orbit_delta: [0, 0],
+                    zoom: 1.0,
+                },
+            )
+            .unwrap()
+        };
         let at_pole = basis(flipped);
         let after_turn = basis(flipped_and_turned);
-        assert!(at_pole.origin[0] < after_turn.origin[0] - 1.0, "horizontal drag still moves the eye after a vertical half-turn");
+        assert!(
+            at_pole.origin[0] < after_turn.origin[0] - 1.0,
+            "horizontal drag still moves the eye after a vertical half-turn"
+        );
         assert!(at_pole.up.iter().all(|value| value.is_finite()));
         assert!((project(flipped, centre)[0] - rest[0]).abs() < 0.1);
     }
@@ -4147,9 +5101,17 @@ mod tests {
 
     /// A two-level single-channel uint16 store of the given (x, y, z) shapes with one chunk
     /// shape (c, z, y, x), a smooth ramp with a bright core.
-    fn chunked_two_level_store(dir: &std::path::Path, shapes: [(u64, u64, u64); 2], chunk: [u64; 4]) -> std::path::PathBuf {
+    fn chunked_two_level_store(
+        dir: &std::path::Path,
+        shapes: [(u64, u64, u64); 2],
+        chunk: [u64; 4],
+    ) -> std::path::PathBuf {
         use std::sync::Arc;
-        use zarrs::{array::{codec, ArrayBuilder, DataType, FillValue}, array_subset::ArraySubset, filesystem::FilesystemStore};
+        use zarrs::{
+            array::{codec, ArrayBuilder, DataType, FillValue},
+            array_subset::ArraySubset,
+            filesystem::FilesystemStore,
+        };
         let root = dir.join("oversized.zarr");
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(
@@ -4159,7 +5121,12 @@ mod tests {
         .unwrap();
         let store = Arc::new(FilesystemStore::new(&root).unwrap());
         for (path, (sx, sy, sz)) in [("/0", shapes[0]), ("/1", shapes[1])] {
-            let mut builder = ArrayBuilder::new(vec![1, sz, sy, sx], DataType::UInt16, chunk.to_vec().try_into().unwrap(), FillValue::from(0_u16));
+            let mut builder = ArrayBuilder::new(
+                vec![1, sz, sy, sx],
+                DataType::UInt16,
+                chunk.to_vec().try_into().unwrap(),
+                FillValue::from(0_u16),
+            );
             builder.bytes_to_bytes_codecs(vec![Arc::new(codec::ZstdCodec::new(1, false))]);
             let array = builder.build(store.clone(), path).unwrap();
             array.store_metadata().unwrap();
@@ -4176,7 +5143,12 @@ mod tests {
                     }
                 }
             }
-            array.store_array_subset_elements::<u16>(&ArraySubset::new_with_shape(vec![1, sz, sy, sx]), &values).unwrap();
+            array
+                .store_array_subset_elements::<u16>(
+                    &ArraySubset::new_with_shape(vec![1, sz, sy, sx]),
+                    &values,
+                )
+                .unwrap();
         }
         root
     }
@@ -4231,14 +5203,32 @@ mod tests {
             zoom: 1.0,
         };
         let size = FrameSize::new(640, 480).unwrap();
-        let controls = CameraControls { focus_xyz: None, orientation: None, orbit_delta: [0, 0], zoom: 1.0 };
-        assert_eq!(demand_scene_levels(&session, size, controls).unwrap(), vec![0], "the camera wants level zero");
-        let at_zero = demand_driven_scene_camera_draw_with_rays_at_levels(&session, request, &[0]).unwrap_err();
+        let controls = CameraControls {
+            focus_xyz: None,
+            orientation: None,
+            orbit_delta: [0, 0],
+            zoom: 1.0,
+        };
+        assert_eq!(
+            demand_scene_levels(&session, size, controls).unwrap(),
+            vec![0],
+            "the camera wants level zero"
+        );
+        let at_zero = demand_driven_scene_camera_draw_with_rays_at_levels(&session, request, &[0])
+            .unwrap_err();
         assert!(at_zero.starts_with(DEMAND_EXCEEDS_PAGE_BOUND), "{at_zero}");
-        let (attachments, rays) = demand_driven_scene_camera_draw_with_rays(&session, request).unwrap();
+        let (attachments, rays) =
+            demand_driven_scene_camera_draw_with_rays(&session, request).unwrap();
         assert_eq!(rays.len(), 640 * 480);
-        let hits = attachments.first_opacity_distance.iter().filter(|d| d.is_finite()).count();
-        assert!(hits > 640 * 480 / 10, "the coarser level still renders the volume: {hits} hits");
+        let hits = attachments
+            .first_opacity_distance
+            .iter()
+            .filter(|d| d.is_finite())
+            .count();
+        assert!(
+            hits > 640 * 480 / 10,
+            "the coarser level still renders the volume: {hits} hits"
+        );
         let frame = scene_route_frame(&session, request).unwrap();
         assert_eq!(frame.renderer, RouteRenderer::Demand);
     }
@@ -4248,7 +5238,11 @@ mod tests {
     /// voxel index and the mapping from pixel to voxel is read straight off the image.
     fn unique_voxel_store(dir: &std::path::Path) -> std::path::PathBuf {
         use std::sync::Arc;
-        use zarrs::{array::{ArrayBuilder, DataType, FillValue}, array_subset::ArraySubset, filesystem::FilesystemStore};
+        use zarrs::{
+            array::{ArrayBuilder, DataType, FillValue},
+            array_subset::ArraySubset,
+            filesystem::FilesystemStore,
+        };
         let root = dir.join("unique.zarr");
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(
@@ -4266,11 +5260,21 @@ mod tests {
             }
         }
         let store = Arc::new(FilesystemStore::new(&root).unwrap());
-        let array = ArrayBuilder::new(vec![1, sz, sy, sx], DataType::UInt16, vec![1, 2, 4, 4].try_into().unwrap(), FillValue::from(0_u16))
-            .build(store, "/0")
-            .unwrap();
+        let array = ArrayBuilder::new(
+            vec![1, sz, sy, sx],
+            DataType::UInt16,
+            vec![1, 2, 4, 4].try_into().unwrap(),
+            FillValue::from(0_u16),
+        )
+        .build(store, "/0")
+        .unwrap();
         array.store_metadata().unwrap();
-        array.store_array_subset_elements::<u16>(&ArraySubset::new_with_shape(vec![1, sz, sy, sx]), &values).unwrap();
+        array
+            .store_array_subset_elements::<u16>(
+                &ArraySubset::new_with_shape(vec![1, sz, sy, sx]),
+                &values,
+            )
+            .unwrap();
         root
     }
 
@@ -4299,13 +5303,25 @@ mod tests {
         assert_eq!((xy_w, xy_h, xz_w, xz_h, yz_w, yz_h), (8, 8, 8, 4, 8, 4));
         for row in 0..8 {
             for col in 0..8 {
-                assert_eq!(voxel_of(xy, xy_w, col, row), (col, row, 3), "XY pixel ({col},{row})");
+                assert_eq!(
+                    voxel_of(xy, xy_w, col, row),
+                    (col, row, 3),
+                    "XY pixel ({col},{row})"
+                );
             }
         }
         for row in 0..4 {
             for col in 0..8 {
-                assert_eq!(voxel_of(xz, xz_w, col, row), (col, 5, row), "XZ pixel ({col},{row})");
-                assert_eq!(voxel_of(yz, yz_w, col, row), (2, col, row), "YZ pixel ({col},{row})");
+                assert_eq!(
+                    voxel_of(xz, xz_w, col, row),
+                    (col, 5, row),
+                    "XZ pixel ({col},{row})"
+                );
+                assert_eq!(
+                    voxel_of(yz, yz_w, col, row),
+                    (2, col, row),
+                    "YZ pixel ({col},{row})"
+                );
             }
         }
     }
@@ -4316,13 +5332,17 @@ mod tests {
     /// planes have the level's dimensions and the crosshair is clamped into the volume.
     #[test]
     fn portable_orthogonal_slices_agree_across_planes_and_report_their_level() {
-        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../test-data/two-channel-gradient.ome.zarr");
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../test-data/two-channel-gradient.ome.zarr");
         let mut session = LocalSession::default();
         session.open_local_omezarr(&root).unwrap();
         session.prepare_default_portable_image_layer().unwrap();
         let slices = portable_orthogonal_slices(&session, Some([5, 7, 3])).unwrap();
         let shape = slices.voxel_shape_xyz;
-        assert_eq!(slices.level, 0, "the fixture's level zero fits the page budget");
+        assert_eq!(
+            slices.level, 0,
+            "the fixture's level zero fits the page budget"
+        );
         assert_eq!(slices.crosshair_xyz, [5, 7, 3]);
         let [(xy_w, xy_h, ref xy), (xz_w, xz_h, ref xz), (yz_w, yz_h, ref yz)] = slices.planes;
         assert_eq!((xy_w, xy_h), (shape[0], shape[1]));
@@ -4335,25 +5355,47 @@ mod tests {
         let mut distinct = std::collections::HashSet::new();
         for x in 0..shape[0] {
             // (x, 7, 3): XY slice at z=3 row 7; XZ slice at y=7 row 3.
-            assert_eq!(pixel(xy, xy_w, x, 7), pixel(xz, xz_w, x, 3), "x={x}: XY and XZ disagree");
+            assert_eq!(
+                pixel(xy, xy_w, x, 7),
+                pixel(xz, xz_w, x, 3),
+                "x={x}: XY and XZ disagree"
+            );
             distinct.insert(pixel(xy, xy_w, x, 7));
         }
         for z in 0..shape[2] {
             // (5, 7, z): XZ slice at y=7 column 5; YZ slice at x=5 column 7.
-            assert_eq!(pixel(xz, xz_w, 5, z), pixel(yz, yz_w, 7, z), "z={z}: XZ and YZ disagree");
+            assert_eq!(
+                pixel(xz, xz_w, 5, z),
+                pixel(yz, yz_w, 7, z),
+                "z={z}: XZ and YZ disagree"
+            );
         }
         assert!(distinct.len() > 1, "a gradient row is not one colour");
         // A crosshair beyond the volume is clamped, not refused; omitted, it is the centre.
         let clamped = portable_orthogonal_slices(&session, Some([u32::MAX; 3])).unwrap();
-        assert_eq!(clamped.crosshair_xyz, [shape[0] - 1, shape[1] - 1, shape[2] - 1]);
+        assert_eq!(
+            clamped.crosshair_xyz,
+            [shape[0] - 1, shape[1] - 1, shape[2] - 1]
+        );
         let centred = portable_orthogonal_slices(&session, None).unwrap();
-        assert_eq!(centred.crosshair_xyz, [shape[0] / 2, shape[1] / 2, shape[2] / 2]);
+        assert_eq!(
+            centred.crosshair_xyz,
+            [shape[0] / 2, shape[1] / 2, shape[2] / 2]
+        );
         let (pngs, _) = portable_orthogonal_slice_pngs(&session, Some([5, 7, 3])).unwrap();
         for png in &pngs {
             assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
         }
-        assert_eq!(u32::from_be_bytes(pngs[0][16..20].try_into().unwrap()), shape[0], "XY PNG width");
-        assert_eq!(u32::from_be_bytes(pngs[1][20..24].try_into().unwrap()), shape[2], "XZ PNG height");
+        assert_eq!(
+            u32::from_be_bytes(pngs[0][16..20].try_into().unwrap()),
+            shape[0],
+            "XY PNG width"
+        );
+        assert_eq!(
+            u32::from_be_bytes(pngs[1][20..24].try_into().unwrap()),
+            shape[2],
+            "XZ PNG height"
+        );
     }
     #[test]
     fn desktop_frame_budget_bounds_colour_and_optional_depth_payloads() {
@@ -4491,16 +5533,32 @@ mod tests {
         let mut session = LocalSession::default();
         session.open_local_omezarr(&root).unwrap();
         let size = FrameSize::new(64, 48).unwrap();
-        let controls = CameraControls { zoom: 4.0, ..CameraControls::default() };
-        let projector = DesktopAnnotationProjector { session: &session, root: &root, size, controls };
+        let controls = CameraControls {
+            zoom: 4.0,
+            ..CameraControls::default()
+        };
+        let projector = DesktopAnnotationProjector {
+            session: &session,
+            root: &root,
+            size,
+            controls,
+        };
         let near = [16.64, 16.64, 1000.0];
         let far = session.voxel_point_physical_f64([64.0, 64.0, 0.5]).unwrap();
-        assert!(projector.projection(near).is_none(), "the point is behind the camera");
+        assert!(
+            projector.projection(near).is_none(),
+            "the point is behind the camera"
+        );
         assert!(projector.projection(far).is_some());
-        session.add_point_annotation_physical("behind", near).unwrap();
+        session
+            .add_point_annotation_physical("behind", near)
+            .unwrap();
         session.add_point_annotation_physical("front", far).unwrap();
         let records = project_session_annotation_words(&session, &root, size, controls).unwrap();
-        assert_eq!(records.len(), newvolim_render::PortableAnnotationPrimitive::WORDS);
+        assert_eq!(
+            records.len(),
+            newvolim_render::PortableAnnotationPrimitive::WORDS
+        );
     }
 
     #[test]
@@ -4514,14 +5572,33 @@ mod tests {
         let extent = PhysicalExtent::new(size.width, size.height).unwrap();
         for controls in [
             CameraControls::default(),
-            CameraControls { orbit_delta: [80, -30], zoom: 0.7, ..CameraControls::default() },
-            CameraControls { focus_xyz: Some([0.2, 0.4, 0.6]), zoom: 2.0, ..CameraControls::default() },
+            CameraControls {
+                orbit_delta: [80, -30],
+                zoom: 0.7,
+                ..CameraControls::default()
+            },
+            CameraControls {
+                focus_xyz: Some([0.2, 0.4, 0.6]),
+                zoom: 2.0,
+                ..CameraControls::default()
+            },
         ] {
             let direct = project_annotation_overlays(
-                &[annotation_overlay(&session.annotations()[0], ANNOTATION_PICK_STYLE)], extent,
-                &DesktopAnnotationProjector { session: &session, root: &root, size, controls },
-            ).unwrap();
-            let fitted = project_session_annotation_records(&session, &root, size, controls).unwrap();
+                &[annotation_overlay(
+                    &session.annotations()[0],
+                    ANNOTATION_PICK_STYLE,
+                )],
+                extent,
+                &DesktopAnnotationProjector {
+                    session: &session,
+                    root: &root,
+                    size,
+                    controls,
+                },
+            )
+            .unwrap();
+            let fitted =
+                project_session_annotation_records(&session, &root, size, controls).unwrap();
             assert_eq!(direct.len(), fitted.len());
             for (a, b) in direct.iter().zip(&fitted) {
                 for (a, b) in a.vertices.iter().zip(&b.vertices) {
@@ -4662,7 +5739,10 @@ mod tests {
         // at 0.5 and samples every unit from there: x = -0.5 reads the transparent voxel 0, and
         // x = 0.5 — half a voxel before voxel 1's position at x = 1 — reads the opaque one.
         assert_eq!(
-            input.render_cpu(&transfer, 1.0 / 256.0).unwrap().first_opacity_distance,
+            input
+                .render_cpu(&transfer, 1.0 / 256.0)
+                .unwrap()
+                .first_opacity_distance,
             [1.5]
         );
         let resident_chunk_camera =
@@ -4677,7 +5757,10 @@ mod tests {
         let (level, rays) = palace_dvr_packet_from_native_camera(&resident_chunk_camera).unwrap();
         let input = level.raymarch_input(1, 1, rays, 1.0).unwrap();
         assert_eq!(
-            input.render_cpu(&transfer, 1.0 / 256.0).unwrap().first_opacity_distance,
+            input
+                .render_cpu(&transfer, 1.0 / 256.0)
+                .unwrap()
+                .first_opacity_distance,
             [1.5]
         );
         let mut transformed = camera.clone();
@@ -4688,7 +5771,10 @@ mod tests {
         // Scale 2 on x: voxels at x = 0 and 2, box from -1 to 3, entered from x = -2 after one
         // unit; unit samples at x = -1 and 0 read voxel 0, x = 1 reads the opaque voxel 1.
         assert_eq!(
-            input.render_cpu(&transfer, 1.0 / 256.0).unwrap().first_opacity_distance,
+            input
+                .render_cpu(&transfer, 1.0 / 256.0)
+                .unwrap()
+                .first_opacity_distance,
             [3.0]
         );
     }
@@ -4722,7 +5808,13 @@ mod tests {
             vec![0, 1, 2, 3]
         );
         assert_eq!(
-            palace_slice_words_from_admitted_volume_with_local_wgpu(&LocalSession::default(), &volume, 2, 0).unwrap(),
+            palace_slice_words_from_admitted_volume_with_local_wgpu(
+                &LocalSession::default(),
+                &volume,
+                2,
+                0
+            )
+            .unwrap(),
             vec![0, 1, 2, 3]
         );
         let payload = palace_slice_payload(&LocalSession::default(), &volume, 2, 0).unwrap();
@@ -4917,11 +6009,25 @@ mod tests {
             ],
         };
         assert_eq!(
-            palace_slice_words_from_channel_with_local_wgpu(&LocalSession::default(), &volume, 0, 2, 0).unwrap(),
+            palace_slice_words_from_channel_with_local_wgpu(
+                &LocalSession::default(),
+                &volume,
+                0,
+                2,
+                0
+            )
+            .unwrap(),
             vec![1]
         );
         assert_eq!(
-            palace_slice_words_from_channel_with_local_wgpu(&LocalSession::default(), &volume, 1, 2, 0).unwrap(),
+            palace_slice_words_from_channel_with_local_wgpu(
+                &LocalSession::default(),
+                &volume,
+                1,
+                2,
+                0
+            )
+            .unwrap(),
             vec![1]
         );
         let linear = newvolim_render::composite_portable_scene_samples(&[(
@@ -4934,10 +6040,12 @@ mod tests {
             portable_linear_premultiplied_to_srgb8(linear),
             [188, 188, 0, 255]
         );
-        assert!(palace_slice_payload(&LocalSession::default(), &volume, 2, 0)
-            .unwrap()
-            .data_url
-            .starts_with("data:image/png;base64,"));
+        assert!(
+            palace_slice_payload(&LocalSession::default(), &volume, 2, 0)
+                .unwrap()
+                .data_url
+                .starts_with("data:image/png;base64,")
+        );
     }
 
     #[test]
@@ -5137,7 +6245,10 @@ mod tests {
             let factor = physical_rays[pixel].physical_distance_per_palace_unit;
             if raw.is_finite() {
                 let expected = (f64::from(*raw) * factor) as f32;
-                assert_eq!(*shown, expected, "pixel {pixel}: {raw} voxel units × {factor}");
+                assert_eq!(
+                    *shown, expected,
+                    "pixel {pixel}: {raw} voxel units × {factor}"
+                );
                 converted += usize::from((factor - 1.0).abs() > 1e-3);
             } else {
                 assert_eq!(*shown, *raw);
@@ -5212,7 +6323,10 @@ mod tests {
             large <= small,
             "a {large}-level 256x192 frame is coarser than a {small}-level 16x12 frame"
         );
-        assert!(small > large, "this fixture must distinguish the two extents");
+        assert!(
+            small > large,
+            "this fixture must distinguish the two extents"
+        );
 
         // Pulling the camera back enlarges the footprint, which may only coarsen the level. At
         // 16x12 every zoom already sits on the coarsest level (two microns per pixel against a
@@ -5220,8 +6334,14 @@ mod tests {
         // three levels are all reachable: 128x96 selects 0, 1 and 2 at zoom 0.5, 1 and 2.
         let near = level(128, 96, 0.5);
         let far = level(128, 96, 2.0);
-        assert!(far >= near, "moving out chose a finer level: {far} after {near}");
-        assert!(far > near, "this fixture must distinguish the two distances");
+        assert!(
+            far >= near,
+            "moving out chose a finer level: {far} after {near}"
+        );
+        assert!(
+            far > near,
+            "this fixture must distinguish the two distances"
+        );
 
         // The fixture declares three levels and selection must reach beyond the finest.
         assert_eq!(session.portable_level_spacings().unwrap().len(), 3);
@@ -5320,7 +6440,12 @@ mod tests {
 
         // The demand route's transfer, rebuilt as Palace's table so both classify identically.
         let probe = session
-            .local_layer_chunk_plan_for_chunks_at_level(LayerRenderLimits::new(4, 4), 0, &[[0, 0, 0]], 8)
+            .local_layer_chunk_plan_for_chunks_at_level(
+                LayerRenderLimits::new(4, 4),
+                0,
+                &[[0, 0, 0]],
+                8,
+            )
             .unwrap();
         let state = probe[0].request.layer.channels[0].state.clone();
         let portable_transfer = palace_transfer_from_channel_state(&state).unwrap();
@@ -5404,8 +6529,16 @@ mod tests {
                 _ => only_one += 1,
             }
         }
-        let mean_depth_delta = if both == 0 { 0.0 } else { depth_delta_sum / both as f64 };
-        let mean_signed = if both == 0 { 0.0 } else { signed_depth_sum / both as f64 };
+        let mean_depth_delta = if both == 0 {
+            0.0
+        } else {
+            depth_delta_sum / both as f64
+        };
+        let mean_signed = if both == 0 {
+            0.0
+        } else {
+            signed_depth_sum / both as f64
+        };
         println!("pixels: {pixels}");
         println!(
             "colour: {colour_differs} differing ({:.1}%), max channel delta {max_channel}, mean \
@@ -5439,7 +6572,9 @@ mod tests {
         };
         let mut alpha_delta = hits
             .iter()
-            .map(|pixel| i32::from(portable.rgba[pixel * 4 + 3]) - i32::from(server_colour[pixel * 4 + 3]))
+            .map(|pixel| {
+                i32::from(portable.rgba[pixel * 4 + 3]) - i32::from(server_colour[pixel * 4 + 3])
+            })
             .collect::<Vec<_>>();
         alpha_delta.sort_unstable();
         println!(
@@ -5533,7 +6668,10 @@ mod tests {
             hue_bias.abs() <= 1.0,
             "Palace's green is biased by {hue_bias:+.2} levels against the transfer's hue"
         );
-        assert!(hue_error_max <= 12.0, "a pixel's green is {hue_error_max} levels off");
+        assert!(
+            hue_error_max <= 12.0,
+            "a pixel's green is {hue_error_max} levels off"
+        );
     }
 
     /// Side-by-side portable-versus-native rendering of the **same packet**, reported rather than
@@ -5571,7 +6709,10 @@ mod tests {
         let palace = render_palace_portable_scene_camera_draw(&session, &scene).unwrap();
         let native = newvolim_wgpu_frame::render_portable_scene_camera_draw(&packet, 0).unwrap();
 
-        assert_eq!(palace.first_opacity_distance.len(), native.ray_distances.len());
+        assert_eq!(
+            palace.first_opacity_distance.len(),
+            native.ray_distances.len()
+        );
         let pixels = native.ray_distances.len();
         let mut colour_differs = 0_usize;
         let mut max_channel = 0_i32;
@@ -5779,7 +6920,10 @@ mod tests {
             "the first use must acquire exactly once"
         );
         for _ in 0..8 {
-            assert!(std::ptr::eq(first.unwrap(), session.portable_device().unwrap()));
+            assert!(std::ptr::eq(
+                first.unwrap(),
+                session.portable_device().unwrap()
+            ));
         }
         assert_eq!(
             PORTABLE_DEVICE_ACQUISITIONS.load(Ordering::Relaxed) - before,
@@ -5810,7 +6954,10 @@ mod tests {
 
         // A clone shares the same device, so handing the session to a render path costs nothing.
         let shared = session.clone();
-        assert!(std::ptr::eq(first.unwrap(), shared.portable_device().unwrap()));
+        assert!(std::ptr::eq(
+            first.unwrap(),
+            shared.portable_device().unwrap()
+        ));
         assert_eq!(
             PORTABLE_DEVICE_ACQUISITIONS.load(Ordering::Relaxed) - before,
             1
@@ -6051,13 +7198,9 @@ mod tests {
         .unwrap();
         let pick_ray =
             newvolim_render::PickRay::new(ray.origin_world, ray.direction_world).unwrap();
-        let hit = depth_aware_annotation_pick(
-            &[front.clone(), behind.clone()],
-            pick_ray,
-            depth,
-        )
-        .unwrap()
-        .expect("an annotation in front of the first-opacity surface must be selectable");
+        let hit = depth_aware_annotation_pick(&[front.clone(), behind.clone()], pick_ray, depth)
+            .unwrap()
+            .expect("an annotation in front of the first-opacity surface must be selectable");
         assert_eq!(hit.annotation_id, 7);
         assert_eq!(
             depth_aware_annotation_pick(&[behind], pick_ray, depth).unwrap(),
@@ -6174,7 +7317,10 @@ mod tests {
         }
         let (index, near, shown, far, room) =
             best.expect("the displayed frame must find volume the one-chunk packet does not");
-        assert!(room >= 0.02, "no such ray has 0.02 um of room (best {room})");
+        assert!(
+            room >= 0.02,
+            "no such ray has 0.02 um of room (best {room})"
+        );
         let ray = displayed.rays[index];
         let request = NativePortableScenePickRequest {
             draw,
@@ -6194,7 +7340,13 @@ mod tests {
             "occluded by the displayed surface at {shown}; the region packet saw no volume here"
         );
         let front_distance = near + (shown - near) / 2.0;
-        let front = place_on_ray(&mut session, "front", ray.origin, ray.direction, front_distance);
+        let front = place_on_ray(
+            &mut session,
+            "front",
+            ray.origin,
+            ray.direction,
+            front_distance,
+        );
         assert_ne!(front, behind);
         let hit = pick_native_portable_scene_annotation_for_session(request, &session)
             .unwrap()
@@ -6213,7 +7365,9 @@ mod tests {
         let mut session = LocalSession::default();
         session.open_local_omezarr(&root).unwrap();
         session.prepare_default_portable_image_layer().unwrap();
-        session.add_point_annotation("marker", [64, 64, 16]).unwrap();
+        session
+            .add_point_annotation("marker", [64, 64, 16])
+            .unwrap();
         // What `newvolimNativePortableDrawRequest` produces: a chunk region (irrelevant to the
         // demand-driven frame) plus the canvas extent and camera.
         let request = NativePortableDrawRequest {
@@ -6227,15 +7381,23 @@ mod tests {
             orbit_y: -3,
             zoom: 1.1,
         };
-        let payload = render_native_portable_scene_camera_draw_for_session(request, &session).unwrap();
-        assert_eq!((payload.mime_type, payload.width, payload.height), ("image/png", 96, 64));
+        let payload =
+            render_native_portable_scene_camera_draw_for_session(request, &session).unwrap();
+        assert_eq!(
+            (payload.mime_type, payload.width, payload.height),
+            ("image/png", 96, 64)
+        );
         assert_eq!(payload.progress, FrameProgress::Final);
         assert_eq!(payload.target.depth, DepthAttachment::RayDistanceF32);
         assert_eq!(payload.target.color_format, ColorFormat::Rgba8Unorm);
         assert_eq!(payload.target.color_encoding, ColorEncoding::Srgb);
         assert!(payload.data_url.starts_with("data:image/png;base64,"));
         let pfm = STANDARD
-            .decode(payload.ray_distance_pfm_base64.expect("scene payload carries the PFM"))
+            .decode(
+                payload
+                    .ray_distance_pfm_base64
+                    .expect("scene payload carries the PFM"),
+            )
             .unwrap();
         // PFM as `palace_png` writes it: header, then rows bottom-to-top, little-endian f32.
         let header = b"Pf\n96 64\n-1.0\n";
@@ -6252,7 +7414,10 @@ mod tests {
             .collect::<Vec<_>>();
         let frame = scene_route_frame(&session, request).unwrap();
         assert_eq!(frame.renderer, RouteRenderer::Demand);
-        assert_eq!(distances.len(), frame.attachments.first_opacity_distance.len());
+        assert_eq!(
+            distances.len(),
+            frame.attachments.first_opacity_distance.len()
+        );
         assert_eq!(distances, frame.attachments.first_opacity_distance);
         assert!(distances.iter().any(|distance| distance.is_finite()));
         distances.clear();
@@ -6313,7 +7478,10 @@ mod tests {
         assert_eq!(transfer.classify(3000.0), [10, 200, 30, 127]);
         assert_eq!(transfer.classify(60000.0), [10, 200, 30, 127]);
         let mut degenerate = state;
-        degenerate.window = ChannelWindow { start: 5.0, end: 5.0 };
+        degenerate.window = ChannelWindow {
+            start: 5.0,
+            end: 5.0,
+        };
         assert!(palace_transfer_from_channel_state(&degenerate).is_err());
     }
 
@@ -6358,7 +7526,11 @@ mod tests {
         };
         session.set_channel_state(layer, 0, state.clone()).unwrap();
         let transparent = render_demand_driven_scene_camera_draw(&session, request).unwrap();
-        assert_eq!(hits(&transparent), 0, "zero opacity must leave no first-opacity surface");
+        assert_eq!(
+            hits(&transparent),
+            0,
+            "zero opacity must leave no first-opacity surface"
+        );
         assert!(transparent.rgba.chunks_exact(4).all(|pixel| pixel[3] == 0));
 
         state.opacity = 1.0;
@@ -6393,7 +7565,10 @@ mod tests {
         session.prepare_default_portable_image_layer().unwrap();
         let first = newvolim_scene::LayerId(session.layer_channels()[0].layer_id);
         let second = session.add_portable_image_layer(&gradient).unwrap();
-        let mut silent = session.layer_render_plan(LayerRenderLimits::new(4, 4)).unwrap().image_layers[0]
+        let mut silent = session
+            .layer_render_plan(LayerRenderLimits::new(4, 4))
+            .unwrap()
+            .image_layers[0]
             .channels[0]
             .state
             .clone();
@@ -6428,7 +7603,10 @@ mod tests {
                 hits += 1;
                 assert!(crosses, "pixel {pixel} has a surface at {depth} but its ray misses the second layer's box");
                 // Red ramps along x, green along y; the silenced cells layer adds no blue.
-                assert!(colour[3] > 0 && colour[2] == 0 && (colour[0] > 0 || colour[1] > 0), "pixel {pixel}: {colour:?}");
+                assert!(
+                    colour[3] > 0 && colour[2] == 0 && (colour[0] > 0 || colour[1] > 0),
+                    "pixel {pixel}: {colour:?}"
+                );
             } else {
                 assert_eq!(colour[3], 0, "pixel {pixel} has colour without a surface");
             }
@@ -6436,11 +7614,17 @@ mod tests {
         assert!(crossing > 0, "the camera must see the second layer's box");
         // The gradient is zero along its first column and row, so not every crossing ray finds
         // volume; most do.
-        assert!(hits * 2 >= crossing, "{hits} hits on {crossing} crossing rays");
+        assert!(
+            hits * 2 >= crossing,
+            "{hits} hits on {crossing} crossing rays"
+        );
         // And this is the scene route's frame — what the desktop and server display.
         let route = scene_route_frame(&session, request).unwrap();
         assert_eq!(route.renderer, RouteRenderer::Demand);
-        assert_eq!(route.attachments.first_opacity_distance, frame.first_opacity_distance);
+        assert_eq!(
+            route.attachments.first_opacity_distance,
+            frame.first_opacity_distance
+        );
     }
 
     /// CPU oracle for picking against a route frame: the pixel's own ray and its own depth,

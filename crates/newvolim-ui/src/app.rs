@@ -7,14 +7,17 @@
 //! newer camera or crosshair only marks the kind dirty, and the reply triggers the next
 //! request, so the page never queues more work than the renderer can drain.
 
-use std::{cell::RefCell, collections::HashMap};
 use std::rc::Rc;
+use std::{
+    cell::RefCell,
+    collections::{HashMap, HashSet},
+};
 
 use leptos::prelude::*;
 use leptos::task::spawn_local;
+use newvolim_scene::qupath::{self, Annotation, Geometry, ObjectType, Plane as AnnotationPlane};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
-use newvolim_scene::qupath::{self, Annotation, Geometry, ObjectType, Plane as AnnotationPlane};
 
 use crate::api::*;
 use crate::cube::CubeView;
@@ -91,7 +94,16 @@ pub enum Renderer {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AnnotationTool {
-    Pan, Select, Point, Rectangle, Ellipse, Polygon, FreehandRegion, Polyline, FreehandLine,
+    Pan,
+    Select,
+    Point,
+    Rectangle,
+    Ellipse,
+    Polygon,
+    FreehandRegion,
+    Polyline,
+    FreehandLine,
+    Profile,
 }
 
 #[derive(Clone)]
@@ -114,21 +126,73 @@ struct AnnotationViewStyle {
 
 impl Default for AnnotationViewStyle {
     fn default() -> Self {
-        Self { class: String::new(), class_color: [51, 230, 255], object_type: ObjectType::Annotation,
-            stroke_width: None, dense_region: false, filter: None, world_radius: false,
-            radius: 20.0, class_radii: HashMap::new(), filled: false, color_by_class: false, opacity: 0.95,
-            point_size: 11.0, slab: 8.0 }
+        Self {
+            class: String::new(),
+            class_color: [51, 230, 255],
+            object_type: ObjectType::Annotation,
+            stroke_width: None,
+            dense_region: false,
+            filter: None,
+            world_radius: false,
+            radius: 20.0,
+            class_radii: HashMap::new(),
+            filled: false,
+            color_by_class: false,
+            opacity: 0.95,
+            point_size: 11.0,
+            slab: 8.0,
+        }
     }
 }
 
 impl AnnotationTool {
     fn label(self) -> &'static str {
         match self {
-            Self::Pan => "Pan", Self::Select => "Select", Self::Point => "Point",
-            Self::Rectangle => "Rectangle", Self::Ellipse => "Ellipse", Self::Polygon => "Polygon",
-            Self::FreehandRegion => "Freehand region", Self::Polyline => "Polyline",
+            Self::Pan => "Pan",
+            Self::Select => "Select",
+            Self::Point => "Point",
+            Self::Rectangle => "Rectangle",
+            Self::Ellipse => "Ellipse",
+            Self::Polygon => "Polygon",
+            Self::FreehandRegion => "Freehand region",
+            Self::Polyline => "Polyline",
             Self::FreehandLine => "Freehand line",
+            Self::Profile => "Line profile",
         }
+    }
+
+}
+
+fn annotation_tool_icon(tool: AnnotationTool) -> AnyView {
+    match tool {
+        AnnotationTool::Pan => view! { <span class="tool-glyph">"✋"</span> }.into_any(),
+        AnnotationTool::Select => view! { <span class="tool-glyph">"⌖"</span> }.into_any(),
+        AnnotationTool::Point => view! {
+            <svg class="tool-icon" viewBox="0 0 20 20"><circle cx="10" cy="10" r="3"/></svg>
+        }.into_any(),
+        AnnotationTool::Rectangle => view! {
+            <svg class="tool-icon" viewBox="0 0 20 20"><rect x="4" y="5" width="12" height="10" rx="1"/></svg>
+        }.into_any(),
+        AnnotationTool::Ellipse => view! {
+            <svg class="tool-icon" viewBox="0 0 20 20"><ellipse cx="10" cy="10" rx="7" ry="5"/></svg>
+        }.into_any(),
+        AnnotationTool::Polygon => view! {
+            <svg class="tool-icon outline" viewBox="0 0 20 20"><path d="M10 2.5 L17 7 L14.5 16 L5.5 16 L3 7 Z"/></svg>
+        }.into_any(),
+        AnnotationTool::FreehandRegion => view! {
+            <svg class="tool-icon" viewBox="0 0 20 20"><path d="M2 14 C5 4 8 16 11 7 C14 1 16 12 18 5 L18 17 L2 17 Z"/></svg>
+        }.into_any(),
+        AnnotationTool::Polyline => view! {
+            <svg class="tool-icon outline" viewBox="0 0 20 20"><path d="M2 16 L7 7 L11 12 L18 3"/></svg>
+        }.into_any(),
+        AnnotationTool::FreehandLine => view! {
+            <svg class="tool-icon outline" viewBox="0 0 20 20"><path d="M2 14 C5 4 8 16 11 7 C14 1 16 12 18 5"/></svg>
+        }.into_any(),
+        AnnotationTool::Profile => view! {
+            <svg class="tool-icon outline" viewBox="0 0 20 20">
+                <path d="M3 5 V15 M17 5 V15 M3 10 H17 M6 8 V12 M10 8 V12 M14 8 V12"/>
+            </svg>
+        }.into_any(),
     }
 }
 
@@ -140,7 +204,10 @@ pub struct Camera {
 
 impl Default for Camera {
     fn default() -> Self {
-        Self { orientation: [0.0, 0.0, 0.0, 1.0], zoom: 1.0 }
+        Self {
+            orientation: [0.0, 0.0, 0.0, 1.0],
+            zoom: 1.0,
+        }
     }
 }
 
@@ -151,6 +218,14 @@ pub struct Slices {
     pub yz: String,
     pub viewport: bool,
     pub capture: OrthogonalCapture,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct LineProfileView {
+    pub line: [[f64; 2]; 2],
+    pub response: Option<LineProfileResponse>,
+    pub loading: bool,
+    pub error: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -167,6 +242,12 @@ struct SliceTilePlacement {
     source_y: u32,
     source_width: u32,
     source_height: u32,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct SliceTileSet {
+    level: usize,
+    tiles: Vec<SliceTilePlacement>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -229,6 +310,8 @@ pub struct Session {
     pub annotation_point_size: RwSignal<f64>,
     pub annotation_slab: RwSignal<f64>,
     pub annotation_draft: RwSignal<Vec<[f64; 2]>>,
+    pub line_profile: RwSignal<Option<LineProfileView>>,
+    profile_generation: StoredValue<u64>,
     annotation_create_inflight: StoredValue<bool>,
     queued_annotations: StoredValue<Vec<Annotation>>,
     annotation_undo: StoredValue<Vec<(u64, Vec<Annotation>)>>,
@@ -243,6 +326,8 @@ pub struct Session {
     /// Zoom of the XY, XZ and YZ panes over their slice: 1 fits the whole slice.
     pub zoom_2d: RwSignal<[f64; 3]>,
     pub pyramid_shapes_xyz: RwSignal<Vec<[u32; 3]>>,
+    /// 2D-only black/white windows, separate from the scene transfer state used by 3D.
+    pub slice_windows: RwSignal<HashMap<(u64, usize), [f64; 2]>>,
     pub tile_generation: RwSignal<u64>,
     /// False until the first dataset response has selected its final 2D or 3D layout and the
     /// browser has had a frame to apply it.
@@ -274,6 +359,7 @@ pub struct Session {
     browser_dirty: StoredValue<bool>,
     channel_inflight: StoredValue<bool>,
     channel_dirty: StoredValue<Option<ChannelEdit>>,
+    channel_tile_dirty: StoredValue<bool>,
     /// Scene-wide see-through depth (the server's `depthScale`), shown at once and sent
     /// latest-only.
     pub depth_scale: RwSignal<f32>,
@@ -322,6 +408,8 @@ impl Session {
             annotation_point_size: RwSignal::new(11.0),
             annotation_slab: RwSignal::new(8.0),
             annotation_draft: RwSignal::new(Vec::new()),
+            line_profile: RwSignal::new(None),
+            profile_generation: StoredValue::new(0),
             annotation_create_inflight: StoredValue::new(false),
             queued_annotations: StoredValue::new(Vec::new()),
             annotation_undo: StoredValue::new(Vec::new()),
@@ -331,6 +419,7 @@ impl Session {
             focus: RwSignal::new([0.0; 3]),
             zoom_2d: RwSignal::new([1.0; 3]),
             pyramid_shapes_xyz: RwSignal::new(Vec::new()),
+            slice_windows: RwSignal::new(HashMap::new()),
             tile_generation: RwSignal::new(js_sys::Date::now() as u64),
             dataset_layout_ready: RwSignal::new(false),
             layout_tick: RwSignal::new(0),
@@ -357,6 +446,7 @@ impl Session {
             browser_dirty: StoredValue::new(false),
             channel_inflight: StoredValue::new(false),
             channel_dirty: StoredValue::new(None),
+            channel_tile_dirty: StoredValue::new(false),
             depth_scale: RwSignal::new(1.0),
             settings_inflight: StoredValue::new(false),
             settings_dirty: StoredValue::new(None),
@@ -397,9 +487,11 @@ impl Session {
         spawn_local(async move {
             match get_json::<DatasetList>(&datasets_url(&origin)).await {
                 Ok(list) => {
-                    self.status.set(format!("{} datasets at {origin}", list.datasets.len()));
+                    self.status
+                        .set(format!("{} datasets at {origin}", list.datasets.len()));
                     // A deep link: `?dataset=name` opens that dataset straight away.
-                    let wanted = query_parameter("dataset").filter(|name| list.datasets.contains(name));
+                    let wanted =
+                        query_parameter("dataset").filter(|name| list.datasets.contains(name));
                     self.datasets.set(list.datasets);
                     if let Some(name) = wanted {
                         if self.dataset.get_untracked().is_none() {
@@ -413,7 +505,9 @@ impl Session {
     }
 
     pub fn open(self, name: String) {
-        if !self.close() { return; }
+        if !self.close() {
+            return;
+        }
         self.dataset.set(Some(name.clone()));
         // The first orthogonal response decides whether this dataset has a volume. Starting from
         // Grid makes a later 3D dataset predictable without speculatively rendering one now.
@@ -432,11 +526,19 @@ impl Session {
     }
 
     pub fn close(self) -> bool {
-        if self.annotation_layers.get_untracked().iter().any(|layer| layer.dirty)
-            && !window().confirm_with_message("Unsaved annotations will be lost. Close this dataset?").unwrap_or(false) {
+        if self
+            .annotation_layers
+            .get_untracked()
+            .iter()
+            .any(|layer| layer.dirty)
+            && !window()
+                .confirm_with_message("Unsaved annotations will be lost. Close this dataset?")
+                .unwrap_or(false)
+        {
             return false;
         }
-        self.volume_preview_generation.update_value(|generation| *generation = generation.wrapping_add(1));
+        self.volume_preview_generation
+            .update_value(|generation| *generation = generation.wrapping_add(1));
         self.volume_preview.set_value(false);
         if let Some(socket) = self.socket.get_value() {
             let _ = socket.borrow().ws.close();
@@ -451,11 +553,15 @@ impl Session {
         self.selected_annotation.set(None);
         self.annotation_tool.set(AnnotationTool::Pan);
         self.annotation_draft.set(Vec::new());
+        self.line_profile.set(None);
+        self.profile_generation
+            .update_value(|generation| *generation = generation.wrapping_add(1));
         self.annotation_create_inflight.set_value(false);
         self.queued_annotations.set_value(Vec::new());
         self.annotation_undo.set_value(Vec::new());
         self.voxel_shape.set(None);
         self.pyramid_shapes_xyz.set(Vec::new());
+        self.slice_windows.set(HashMap::new());
         self.dataset_layout_ready.set(false);
         self.slices.set(None);
         self.volume_png.set(None);
@@ -464,33 +570,62 @@ impl Session {
         self.ortho_inflight.set_value(None);
         self.volume_dirty.set_value(false);
         self.ortho_dirty.set_value(false);
+        self.channel_tile_dirty.set_value(false);
         self.update_busy();
         true
     }
 
     fn refresh_layers(self) {
-        let Some(dataset) = self.dataset.get() else { return };
+        let Some(dataset) = self.dataset.get() else {
+            return;
+        };
         let url = channels_url(&self.origin.get(), &dataset);
         spawn_local(async move {
             match get_json::<Vec<LayerChannelSummary>>(&url).await {
-                Ok(layers) => self.layers.set(layers),
+                Ok(layers) => {
+                    self.slice_windows.set(
+                        layers
+                            .iter()
+                            .flat_map(|layer| {
+                                layer.channels.iter().map(move |channel| {
+                                    (
+                                        (layer.layer_id, channel.source_index),
+                                        [channel.window_start, channel.window_end],
+                                    )
+                                })
+                            })
+                            .collect(),
+                    );
+                    self.layers.set(layers);
+                }
                 Err(message) => self.fail(message),
             }
         });
     }
 
     fn refresh_annotations(self) {
-        let Some(dataset) = self.dataset.get_untracked() else { return };
+        let Some(dataset) = self.dataset.get_untracked() else {
+            return;
+        };
         let url = annotation_layers_url(&self.origin.get_untracked(), &dataset);
         spawn_local(async move {
             match get_json::<Vec<AnnotationLayer>>(&url).await {
                 Ok(layers) => {
-                    let has_annotations = layers.iter().any(|layer| layer.visible && !layer.annotations.is_empty());
+                    let has_annotations = layers
+                        .iter()
+                        .any(|layer| layer.visible && !layer.annotations.is_empty());
                     let active = self.annotation_layer.get_untracked();
-                    self.select_annotation_layer(active.filter(|id| layers.iter().any(|layer| layer.id == *id)).or_else(|| layers.first().map(|layer| layer.id)));
+                    self.select_annotation_layer(
+                        active
+                            .filter(|id| layers.iter().any(|layer| layer.id == *id))
+                            .or_else(|| layers.first().map(|layer| layer.id)),
+                    );
                     self.annotation_layers.set(layers);
                     if has_annotations
-                        && self.voxel_shape.get_untracked().is_some_and(|shape| shape[2] > 1)
+                        && self
+                            .voxel_shape
+                            .get_untracked()
+                            .is_some_and(|shape| shape[2] > 1)
                     {
                         self.request_volume();
                     }
@@ -500,7 +635,9 @@ impl Session {
         });
         let tables_url = annotation_roi_tables_url(&self.origin.get_untracked(), &dataset);
         spawn_local(async move {
-            if let Ok(tables) = get_json::<Vec<RoiTableSummary>>(&tables_url).await { self.annotation_roi_tables.set(tables); }
+            if let Ok(tables) = get_json::<Vec<RoiTableSummary>>(&tables_url).await {
+                self.annotation_roi_tables.set(tables);
+            }
         });
     }
 
@@ -508,13 +645,20 @@ impl Session {
         self.annotation_layers.update(|layers| {
             if let Some(existing) = layers.iter_mut().find(|layer| layer.id == updated.id) {
                 *existing = updated;
-            } else { layers.push(updated); }
+            } else {
+                layers.push(updated);
+            }
         });
     }
 
     fn active_annotations(self) -> Vec<Annotation> {
         let id = self.annotation_layer.get_untracked();
-        self.annotation_layers.get_untracked().into_iter().find(|layer| Some(layer.id) == id).map(|layer| layer.annotations).unwrap_or_default()
+        self.annotation_layers
+            .get_untracked()
+            .into_iter()
+            .find(|layer| Some(layer.id) == id)
+            .map(|layer| layer.annotations)
+            .unwrap_or_default()
     }
 
     fn current_annotation_style(self) -> AnnotationViewStyle {
@@ -538,12 +682,18 @@ impl Session {
 
     fn select_annotation_layer(self, next: Option<u64>) {
         let previous = self.annotation_layer.get_untracked();
-        if previous == next { return; }
+        if previous == next {
+            return;
+        }
         if let Some(id) = previous {
             let style = self.current_annotation_style();
-            self.annotation_styles.update_value(|styles| { styles.insert(id, style); });
+            self.annotation_styles.update_value(|styles| {
+                styles.insert(id, style);
+            });
         }
-        let style = next.and_then(|id| self.annotation_styles.get_value().get(&id).cloned()).unwrap_or_default();
+        let style = next
+            .and_then(|id| self.annotation_styles.get_value().get(&id).cloned())
+            .unwrap_or_default();
         self.annotation_class.set(style.class);
         self.annotation_class_color.set(style.class_color);
         self.annotation_object_type.set(style.object_type);
@@ -563,30 +713,51 @@ impl Session {
     }
 
     fn edit_selected_annotation(self, edit: impl FnOnce(&mut Annotation)) {
-        let Some(id) = self.selected_annotation.get_untracked() else { return };
-        let Some(mut annotation) = self.active_annotations().into_iter().find(|item| item.id == id) else { return };
+        let Some(id) = self.selected_annotation.get_untracked() else {
+            return;
+        };
+        let Some(mut annotation) = self
+            .active_annotations()
+            .into_iter()
+            .find(|item| item.id == id)
+        else {
+            return;
+        };
         edit(&mut annotation);
         self.remember_annotations();
         self.update_annotation(annotation);
     }
 
     fn remember_annotations(self) {
-        let Some(layer) = self.annotation_layer.get_untracked() else { return };
+        let Some(layer) = self.annotation_layer.get_untracked() else {
+            return;
+        };
         let rows = self.active_annotations();
         self.annotation_undo.update_value(|history| {
             history.push((layer, rows));
-            if history.len() > 50 { history.remove(0); }
+            if history.len() > 50 {
+                history.remove(0);
+            }
         });
     }
 
     fn undo_annotations(self) {
-        let Some((layer, rows)) = self.annotation_undo.get_value().last().cloned() else { return };
-        let Some(dataset) = self.dataset.get_untracked() else { return };
-        let url = format!("{}/state", annotation_layer_url(&self.origin.get_untracked(), &dataset, layer));
+        let Some((layer, rows)) = self.annotation_undo.get_value().last().cloned() else {
+            return;
+        };
+        let Some(dataset) = self.dataset.get_untracked() else {
+            return;
+        };
+        let url = format!(
+            "{}/state",
+            annotation_layer_url(&self.origin.get_untracked(), &dataset, layer)
+        );
         spawn_local(async move {
             match put_json::<AnnotationLayer, _>(&url, &rows).await {
                 Ok(updated) => {
-                    self.annotation_undo.update_value(|history| { history.pop(); });
+                    self.annotation_undo.update_value(|history| {
+                        history.pop();
+                    });
                     self.select_annotation_layer(Some(layer));
                     self.set_annotation_layer(updated);
                     self.selected_annotation.set(None);
@@ -602,38 +773,129 @@ impl Session {
         let points = self.annotation_draft.get_untracked();
         self.annotation_draft.set(Vec::new());
         let tool = self.annotation_tool.get_untracked();
-        let Some((geometry, is_ellipse)) = annotation_geometry(tool, &points) else { return };
+        let Some((geometry, is_ellipse)) = annotation_geometry(tool, &points) else {
+            return;
+        };
         let z = self.crosshair.get_untracked()[2] as i32;
-        self.add_annotation(Annotation { geometry, is_ellipse, plane: AnnotationPlane::at(z, 0), ..Annotation::default() });
+        self.add_annotation(Annotation {
+            geometry,
+            is_ellipse,
+            plane: AnnotationPlane::at(z, 0),
+            ..Annotation::default()
+        });
+    }
+
+    fn request_line_profile(self, line: [[f64; 2]; 2], level: u32) {
+        let (Some(dataset), Some(layer)) = (
+            self.dataset.get_untracked(),
+            self.layers.get_untracked().into_iter().next(),
+        ) else {
+            return;
+        };
+        let channels = layer
+            .channels
+            .iter()
+            .filter(|channel| channel.enabled)
+            .map(|channel| channel.source_index)
+            .collect::<Vec<_>>();
+        if channels.is_empty() {
+            self.line_profile.set(Some(LineProfileView {
+                line,
+                response: None,
+                loading: false,
+                error: Some("No enabled image channels to sample".into()),
+            }));
+            return;
+        }
+        let generation = self.profile_generation.get_value().wrapping_add(1);
+        self.profile_generation.set_value(generation);
+        self.line_profile.set(Some(LineProfileView {
+            line,
+            response: None,
+            loading: true,
+            error: None,
+        }));
+        let url = xy_profile_url(
+            &self.origin.get_untracked(),
+            &dataset,
+            level,
+            line[0],
+            line[1],
+            self.focus.get_untracked()[2],
+            &channels,
+        );
+        spawn_local(async move {
+            let result = get_json::<LineProfileResponse>(&url).await;
+            if self.profile_generation.get_value() != generation {
+                return;
+            }
+            self.line_profile.update(|profile| {
+                let Some(profile) = profile else { return };
+                profile.loading = false;
+                match result {
+                    Ok(response) => profile.response = Some(response),
+                    Err(message) => profile.error = Some(message),
+                }
+            });
+        });
     }
 
     fn create_annotation_layer(self, name: String) {
-        let Some(dataset) = self.dataset.get_untracked() else { return };
+        let Some(dataset) = self.dataset.get_untracked() else {
+            return;
+        };
         let url = annotation_layers_url(&self.origin.get_untracked(), &dataset);
         spawn_local(async move {
             match post_json::<AnnotationLayer, _>(&url, &serde_json::json!({"name": name})).await {
-                Ok(layer) => { self.select_annotation_layer(Some(layer.id)); self.set_annotation_layer(layer); self.error.set(None); }
+                Ok(layer) => {
+                    self.select_annotation_layer(Some(layer.id));
+                    self.set_annotation_layer(layer);
+                    self.error.set(None);
+                }
                 Err(message) => self.fail(message),
             }
         });
     }
 
     fn remove_annotation_layer(self) {
-        let (Some(dataset), Some(id)) = (self.dataset.get_untracked(), self.annotation_layer.get_untracked()) else { return };
-        let layer = self.annotation_layers.get_untracked().into_iter().find(|layer| layer.id == id);
+        let (Some(dataset), Some(id)) = (
+            self.dataset.get_untracked(),
+            self.annotation_layer.get_untracked(),
+        ) else {
+            return;
+        };
+        let layer = self
+            .annotation_layers
+            .get_untracked()
+            .into_iter()
+            .find(|layer| layer.id == id);
         if layer.as_ref().is_some_and(|layer| layer.dirty)
-            && !window().confirm_with_message("Unsaved annotations in this layer will be lost. Remove it from the session?").unwrap_or(false) {
+            && !window()
+                .confirm_with_message(
+                    "Unsaved annotations in this layer will be lost. Remove it from the session?",
+                )
+                .unwrap_or(false)
+        {
             return;
         }
         let url = annotation_layer_url(&self.origin.get_untracked(), &dataset, id);
         spawn_local(async move {
             match delete_request(&url).await {
                 Ok(()) => {
-                    self.annotation_layers.update(|layers| layers.retain(|layer| layer.id != id));
-                    self.select_annotation_layer(self.annotation_layers.get_untracked().first().map(|layer| layer.id));
-                    self.annotation_styles.update_value(|styles| { styles.remove(&id); });
+                    self.annotation_layers
+                        .update(|layers| layers.retain(|layer| layer.id != id));
+                    self.select_annotation_layer(
+                        self.annotation_layers
+                            .get_untracked()
+                            .first()
+                            .map(|layer| layer.id),
+                    );
+                    self.annotation_styles.update_value(|styles| {
+                        styles.remove(&id);
+                    });
                     self.selected_annotation.set(None);
-                    self.annotation_undo.update_value(|history| history.retain(|(layer, _)| *layer != id));
+                    self.annotation_undo
+                        .update_value(|history| history.retain(|(layer, _)| *layer != id));
                     self.error.set(None);
                     self.request_volume();
                 }
@@ -643,22 +905,31 @@ impl Session {
     }
 
     fn add_annotation(self, mut annotation: Annotation) {
-        let Some(dataset) = self.dataset.get_untracked() else { return };
+        let Some(dataset) = self.dataset.get_untracked() else {
+            return;
+        };
         let origin = self.origin.get_untracked();
         let Some(layer_id) = self.annotation_layer.get_untracked() else {
-            self.queued_annotations.update_value(|queue| queue.push(annotation));
-            if self.annotation_create_inflight.get_value() { return; }
+            self.queued_annotations
+                .update_value(|queue| queue.push(annotation));
+            if self.annotation_create_inflight.get_value() {
+                return;
+            }
             self.annotation_create_inflight.set_value(true);
             spawn_local(async move {
                 let url = annotation_layers_url(&origin, &dataset);
                 let name = format!("manual_{}", js_sys::Date::now() as u64);
-                match post_json::<AnnotationLayer, _>(&url, &serde_json::json!({"name": name})).await {
+                match post_json::<AnnotationLayer, _>(&url, &serde_json::json!({"name": name}))
+                    .await
+                {
                     Ok(layer) => {
                         self.select_annotation_layer(Some(layer.id));
                         self.set_annotation_layer(layer);
                         let queued = self.queued_annotations.get_value();
                         self.queued_annotations.set_value(Vec::new());
-                        for item in queued { self.add_annotation(item); }
+                        for item in queued {
+                            self.add_annotation(item);
+                        }
                     }
                     Err(message) => self.fail(message),
                 }
@@ -671,15 +942,25 @@ impl Session {
             let id = layer_id;
             annotation.label = self.annotation_class.get_untracked();
             annotation.object_type = self.annotation_object_type.get_untracked();
-            annotation.dense_region = self.annotation_dense_region.get_untracked() && matches!(&annotation.geometry, Geometry::Polygon(_) | Geometry::MultiPolygon(_));
-            if matches!(&annotation.geometry, Geometry::LineString(_) | Geometry::MultiLineString(_)) {
+            annotation.dense_region = self.annotation_dense_region.get_untracked()
+                && matches!(
+                    &annotation.geometry,
+                    Geometry::Polygon(_) | Geometry::MultiPolygon(_)
+                );
+            if matches!(
+                &annotation.geometry,
+                Geometry::LineString(_) | Geometry::MultiLineString(_)
+            ) {
                 annotation.stroke_width = self.annotation_stroke_width.get_untracked();
             }
             let url = annotation_layer_url(&origin, &dataset, id);
             match post_json::<Annotation, _>(&url, &annotation).await {
                 Ok(stored) => {
-                    self.annotation_layers.update(|layers| if let Some(layer) = layers.iter_mut().find(|layer| layer.id == id) {
-                        layer.annotations.push(stored.clone()); layer.dirty = true;
+                    self.annotation_layers.update(|layers| {
+                        if let Some(layer) = layers.iter_mut().find(|layer| layer.id == id) {
+                            layer.annotations.push(stored.clone());
+                            layer.dirty = true;
+                        }
                     });
                     self.selected_annotation.set(Some(stored.id));
                     self.error.set(None);
@@ -691,14 +972,31 @@ impl Session {
     }
 
     fn update_annotation(self, annotation: Annotation) {
-        let (Some(dataset), Some(layer)) = (self.dataset.get_untracked(), self.annotation_layer.get_untracked()) else { return };
-        let url = format!("{}/{}", annotation_layer_url(&self.origin.get_untracked(), &dataset, layer), annotation.id);
+        let (Some(dataset), Some(layer)) = (
+            self.dataset.get_untracked(),
+            self.annotation_layer.get_untracked(),
+        ) else {
+            return;
+        };
+        let url = format!(
+            "{}/{}",
+            annotation_layer_url(&self.origin.get_untracked(), &dataset, layer),
+            annotation.id
+        );
         spawn_local(async move {
             match put_json::<Annotation, _>(&url, &annotation).await {
                 Ok(stored) => {
-                    self.annotation_layers.update(|layers| if let Some(layer) = layers.iter_mut().find(|item| item.id == layer) {
-                        if let Some(item) = layer.annotations.iter_mut().find(|item| item.id == stored.id) { *item = stored; }
-                        layer.dirty = true;
+                    self.annotation_layers.update(|layers| {
+                        if let Some(layer) = layers.iter_mut().find(|item| item.id == layer) {
+                            if let Some(item) = layer
+                                .annotations
+                                .iter_mut()
+                                .find(|item| item.id == stored.id)
+                            {
+                                *item = stored;
+                            }
+                            layer.dirty = true;
+                        }
                     });
                     self.error.set(None);
                     self.request_volume();
@@ -709,15 +1007,25 @@ impl Session {
     }
 
     fn delete_annotation(self, id: u64) {
-        let (Some(dataset), Some(layer)) = (self.dataset.get_untracked(), self.annotation_layer.get_untracked()) else { return };
-        let url = format!("{}/{id}", annotation_layer_url(&self.origin.get_untracked(), &dataset, layer));
+        let (Some(dataset), Some(layer)) = (
+            self.dataset.get_untracked(),
+            self.annotation_layer.get_untracked(),
+        ) else {
+            return;
+        };
+        let url = format!(
+            "{}/{id}",
+            annotation_layer_url(&self.origin.get_untracked(), &dataset, layer)
+        );
         self.remember_annotations();
         spawn_local(async move {
             match delete_request(&url).await {
                 Ok(()) => {
-                    self.annotation_layers.update(|layers| if let Some(layer) = layers.iter_mut().find(|item| item.id == layer) {
-                        layer.annotations.retain(|item| item.id != id);
-                        layer.dirty = true;
+                    self.annotation_layers.update(|layers| {
+                        if let Some(layer) = layers.iter_mut().find(|item| item.id == layer) {
+                            layer.annotations.retain(|item| item.id != id);
+                            layer.dirty = true;
+                        }
                     });
                     self.selected_annotation.set(None);
                     self.error.set(None);
@@ -729,15 +1037,46 @@ impl Session {
     }
 
     fn save_annotations(self) {
-        let (Some(dataset), Some(layer)) = (self.dataset.get_untracked(), self.annotation_layer.get_untracked()) else { return };
-        let Some(target) = self.annotation_layers.get_untracked().into_iter().find(|item| item.id == layer).map(|item| item.save_target) else { return };
-        let url = format!("{}/save-to", annotation_layer_url(&self.origin.get_untracked(), &dataset, layer));
+        let (Some(dataset), Some(layer)) = (
+            self.dataset.get_untracked(),
+            self.annotation_layer.get_untracked(),
+        ) else {
+            return;
+        };
+        let Some(target) = self
+            .annotation_layers
+            .get_untracked()
+            .into_iter()
+            .find(|item| item.id == layer)
+            .map(|item| item.save_target)
+        else {
+            return;
+        };
+        let url = format!(
+            "{}/save-to",
+            annotation_layer_url(&self.origin.get_untracked(), &dataset, layer)
+        );
         spawn_local(async move {
-            match post_json::<AnnotationSaveReport, _>(&url, &serde_json::json!({"target": target})).await {
+            match post_json::<AnnotationSaveReport, _>(&url, &serde_json::json!({"target": target}))
+                .await
+            {
                 Ok(report) => {
-                    self.annotation_layers.update(|layers| if let Some(item) = layers.iter_mut().find(|item| item.id == layer) { item.dirty = false; });
-                    self.status.set(format!("Saved {} annotations as {} to {}{}", report.rows, report.format, report.target,
-                        if report.flattened > 0 { format!("; {} shapes reduced to boxes", report.flattened) } else { String::new() }));
+                    self.annotation_layers.update(|layers| {
+                        if let Some(item) = layers.iter_mut().find(|item| item.id == layer) {
+                            item.dirty = false;
+                        }
+                    });
+                    self.status.set(format!(
+                        "Saved {} annotations as {} to {}{}",
+                        report.rows,
+                        report.format,
+                        report.target,
+                        if report.flattened > 0 {
+                            format!("; {} shapes reduced to boxes", report.flattened)
+                        } else {
+                            String::new()
+                        }
+                    ));
                     self.error.set(None);
                 }
                 Err(message) => self.fail(message),
@@ -746,23 +1085,48 @@ impl Session {
     }
 
     fn set_annotation_visibility(self, visible: bool) {
-        let (Some(dataset), Some(layer)) = (self.dataset.get_untracked(), self.annotation_layer.get_untracked()) else { return };
-        let url = format!("{}/visibility", annotation_layer_url(&self.origin.get_untracked(), &dataset, layer));
+        let (Some(dataset), Some(layer)) = (
+            self.dataset.get_untracked(),
+            self.annotation_layer.get_untracked(),
+        ) else {
+            return;
+        };
+        let url = format!(
+            "{}/visibility",
+            annotation_layer_url(&self.origin.get_untracked(), &dataset, layer)
+        );
         spawn_local(async move {
-            match put_json::<AnnotationLayer, _>(&url, &serde_json::json!({"visible": visible})).await {
-                Ok(updated) => { self.set_annotation_layer(updated); self.error.set(None); self.request_volume(); }
+            match put_json::<AnnotationLayer, _>(&url, &serde_json::json!({"visible": visible}))
+                .await
+            {
+                Ok(updated) => {
+                    self.set_annotation_layer(updated);
+                    self.error.set(None);
+                    self.request_volume();
+                }
                 Err(message) => self.fail(message),
             }
         });
     }
 
     fn save_annotation_roi(self) {
-        let (Some(dataset), Some(layer)) = (self.dataset.get_untracked(), self.annotation_layer.get_untracked()) else { return };
-        let url = format!("{}/save-roi", annotation_layer_url(&self.origin.get_untracked(), &dataset, layer));
+        let (Some(dataset), Some(layer)) = (
+            self.dataset.get_untracked(),
+            self.annotation_layer.get_untracked(),
+        ) else {
+            return;
+        };
+        let url = format!(
+            "{}/save-roi",
+            annotation_layer_url(&self.origin.get_untracked(), &dataset, layer)
+        );
         spawn_local(async move {
             match post_json::<RoiSaveReport, _>(&url, &serde_json::json!({})).await {
                 Ok(report) => {
-                    self.status.set(format!("ROI table saved to {}; {} shapes reduced to boxes", report.target, report.flattened));
+                    self.status.set(format!(
+                        "ROI table saved to {}; {} shapes reduced to boxes",
+                        report.target, report.flattened
+                    ));
                     self.refresh_annotations();
                 }
                 Err(message) => self.fail(message),
@@ -771,42 +1135,76 @@ impl Session {
     }
 
     fn import_annotation_roi(self, name: String) {
-        let Some(dataset) = self.dataset.get_untracked() else { return };
+        let Some(dataset) = self.dataset.get_untracked() else {
+            return;
+        };
         let url = annotation_roi_import_url(&self.origin.get_untracked(), &dataset, &name);
         spawn_local(async move {
             match post_json::<AnnotationLayer, _>(&url, &serde_json::json!({})).await {
-                Ok(layer) => { self.select_annotation_layer(Some(layer.id)); self.set_annotation_layer(layer); self.error.set(None); self.request_volume(); }
+                Ok(layer) => {
+                    self.select_annotation_layer(Some(layer.id));
+                    self.set_annotation_layer(layer);
+                    self.error.set(None);
+                    self.request_volume();
+                }
                 Err(message) => self.fail(message),
             }
         });
     }
 
     fn import_annotations(self, text: String) {
-        let (Some(dataset), Some(layer)) = (self.dataset.get_untracked(), self.annotation_layer.get_untracked()) else { return };
-        let url = format!("{}/geojson", annotation_layer_url(&self.origin.get_untracked(), &dataset, layer));
+        let (Some(dataset), Some(layer)) = (
+            self.dataset.get_untracked(),
+            self.annotation_layer.get_untracked(),
+        ) else {
+            return;
+        };
+        let url = format!(
+            "{}/geojson",
+            annotation_layer_url(&self.origin.get_untracked(), &dataset, layer)
+        );
         self.remember_annotations();
         spawn_local(async move {
             match put_geojson(&url, text).await {
-                Ok(updated) => { self.set_annotation_layer(updated); self.selected_annotation.set(None); self.error.set(None); self.request_volume(); }
+                Ok(updated) => {
+                    self.set_annotation_layer(updated);
+                    self.selected_annotation.set(None);
+                    self.error.set(None);
+                    self.request_volume();
+                }
                 Err(message) => self.fail(message),
             }
         });
     }
 
     fn annotation_action(self, suffix: String) {
-        let (Some(dataset), Some(layer)) = (self.dataset.get_untracked(), self.annotation_layer.get_untracked()) else { return };
-        let url = format!("{}/{}", annotation_layer_url(&self.origin.get_untracked(), &dataset, layer), suffix);
+        let (Some(dataset), Some(layer)) = (
+            self.dataset.get_untracked(),
+            self.annotation_layer.get_untracked(),
+        ) else {
+            return;
+        };
+        let url = format!(
+            "{}/{}",
+            annotation_layer_url(&self.origin.get_untracked(), &dataset, layer),
+            suffix
+        );
         self.remember_annotations();
         spawn_local(async move {
             match post_empty(&url).await {
-                Ok(()) => { self.refresh_annotations(); self.error.set(None); }
+                Ok(()) => {
+                    self.refresh_annotations();
+                    self.error.set(None);
+                }
                 Err(message) => self.fail(message),
             }
         });
     }
 
     fn refresh_settings(self) {
-        let Some(dataset) = self.dataset.get() else { return };
+        let Some(dataset) = self.dataset.get() else {
+            return;
+        };
         let url = settings_url(&self.origin.get(), &dataset);
         spawn_local(async move {
             match get_json::<SceneSettings>(&url).await {
@@ -827,7 +1225,9 @@ impl Session {
     }
 
     fn post_depth_scale(self, scale: f32) {
-        let Some(dataset) = self.dataset.get_untracked() else { return };
+        let Some(dataset) = self.dataset.get_untracked() else {
+            return;
+        };
         let url = settings_url(&self.origin.get_untracked(), &dataset);
         self.settings_inflight.set_value(true);
         self.update_busy();
@@ -858,7 +1258,12 @@ impl Session {
             Ok(ws) => ws,
             Err(error) => return self.fail(format!("frame socket {url}: {error:?}")),
         };
-        let socket = Rc::new(RefCell::new(Socket { ws: ws.clone(), open: false, queued: Vec::new(), _closures: Vec::new() }));
+        let socket = Rc::new(RefCell::new(Socket {
+            ws: ws.clone(),
+            open: false,
+            queued: Vec::new(),
+            _closures: Vec::new(),
+        }));
         let mut closures = Vec::new();
 
         let on_open = {
@@ -878,8 +1283,12 @@ impl Session {
         closures.push(on_open);
 
         let on_message = Closure::<dyn FnMut(JsValue)>::new(move |event: JsValue| {
-            let Ok(event) = event.dyn_into::<web_sys::MessageEvent>() else { return };
-            let Some(text) = event.data().as_string() else { return };
+            let Ok(event) = event.dyn_into::<web_sys::MessageEvent>() else {
+                return;
+            };
+            let Some(text) = event.data().as_string() else {
+                return;
+            };
             match serde_json::from_str::<SocketReply>(&text) {
                 Ok(reply) => self.handle_reply(reply),
                 Err(error) => self.fail(format!("frame socket sent invalid JSON: {error}")),
@@ -910,7 +1319,9 @@ impl Session {
     }
 
     fn socket_send(self, text: String) {
-        let Some(socket) = self.socket.get_value() else { return };
+        let Some(socket) = self.socket.get_value() else {
+            return;
+        };
         let mut inner = socket.borrow_mut();
         if inner.open {
             if let Err(error) = inner.ws.send_with_str(&text) {
@@ -931,9 +1342,14 @@ impl Session {
     /// The three slices at the visible slice pane's physical size, for the current crosshair.
     /// Nothing is requested while no slice pane is on screen.
     pub fn request_orthogonal(self) {
-        let Some(dataset) = self.dataset.get_untracked() else { return };
+        let Some(dataset) = self.dataset.get_untracked() else {
+            return;
+        };
         let mode = self.view_mode.get_untracked();
-        if self.uses_xy_tile_cache() && mode == ViewMode::Xy && self.slices.get_untracked().is_some() {
+        if self.uses_xy_tile_cache()
+            && mode == ViewMode::Xy
+            && self.slices.get_untracked().is_some()
+        {
             self.ortho_dirty.set_value(false);
             return;
         }
@@ -944,21 +1360,33 @@ impl Session {
             .filter(|(_, &plane)| mode.shows_plane(plane))
             .max_by(|(left, _), (right, _)| zooms[*left].total_cmp(&zooms[*right]))
             .map(|(index, _)| index)
-        else { return };
+        else {
+            return;
+        };
         if self.ortho_inflight.get_value().is_some() {
             self.ortho_dirty.set_value(true);
             return;
         }
-        let (width, height) = self.ortho_panes[pane_index].get_untracked().map(|pane| physical_size(&pane)).unwrap_or((256, 256));
-        let crosshair = self.voxel_shape.get_untracked().map(|_| self.crosshair.get_untracked());
-        let focus_xyz = self.voxel_shape.get_untracked().map(|shape| normalized_focus_xyz(self.focus.get_untracked(), shape));
+        let (width, height) = self.ortho_panes[pane_index]
+            .get_untracked()
+            .map(|pane| physical_size(&pane))
+            .unwrap_or((256, 256));
+        let crosshair = self
+            .voxel_shape
+            .get_untracked()
+            .map(|_| self.crosshair.get_untracked());
+        let focus_xyz = self
+            .voxel_shape
+            .get_untracked()
+            .map(|shape| normalized_focus_xyz(self.focus.get_untracked(), shape));
         let request_id = self.next_request_id();
         self.ortho_inflight.set_value(Some(request_id));
-        self.ortho_request_capture.set_value(Some(OrthogonalCapture {
-            focus_xyz: self.focus.get_untracked(),
-            zooms,
-            pane_size: [width, height],
-        }));
+        self.ortho_request_capture
+            .set_value(Some(OrthogonalCapture {
+                focus_xyz: self.focus.get_untracked(),
+                zooms,
+                pane_size: [width, height],
+            }));
         self.ortho_dirty.set_value(false);
         self.update_busy();
         let request = FrameRequest {
@@ -984,7 +1412,9 @@ impl Session {
     /// The volume frame for the current camera: from the server over the socket, or rendered
     /// here from the server's scene packet.
     pub fn request_volume(self) {
-        let Some(dataset) = self.dataset.get_untracked() else { return };
+        let Some(dataset) = self.dataset.get_untracked() else {
+            return;
+        };
         if !self.view_mode.get_untracked().shows_volume() {
             return;
         }
@@ -995,9 +1425,16 @@ impl Session {
             self.volume_dirty.set_value(true);
             return;
         }
-        let (width, height) = self.volume_pane.get_untracked().map(|pane| preview_size(physical_size(&pane), self.volume_preview.get_value())).unwrap_or((256, 256));
+        let (width, height) = self
+            .volume_pane
+            .get_untracked()
+            .map(|pane| preview_size(physical_size(&pane), self.volume_preview.get_value()))
+            .unwrap_or((256, 256));
         let camera = self.camera.get_untracked();
-        let focus_xyz = self.voxel_shape.get_untracked().map(|shape| normalized_focus_xyz(self.focus.get_untracked(), shape));
+        let focus_xyz = self
+            .voxel_shape
+            .get_untracked()
+            .map(|shape| normalized_focus_xyz(self.focus.get_untracked(), shape));
         let request_id = self.next_request_id();
         self.volume_inflight.set_value(Some(request_id));
         self.volume_dirty.set_value(false);
@@ -1027,17 +1464,28 @@ impl Session {
             self.browser_dirty.set_value(true);
             return;
         }
-        let Some(canvas) = self.volume_canvas.get_untracked() else { return };
-        let (width, height) = self.volume_pane.get_untracked().map(|pane| preview_size(physical_size(&pane), self.volume_preview.get_value())).unwrap_or((256, 256));
+        let Some(canvas) = self.volume_canvas.get_untracked() else {
+            return;
+        };
+        let (width, height) = self
+            .volume_pane
+            .get_untracked()
+            .map(|pane| preview_size(physical_size(&pane), self.volume_preview.get_value()))
+            .unwrap_or((256, 256));
         let camera = self.camera.get_untracked();
-        let focus_xyz = self.voxel_shape.get_untracked().map(|shape| normalized_focus_xyz(self.focus.get_untracked(), shape));
+        let focus_xyz = self
+            .voxel_shape
+            .get_untracked()
+            .map(|shape| normalized_focus_xyz(self.focus.get_untracked(), shape));
         let origin = self.origin.get_untracked();
         self.browser_busy.set_value(true);
         self.browser_dirty.set_value(false);
         self.update_busy();
         spawn_local(async move {
             let canvas: web_sys::HtmlCanvasElement = canvas.clone();
-            let outcome = self.browser_frame(&origin, &dataset, &canvas, width, height, camera, focus_xyz).await;
+            let outcome = self
+                .browser_frame(&origin, &dataset, &canvas, width, height, camera, focus_xyz)
+                .await;
             self.browser_busy.set_value(false);
             self.update_busy();
             match outcome {
@@ -1052,7 +1500,9 @@ impl Session {
                     // No WebGPU, or a failed pass: say so and go back to server frames rather
                     // than leave the 3D pane empty.
                     web_sys::console::error_1(&JsValue::from_str(&message));
-                    self.notice.set(Some(format!("WebGPU render failed: {message}. Showing server frames.")));
+                    self.notice.set(Some(format!(
+                        "WebGPU render failed: {message}. Showing server frames."
+                    )));
                     self.renderer.set(Renderer::Server);
                     self.request_volume();
                 }
@@ -1076,9 +1526,24 @@ impl Session {
     ) -> Result<String, String> {
         use newvolim_residency::{ChunkCache, ClientResidency, ScenePlan, StepOutcome};
         install_shader()?;
-        let plan: ScenePlan = get_json(&scene_plan_url(origin, dataset, width, height, 0, 0, camera.zoom, Some(camera.orientation), focus_xyz, None)).await?;
+        let plan: ScenePlan = get_json(&scene_plan_url(
+            origin,
+            dataset,
+            width,
+            height,
+            0,
+            0,
+            camera.zoom,
+            Some(camera.orientation),
+            focus_xyz,
+            None,
+        ))
+        .await?;
         let mut ray_words = newvolim_residency::ray_words_for_plan(&plan)?;
-        let cache = self.chunk_cache.get_value().unwrap_or_else(|| ChunkCache::new(CHUNK_CACHE_WORDS));
+        let cache = self
+            .chunk_cache
+            .get_value()
+            .unwrap_or_else(|| ChunkCache::new(CHUNK_CACHE_WORDS));
         self.chunk_cache.set_value(None);
         let mut client = ClientResidency::new(plan, &ray_words, cache)?;
         let (mut passes, mut fetched, mut coarsened) = (0_usize, 0_usize, 0_usize);
@@ -1093,25 +1558,60 @@ impl Session {
             match client.absorb_requests(&requests)? {
                 StepOutcome::Complete => {
                     let pixels = width as usize * height as usize;
-                    let mut rgba: Vec<u8> = output.iter().take(pixels).flat_map(|word| word.to_le_bytes()).collect();
-                    if self.annotation_layers.get_untracked().iter().any(|layer| layer.visible && !layer.annotations.is_empty()) {
-                        let url = annotation_projection_url(origin, dataset, width, height, camera.zoom, camera.orientation, focus_xyz);
+                    let mut rgba: Vec<u8> = output
+                        .iter()
+                        .take(pixels)
+                        .flat_map(|word| word.to_le_bytes())
+                        .collect();
+                    if self
+                        .annotation_layers
+                        .get_untracked()
+                        .iter()
+                        .any(|layer| layer.visible && !layer.annotations.is_empty())
+                    {
+                        let url = annotation_projection_url(
+                            origin,
+                            dataset,
+                            width,
+                            height,
+                            camera.zoom,
+                            camera.orientation,
+                            focus_xyz,
+                        );
                         let words: Vec<u32> = get_json(&url).await?;
                         let primitives = projected_annotations_from_words(&words)?;
                         if !primitives.is_empty() {
-                            let depths = output.get(pixels..pixels*2).ok_or("scene output has no paired depth")?
-                                .iter().map(|bits| f32::from_bits(*bits)).collect();
-                            let frame = palace_core::gpu::PortableFrameAttachments::new(width, height, rgba, depths)
-                                .ok_or("scene colour and depth cannot form annotation attachments")?;
-                            rgba = palace_core::gpu::PortableAnnotationCompositeInput::new(frame, primitives)
-                                .ok_or("annotation projection exceeds compositor capacity")?
-                                .composite_cpu().ok_or("annotation compositor rejected the frame")?.rgba;
+                            let depths = output
+                                .get(pixels..pixels * 2)
+                                .ok_or("scene output has no paired depth")?
+                                .iter()
+                                .map(|bits| f32::from_bits(*bits))
+                                .collect();
+                            let frame = palace_core::gpu::PortableFrameAttachments::new(
+                                width, height, rgba, depths,
+                            )
+                            .ok_or("scene colour and depth cannot form annotation attachments")?;
+                            rgba = palace_core::gpu::PortableAnnotationCompositeInput::new(
+                                frame, primitives,
+                            )
+                            .ok_or("annotation projection exceeds compositor capacity")?
+                            .composite_cpu()
+                            .ok_or("annotation compositor rejected the frame")?
+                            .rgba;
                         }
                     }
-                    scene_webgpu_present(canvas, js_sys::Uint8ClampedArray::from(&rgba[..]), width, height)
-                        .await
-                        .map_err(js_error)?;
-                    let hits = output[pixels..(2 * pixels).min(output.len())].iter().filter(|bits| f32::from_bits(**bits).is_finite()).count();
+                    scene_webgpu_present(
+                        canvas,
+                        js_sys::Uint8ClampedArray::from(&rgba[..]),
+                        width,
+                        height,
+                    )
+                    .await
+                    .map_err(js_error)?;
+                    let hits = output[pixels..(2 * pixels).min(output.len())]
+                        .iter()
+                        .filter(|bits| f32::from_bits(**bits).is_finite())
+                        .count();
                     let cache = client.cache();
                     break format!(
                         "Browser residency: levels {:?}, {passes} passes, {fetched} chunks fetched{}, {hits} of {pixels} pixels hit; cache {} chunks, {} MiB",
@@ -1124,14 +1624,35 @@ impl Session {
                 StepOutcome::Planned => {
                     let missing = client.missing_chunks();
                     fetched += missing.len();
-                    self.status.set(format!("Browser residency: pass {passes}, fetching {} chunks…", missing.len()));
+                    self.status.set(format!(
+                        "Browser residency: pass {passes}, fetching {} chunks…",
+                        missing.len()
+                    ));
                     fetch_chunks(origin, dataset, &mut client, &missing).await?;
                 }
                 StepOutcome::ExceedsPortableBound { required_pages } => {
                     let plan = client.plan();
-                    let coarser = newvolim_residency::coarser_levels(&plan.levels, &plan.level_counts)
-                        .ok_or_else(|| format!("the coarsest levels {:?} still need {required_pages} pages", plan.levels))?;
-                    let plan: ScenePlan = get_json(&scene_plan_url(origin, dataset, width, height, 0, 0, camera.zoom, Some(camera.orientation), focus_xyz, Some(&coarser))).await?;
+                    let coarser =
+                        newvolim_residency::coarser_levels(&plan.levels, &plan.level_counts)
+                            .ok_or_else(|| {
+                                format!(
+                                    "the coarsest levels {:?} still need {required_pages} pages",
+                                    plan.levels
+                                )
+                            })?;
+                    let plan: ScenePlan = get_json(&scene_plan_url(
+                        origin,
+                        dataset,
+                        width,
+                        height,
+                        0,
+                        0,
+                        camera.zoom,
+                        Some(camera.orientation),
+                        focus_xyz,
+                        Some(&coarser),
+                    ))
+                    .await?;
                     ray_words = newvolim_residency::ray_words_for_plan(&plan)?;
                     client = ClientResidency::new(plan, &ray_words, client.into_cache())?;
                     coarsened += 1;
@@ -1144,29 +1665,51 @@ impl Session {
 
     fn handle_reply(self, reply: SocketReply) {
         match reply {
-            SocketReply::Frame { request_id, render_ms, data_base64, .. } => {
+            SocketReply::Frame {
+                request_id,
+                render_ms,
+                data_base64,
+                ..
+            } => {
                 if self.volume_inflight.get_value() == Some(request_id) {
                     self.volume_inflight.set_value(None);
-                    self.volume_png.set(Some(format!("data:image/png;base64,{data_base64}")));
+                    self.volume_png
+                        .set(Some(format!("data:image/png;base64,{data_base64}")));
                     self.error.set(None);
-                    self.status.set(format!("Server volume frame in {render_ms:.0} ms"));
+                    self.status
+                        .set(format!("Server volume frame in {render_ms:.0} ms"));
                     self.update_busy();
                     if self.volume_dirty.get_value() {
                         self.request_volume();
                     }
                 }
             }
-            SocketReply::Orthogonal { request_id, render_ms, xy_base64, xz_base64, yz_base64, voxel_shape_xyz, crosshair_xyz, pyramid_levels, viewport, pyramid_shapes_xyz, .. } => {
+            SocketReply::Orthogonal {
+                request_id,
+                render_ms,
+                xy_base64,
+                xz_base64,
+                yz_base64,
+                voxel_shape_xyz,
+                crosshair_xyz,
+                pyramid_levels,
+                viewport,
+                pyramid_shapes_xyz,
+                ..
+            } => {
                 if self.ortho_inflight.get_value() == Some(request_id) {
                     self.ortho_inflight.set_value(None);
                     let first = self.voxel_shape.get_untracked().is_none();
                     self.voxel_shape.set(Some(voxel_shape_xyz));
                     self.pyramid_shapes_xyz.set(pyramid_shapes_xyz);
-                    let mut capture = self.ortho_request_capture.get_value().unwrap_or(OrthogonalCapture {
-                        focus_xyz: crosshair_xyz.map(|value| value as f64 + 0.5),
-                        zooms: [1.0; 3],
-                        pane_size: [256, 256],
-                    });
+                    let mut capture =
+                        self.ortho_request_capture
+                            .get_value()
+                            .unwrap_or(OrthogonalCapture {
+                                focus_xyz: crosshair_xyz.map(|value| value as f64 + 0.5),
+                                zooms: [1.0; 3],
+                                pane_size: [256, 256],
+                            });
                     if first {
                         self.crosshair.set(crosshair_xyz);
                         self.focus.set(crosshair_xyz.map(|v| v as f64 + 0.5));
@@ -1194,7 +1737,9 @@ impl Session {
                     }));
                     self.error.set(None);
                     self.status.set(match pyramid_levels {
-                        Some([xy, xz, yz]) => format!("Slices XY L{xy}, XZ L{xz}, YZ L{yz} in {render_ms:.0} ms"),
+                        Some([xy, xz, yz]) => {
+                            format!("Slices XY L{xy}, XZ L{xz}, YZ L{yz} in {render_ms:.0} ms")
+                        }
                         None => format!("Slices in {render_ms:.0} ms"),
                     });
                     self.update_busy();
@@ -1204,7 +1749,11 @@ impl Session {
                 }
             }
             SocketReply::Channels { layers, .. } => self.layers.set(layers),
-            SocketReply::Error { request_id, status, message } => {
+            SocketReply::Error {
+                request_id,
+                status,
+                message,
+            } => {
                 if request_id.is_some() && self.volume_inflight.get_value() == request_id {
                     self.volume_inflight.set_value(None);
                 }
@@ -1220,41 +1769,65 @@ impl Session {
     /// Move the crosshair to a voxel (from the sliders or the orientation box): the focus goes
     /// to that voxel's centre.
     pub fn move_crosshair(self, next: [u32; 3]) {
-        let Some(shape) = self.voxel_shape.get_untracked() else { return };
-        let clamped = [next[0].min(shape[0].saturating_sub(1)), next[1].min(shape[1].saturating_sub(1)), next[2].min(shape[2].saturating_sub(1))];
+        let Some(shape) = self.voxel_shape.get_untracked() else {
+            return;
+        };
+        let clamped = [
+            next[0].min(shape[0].saturating_sub(1)),
+            next[1].min(shape[1].saturating_sub(1)),
+            next[2].min(shape[2].saturating_sub(1)),
+        ];
         let next_focus = clamped.map(|v| v as f64 + 0.5);
         let moved = self.focus.get_untracked() != next_focus;
         self.focus.set(next_focus);
         if clamped != self.crosshair.get_untracked() {
             self.crosshair.set(clamped);
-            if !self.uses_xy_tile_cache() { self.request_orthogonal(); }
+            if !self.uses_xy_tile_cache() {
+                self.request_orthogonal();
+            }
         }
-        if moved && !self.uses_xy_tile_cache() { self.request_interactive_volume(); }
+        if moved && !self.uses_xy_tile_cache() {
+            self.request_interactive_volume();
+        }
     }
 
     /// Move the focus continuously (a pan): the crosshair follows as its floor, and the slices
     /// are re-cut only when that integer changes.
     pub fn set_focus(self, next: [f64; 3]) {
-        let Some(shape) = self.voxel_shape.get_untracked() else { return };
-        let clamped: [f64; 3] = std::array::from_fn(|axis| next[axis].clamp(0.0, shape[axis].max(1) as f64));
+        let Some(shape) = self.voxel_shape.get_untracked() else {
+            return;
+        };
+        let clamped: [f64; 3] =
+            std::array::from_fn(|axis| next[axis].clamp(0.0, shape[axis].max(1) as f64));
         let moved = self.focus.get_untracked() != clamped;
         self.focus.set(clamped);
-        let crosshair: [u32; 3] = std::array::from_fn(|axis| (clamped[axis].floor() as u32).min(shape[axis].saturating_sub(1)));
+        let crosshair: [u32; 3] = std::array::from_fn(|axis| {
+            (clamped[axis].floor() as u32).min(shape[axis].saturating_sub(1))
+        });
         if crosshair != self.crosshair.get_untracked() {
             self.crosshair.set(crosshair);
-            if !self.uses_xy_tile_cache() { self.request_orthogonal(); }
+            if !self.uses_xy_tile_cache() {
+                self.request_orthogonal();
+            }
         }
-        if moved && !self.uses_xy_tile_cache() { self.request_interactive_volume(); }
+        if moved && !self.uses_xy_tile_cache() {
+            self.request_interactive_volume();
+        }
     }
 
     pub fn orbit_by(self, dx: i32, dy: i32) {
-        if dx == 0 && dy == 0 { return; }
-        self.camera.update(|camera| camera.orientation = drag_orientation(camera.orientation, dx, dy));
+        if dx == 0 && dy == 0 {
+            return;
+        }
+        self.camera
+            .update(|camera| camera.orientation = drag_orientation(camera.orientation, dx, dy));
         self.request_interactive_volume();
     }
 
     pub fn zoom_by(self, factor: f32) {
-        self.camera.update(|camera| camera.zoom = (camera.zoom * factor).clamp(ZOOM_RANGE.0, ZOOM_RANGE.1));
+        self.camera.update(|camera| {
+            camera.zoom = (camera.zoom * factor).clamp(ZOOM_RANGE.0, ZOOM_RANGE.1)
+        });
         self.request_interactive_volume();
     }
 
@@ -1295,7 +1868,17 @@ impl Session {
     /// One channel edit: shown at once, sent latest-only, then both frames follow.
     pub fn set_channel(self, layer_id: u64, channel: usize, state: ChannelStateInput) {
         self.layers.update(|layers| {
-            if let Some(slot) = layers.iter_mut().find(|layer| layer.layer_id == layer_id).and_then(|layer| layer.channels.get_mut(channel)) {
+            if let Some(slot) = layers
+                .iter_mut()
+                .find(|layer| layer.layer_id == layer_id)
+                .and_then(|layer| layer.channels.get_mut(channel))
+            {
+                if slot.enabled != state.enabled
+                    || slot.color_srgb != state.color_srgb
+                    || slot.opacity != state.opacity
+                {
+                    self.channel_tile_dirty.set_value(true);
+                }
                 slot.enabled = state.enabled;
                 slot.color_srgb = state.color_srgb;
                 slot.window_start = state.window_start;
@@ -1303,7 +1886,11 @@ impl Session {
                 slot.opacity = state.opacity;
             }
         });
-        let edit = ChannelEdit { layer_id, channel, state };
+        let edit = ChannelEdit {
+            layer_id,
+            channel,
+            state,
+        };
         if self.channel_inflight.get_value() {
             self.channel_dirty.set_value(Some(edit));
             return;
@@ -1311,8 +1898,21 @@ impl Session {
         self.post_channel(edit);
     }
 
+    pub fn set_slice_window(self, layer_id: u64, channel: usize, window: [f64; 2]) {
+        if !window.iter().all(|value| value.is_finite()) || window[0] >= window[1] {
+            return;
+        }
+        self.slice_windows.update(|windows| {
+            windows.insert((layer_id, channel), window);
+        });
+        self.tile_generation
+            .update(|generation| *generation = generation.wrapping_add(1));
+    }
+
     fn post_channel(self, edit: ChannelEdit) {
-        let Some(dataset) = self.dataset.get_untracked() else { return };
+        let Some(dataset) = self.dataset.get_untracked() else {
+            return;
+        };
         let url = channels_url(&self.origin.get_untracked(), &dataset);
         self.channel_inflight.set_value(true);
         self.update_busy();
@@ -1333,7 +1933,11 @@ impl Session {
                 self.channel_dirty.set_value(None);
                 self.post_channel(next);
             } else {
-                self.tile_generation.update(|generation| *generation = generation.wrapping_add(1));
+                if self.channel_tile_dirty.get_value() {
+                    self.channel_tile_dirty.set_value(false);
+                    self.tile_generation
+                        .update(|generation| *generation = generation.wrapping_add(1));
+                }
                 self.request_orthogonal();
                 self.request_volume();
             }
@@ -1341,11 +1945,20 @@ impl Session {
     }
 
     pub fn add_layer(self, layer_dataset: String) {
-        let Some(dataset) = self.dataset.get_untracked() else { return };
+        let Some(dataset) = self.dataset.get_untracked() else {
+            return;
+        };
         let url = layers_url(&self.origin.get_untracked(), &dataset);
         self.status.set(format!("Adding layer {layer_dataset}…"));
         spawn_local(async move {
-            match post_json::<Vec<LayerChannelSummary>, _>(&url, &LayerRequest { dataset: layer_dataset }).await {
+            match post_json::<Vec<LayerChannelSummary>, _>(
+                &url,
+                &LayerRequest {
+                    dataset: layer_dataset,
+                },
+            )
+            .await
+            {
                 Ok(layers) => {
                     self.layers.set(layers);
                     self.error.set(None);
@@ -1363,18 +1976,27 @@ impl Session {
 
 /// Hand the desktop's WGSL to the script once; it is the same constant the server dispatches.
 fn install_shader() -> Result<(), String> {
-    let module = js_sys::Reflect::get(&window(), &JsValue::from_str("newvolimSceneWebGpu")).map_err(js_error)?;
+    let module = js_sys::Reflect::get(&window(), &JsValue::from_str("newvolimSceneWebGpu"))
+        .map_err(js_error)?;
     if module.is_undefined() {
         return Err("scene-webgpu.js did not load".into());
     }
-    let installed = js_sys::Reflect::get(&module, &JsValue::from_str("shader")).map_err(js_error)?;
+    let installed =
+        js_sys::Reflect::get(&module, &JsValue::from_str("shader")).map_err(js_error)?;
     if installed.is_null() || installed.is_undefined() {
-        js_sys::Reflect::set(&module, &JsValue::from_str("shader"), &JsValue::from_str(palace_core::gpu::SCENE_DVR_SHADER)).map_err(js_error)?;
+        js_sys::Reflect::set(
+            &module,
+            &JsValue::from_str("shader"),
+            &JsValue::from_str(palace_core::gpu::SCENE_DVR_SHADER),
+        )
+        .map_err(js_error)?;
     }
     Ok(())
 }
 
-async fn dispatch_on_gpu(dispatch: &palace_core::gpu::SceneDvrDispatch) -> Result<(Vec<u32>, Vec<u32>), String> {
+async fn dispatch_on_gpu(
+    dispatch: &palace_core::gpu::SceneDvrDispatch,
+) -> Result<(Vec<u32>, Vec<u32>), String> {
     let pages = js_sys::Array::new();
     for page in &dispatch.pages {
         pages.push(&js_sys::Uint32Array::from(&page[..]));
@@ -1423,7 +2045,12 @@ async fn fetch_chunks(
     let url = scene_chunks_url(origin, dataset);
     for ((layer_id, level, source_index), requests) in groups {
         for batch in requests.chunks(CHUNKS_PER_REQUEST) {
-            let body = SceneChunksRequest { layer_id, level, source_index, chunks: batch.iter().map(|r| r.chunk_xyz).collect() };
+            let body = SceneChunksRequest {
+                layer_id,
+                level,
+                source_index,
+                chunks: batch.iter().map(|r| r.chunk_xyz).collect(),
+            };
             let bytes = post_bytes(&url, &body).await?;
             let chunks = chunks_from_le_bytes(&bytes, batch.len())?;
             for (request, words) in batch.iter().zip(chunks) {
@@ -1437,80 +2064,188 @@ async fn fetch_chunks(
 fn js_error(error: JsValue) -> String {
     error
         .as_string()
-        .or_else(|| js_sys::Reflect::get(&error, &JsValue::from_str("message")).ok().and_then(|m| m.as_string()))
+        .or_else(|| {
+            js_sys::Reflect::get(&error, &JsValue::from_str("message"))
+                .ok()
+                .and_then(|m| m.as_string())
+        })
         .unwrap_or_else(|| format!("{error:?}"))
 }
 
-fn projected_annotations_from_words(words: &[u32]) -> Result<Vec<palace_core::gpu::ProjectedAnnotationPrimitive>, String> {
-    if !words.len().is_multiple_of(13) { return Err("annotation projection has an incomplete record".into()); }
-    words.chunks_exact(13).map(|record| {
-        let color = record[2].to_be_bytes();
-        let color = [color[1], color[2], color[3]];
-        let vertices: [[f32; 3]; 3] = std::array::from_fn(|index| {
-            std::array::from_fn(|axis| f32::from_bits(record[4 + index*3 + axis]))
-        });
-        let id = u64::from(record[1]);
-        let primitive = match record[0] {
-            1 => palace_core::gpu::ProjectedAnnotationPrimitive::point(id, color, f32::from_bits(record[3]), vertices[0]),
-            2 => palace_core::gpu::ProjectedAnnotationPrimitive::segment(id, color, f32::from_bits(record[3]), vertices[0], vertices[1]),
-            3 => palace_core::gpu::ProjectedAnnotationPrimitive::triangle(id, color, vertices),
-            _ => return Err("annotation projection has an unknown primitive kind".into()),
-        };
-        primitive.ok_or_else(|| "annotation projection contains invalid coordinates".into())
-    }).collect()
+fn projected_annotations_from_words(
+    words: &[u32],
+) -> Result<Vec<palace_core::gpu::ProjectedAnnotationPrimitive>, String> {
+    if !words.len().is_multiple_of(13) {
+        return Err("annotation projection has an incomplete record".into());
+    }
+    words
+        .chunks_exact(13)
+        .map(|record| {
+            let color = record[2].to_be_bytes();
+            let color = [color[1], color[2], color[3]];
+            let vertices: [[f32; 3]; 3] = std::array::from_fn(|index| {
+                std::array::from_fn(|axis| f32::from_bits(record[4 + index * 3 + axis]))
+            });
+            let id = u64::from(record[1]);
+            let primitive = match record[0] {
+                1 => palace_core::gpu::ProjectedAnnotationPrimitive::point(
+                    id,
+                    color,
+                    f32::from_bits(record[3]),
+                    vertices[0],
+                ),
+                2 => palace_core::gpu::ProjectedAnnotationPrimitive::segment(
+                    id,
+                    color,
+                    f32::from_bits(record[3]),
+                    vertices[0],
+                    vertices[1],
+                ),
+                3 => palace_core::gpu::ProjectedAnnotationPrimitive::triangle(id, color, vertices),
+                _ => return Err("annotation projection has an unknown primitive kind".into()),
+            };
+            primitive.ok_or_else(|| "annotation projection contains invalid coordinates".into())
+        })
+        .collect()
 }
 
 // ---- HTTP -------------------------------------------------------------------------------
 
 async fn post_bytes<B: serde::Serialize>(url: &str, body: &B) -> Result<Vec<u8>, String> {
-    let request = gloo_net::http::Request::post(url).json(body).map_err(|error| format!("POST {url}: {error}"))?;
-    let response = request.send().await.map_err(|error| format!("POST {url}: {error}"))?;
+    let request = gloo_net::http::Request::post(url)
+        .json(body)
+        .map_err(|error| format!("POST {url}: {error}"))?;
+    let response = request
+        .send()
+        .await
+        .map_err(|error| format!("POST {url}: {error}"))?;
     if !response.ok() {
-        return Err(format!("POST {url}: {} {}", response.status(), response.text().await.unwrap_or_default()));
+        return Err(format!(
+            "POST {url}: {} {}",
+            response.status(),
+            response.text().await.unwrap_or_default()
+        ));
     }
-    response.binary().await.map_err(|error| format!("POST {url}: {error}"))
+    response
+        .binary()
+        .await
+        .map_err(|error| format!("POST {url}: {error}"))
 }
 
 async fn get_json<T: serde::de::DeserializeOwned>(url: &str) -> Result<T, String> {
-    let response = gloo_net::http::Request::get(url).send().await.map_err(|error| format!("GET {url}: {error}"))?;
+    let response = gloo_net::http::Request::get(url)
+        .send()
+        .await
+        .map_err(|error| format!("GET {url}: {error}"))?;
     if !response.ok() {
-        return Err(format!("GET {url}: {} {}", response.status(), response.text().await.unwrap_or_default()));
+        return Err(format!(
+            "GET {url}: {} {}",
+            response.status(),
+            response.text().await.unwrap_or_default()
+        ));
     }
-    response.json::<T>().await.map_err(|error| format!("GET {url}: {error}"))
+    response
+        .json::<T>()
+        .await
+        .map_err(|error| format!("GET {url}: {error}"))
 }
 
-async fn post_json<T: serde::de::DeserializeOwned, B: serde::Serialize>(url: &str, body: &B) -> Result<T, String> {
-    let request = gloo_net::http::Request::post(url).json(body).map_err(|error| format!("POST {url}: {error}"))?;
-    let response = request.send().await.map_err(|error| format!("POST {url}: {error}"))?;
+async fn post_json<T: serde::de::DeserializeOwned, B: serde::Serialize>(
+    url: &str,
+    body: &B,
+) -> Result<T, String> {
+    let request = gloo_net::http::Request::post(url)
+        .json(body)
+        .map_err(|error| format!("POST {url}: {error}"))?;
+    let response = request
+        .send()
+        .await
+        .map_err(|error| format!("POST {url}: {error}"))?;
     if !response.ok() {
-        return Err(format!("POST {url}: {} {}", response.status(), response.text().await.unwrap_or_default()));
+        return Err(format!(
+            "POST {url}: {} {}",
+            response.status(),
+            response.text().await.unwrap_or_default()
+        ));
     }
-    response.json::<T>().await.map_err(|error| format!("POST {url}: {error}"))
+    response
+        .json::<T>()
+        .await
+        .map_err(|error| format!("POST {url}: {error}"))
 }
 
-async fn put_json<T: serde::de::DeserializeOwned, B: serde::Serialize>(url: &str, body: &B) -> Result<T, String> {
-    let request = gloo_net::http::Request::put(url).json(body).map_err(|error| format!("PUT {url}: {error}"))?;
-    let response = request.send().await.map_err(|error| format!("PUT {url}: {error}"))?;
-    if !response.ok() { return Err(format!("PUT {url}: {} {}", response.status(), response.text().await.unwrap_or_default())); }
-    response.json::<T>().await.map_err(|error| format!("PUT {url}: {error}"))
+async fn put_json<T: serde::de::DeserializeOwned, B: serde::Serialize>(
+    url: &str,
+    body: &B,
+) -> Result<T, String> {
+    let request = gloo_net::http::Request::put(url)
+        .json(body)
+        .map_err(|error| format!("PUT {url}: {error}"))?;
+    let response = request
+        .send()
+        .await
+        .map_err(|error| format!("PUT {url}: {error}"))?;
+    if !response.ok() {
+        return Err(format!(
+            "PUT {url}: {} {}",
+            response.status(),
+            response.text().await.unwrap_or_default()
+        ));
+    }
+    response
+        .json::<T>()
+        .await
+        .map_err(|error| format!("PUT {url}: {error}"))
 }
 
 async fn put_geojson(url: &str, text: String) -> Result<AnnotationLayer, String> {
-    let response = gloo_net::http::Request::put(url).header("Content-Type", "application/geo+json").body(text)
-        .map_err(|error| format!("PUT {url}: {error}"))?.send().await.map_err(|error| format!("PUT {url}: {error}"))?;
-    if !response.ok() { return Err(format!("PUT {url}: {} {}", response.status(), response.text().await.unwrap_or_default())); }
-    response.json::<AnnotationLayer>().await.map_err(|error| format!("PUT {url}: {error}"))
+    let response = gloo_net::http::Request::put(url)
+        .header("Content-Type", "application/geo+json")
+        .body(text)
+        .map_err(|error| format!("PUT {url}: {error}"))?
+        .send()
+        .await
+        .map_err(|error| format!("PUT {url}: {error}"))?;
+    if !response.ok() {
+        return Err(format!(
+            "PUT {url}: {} {}",
+            response.status(),
+            response.text().await.unwrap_or_default()
+        ));
+    }
+    response
+        .json::<AnnotationLayer>()
+        .await
+        .map_err(|error| format!("PUT {url}: {error}"))
 }
 
 async fn delete_request(url: &str) -> Result<(), String> {
-    let response = gloo_net::http::Request::delete(url).send().await.map_err(|error| format!("DELETE {url}: {error}"))?;
-    if !response.ok() { return Err(format!("DELETE {url}: {} {}", response.status(), response.text().await.unwrap_or_default())); }
+    let response = gloo_net::http::Request::delete(url)
+        .send()
+        .await
+        .map_err(|error| format!("DELETE {url}: {error}"))?;
+    if !response.ok() {
+        return Err(format!(
+            "DELETE {url}: {} {}",
+            response.status(),
+            response.text().await.unwrap_or_default()
+        ));
+    }
     Ok(())
 }
 
 async fn post_empty(url: &str) -> Result<(), String> {
-    let response = gloo_net::http::Request::post(url).send().await.map_err(|error| format!("POST {url}: {error}"))?;
-    if !response.ok() { return Err(format!("POST {url}: {} {}", response.status(), response.text().await.unwrap_or_default())); }
+    let response = gloo_net::http::Request::post(url)
+        .send()
+        .await
+        .map_err(|error| format!("POST {url}: {error}"))?;
+    if !response.ok() {
+        return Err(format!(
+            "POST {url}: {} {}",
+            response.status(),
+            response.text().await.unwrap_or_default()
+        ));
+    }
     Ok(())
 }
 
@@ -1532,9 +2267,12 @@ fn physical_size(element: &web_sys::Element) -> (u32, u32) {
 }
 
 fn preview_size(size: (u32, u32), preview: bool) -> (u32, u32) {
-    if preview { (size.0.div_ceil(2), size.1.div_ceil(2)) } else { size }
+    if preview {
+        (size.0.div_ceil(2), size.1.div_ceil(2))
+    } else {
+        size
+    }
 }
-
 
 // ---- components ---------------------------------------------------------------------------
 
@@ -1551,21 +2289,42 @@ pub fn App() -> impl IntoView {
         }
     });
     window_event_listener(leptos::ev::keydown, move |ev| {
-        let tag = ev.target().and_then(|target| target.dyn_into::<web_sys::Element>().ok())
-            .map(|element| element.tag_name()).unwrap_or_default();
-        if matches!(tag.as_str(), "INPUT" | "TEXTAREA" | "SELECT") { return; }
+        let tag = ev
+            .target()
+            .and_then(|target| target.dyn_into::<web_sys::Element>().ok())
+            .map(|element| element.tag_name())
+            .unwrap_or_default();
+        if matches!(tag.as_str(), "INPUT" | "TEXTAREA" | "SELECT") {
+            return;
+        }
         if (ev.ctrl_key() || ev.meta_key()) && ev.key().eq_ignore_ascii_case("z") {
-            ev.prevent_default(); session.undo_annotations();
+            ev.prevent_default();
+            session.undo_annotations();
         } else if ev.key() == "Escape" {
-            session.annotation_draft.set(Vec::new()); session.annotation_tool.set(AnnotationTool::Pan);
-        } else if ev.key() == "Enter" && matches!(session.annotation_tool.get_untracked(), AnnotationTool::Polygon | AnnotationTool::Polyline) {
+            session.annotation_draft.set(Vec::new());
+            session.annotation_tool.set(AnnotationTool::Pan);
+        } else if ev.key() == "Enter"
+            && matches!(
+                session.annotation_tool.get_untracked(),
+                AnnotationTool::Polygon | AnnotationTool::Polyline
+            )
+        {
             session.finish_annotation_draft();
-        } else if ev.key() == "Delete" && session.annotation_tool.get_untracked() == AnnotationTool::Select {
-            if let Some(id) = session.selected_annotation.get_untracked() { session.delete_annotation(id); }
+        } else if ev.key() == "Delete"
+            && session.annotation_tool.get_untracked() == AnnotationTool::Select
+        {
+            if let Some(id) = session.selected_annotation.get_untracked() {
+                session.delete_annotation(id);
+            }
         }
     });
     window_event_listener(leptos::ev::beforeunload, move |ev| {
-        if session.annotation_layers.get_untracked().iter().any(|layer| layer.dirty) {
+        if session
+            .annotation_layers
+            .get_untracked()
+            .iter()
+            .any(|layer| layer.dirty)
+        {
             ev.prevent_default();
             ev.set_return_value("Unsaved annotations");
         }
@@ -1573,7 +2332,7 @@ pub fn App() -> impl IntoView {
     view! {
         <div class="workspace">
             <nav class="workspace-tabs">
-                <span class="brand">"newvolim"</span>
+                <span class="brand" title="Rusty OmeZarr Tiles">"ROZT"</span>
                 <Show when=move || session.dataset.get().is_some()>
                     <span class="tab">
                         {move || session.dataset.get().unwrap_or_default()}
@@ -1616,8 +2375,8 @@ fn FrontPage() -> impl IntoView {
     view! {
         <div class="front-page">
             <div class="front-browser">
-                <h1>"newvolim"</h1>
-                <div class="subtitle">"Volume images from OME-Zarr, rendered on the server or in this browser."</div>
+                <h1>"ROZT"</h1>
+                <div class="subtitle">"Rusty OmeZarr Tiles — volume images rendered on the server or in this browser."</div>
                 <div class="browser-list">
                     {move || {
                         let datasets = session.datasets.get();
@@ -1696,16 +2455,19 @@ fn ViewerShell() -> impl IntoView {
                             <button class="tool-button" title="Reset the camera" on:click=move |_| { session.camera.set(Camera::default()); session.request_volume(); }>"Reset view"</button>
                         </div>
                     </Show>
-                    <div class="tool-group annotation-tools" title="Draw annotations in the XY slice">
+                    <div class="tool-group annotation-tools" title="Annotation and measurement tools for the XY slice">
                         {[
                             AnnotationTool::Pan, AnnotationTool::Select, AnnotationTool::Point,
                             AnnotationTool::Rectangle, AnnotationTool::Ellipse, AnnotationTool::Polygon,
                             AnnotationTool::FreehandRegion, AnnotationTool::Polyline, AnnotationTool::FreehandLine,
+                            AnnotationTool::Profile,
                         ].into_iter().map(|tool| view! {
-                            <button class="tool-button" class:active=move || session.annotation_tool.get() == tool
-                                on:click=move |_| { session.annotation_tool.set(tool); session.annotation_draft.set(Vec::new()); }>{tool.label()}</button>
+                            <button class="tool-button" title=tool.label() aria-label=tool.label()
+                                class:active=move || session.annotation_tool.get() == tool
+                                on:click=move |_| { session.annotation_tool.set(tool); session.annotation_draft.set(Vec::new()); }>{annotation_tool_icon(tool)}</button>
                         }).collect_view()}
-                        <button class="tool-button" on:click=move |_| session.undo_annotations()>"Undo"</button>
+                        <button class="tool-button" title="Undo the last annotation edit" aria-label="Undo"
+                            on:click=move |_| session.undo_annotations()>"↶"</button>
                     </div>
                 </div>
                 <OrthoPane plane=Plane::Xy/>
@@ -1714,6 +2476,7 @@ fn ViewerShell() -> impl IntoView {
                 <VolumePane/>
             </div>
             <AxisSliders/>
+            <LineProfilePanel/>
             <div class="status-bar">
                 <span class:busy=move || session.busy.get()>{move || if session.busy.get() { "●" } else { "○" }}</span>
                 <span>{move || session.status.get()}</span>
@@ -1738,6 +2501,142 @@ fn ViewerShell() -> impl IntoView {
     }
 }
 
+fn profile_polyline(
+    samples: &[ProfileSample],
+    values: &[f32],
+    width: f32,
+    height: f32,
+    pad: f32,
+    y_min: f32,
+    y_max: f32,
+) -> String {
+    let x_max = samples
+        .last()
+        .map(|sample| sample.distance.max(1.0))
+        .unwrap_or(1.0);
+    samples
+        .iter()
+        .zip(values)
+        .filter(|(_, value)| value.is_finite())
+        .map(|(sample, value)| {
+            let x = pad + sample.distance / x_max * (width - 2.0 * pad);
+            let y = height - pad - (*value - y_min) / (y_max - y_min) * (height - 2.0 * pad);
+            format!("{x:.2},{y:.2}")
+        })
+        .collect::<Vec<_>>()
+    .join(" ")
+}
+
+fn profile_length_label(response: &LineProfileResponse) -> String {
+    let pixels = format!("{:.1} px", response.pixel_length);
+    let Some(length) = response.physical_length else {
+        return pixels;
+    };
+    let unit = match response.physical_unit.as_deref().unwrap_or("") {
+        "micrometer" | "micrometre" | "um" | "µm" => "µm",
+        other => other,
+    };
+    if unit.is_empty() {
+        pixels
+    } else {
+        format!("{pixels} · {length:.2} {unit}")
+    }
+}
+
+#[component]
+fn LineProfilePanel() -> impl IntoView {
+    let session = expect_context::<Session>();
+    view! {
+        <Show when=move || session.line_profile.get().is_some()>
+            {move || {
+                let Some(profile) = session.line_profile.get() else {
+                    return view! { <span></span> }.into_any();
+                };
+                let channel_views = session.layers.get().first().map(|layer| layer.channels.clone())
+                    .unwrap_or_default();
+                let legend = channel_views.iter().filter(|channel| channel.enabled).map(|channel| {
+                    let color = color_hex(channel.color_srgb);
+                    let name = channel.label.clone().filter(|label| !label.trim().is_empty())
+                        .unwrap_or_else(|| format!("Channel {}", channel.source_index + 1));
+                    view! {
+                        <span class="profile-channel">
+                            <span class="profile-swatch" style:background=color></span>
+                            {name}
+                        </span>
+                    }
+                }).collect_view();
+                let body = if profile.loading {
+                    view! { <div class="profile-empty">"Sampling…"</div> }.into_any()
+                } else if let Some(error) = profile.error {
+                    view! { <div class="profile-error">{error}</div> }.into_any()
+                } else if let Some(response) = profile.response {
+                    let mut y_min = f32::INFINITY;
+                    let mut y_max = f32::NEG_INFINITY;
+                    for channel in &response.channels {
+                        for value in &channel.values {
+                            if value.is_finite() {
+                                y_min = y_min.min(*value);
+                                y_max = y_max.max(*value);
+                            }
+                        }
+                    }
+                    if !y_min.is_finite() || !y_max.is_finite() {
+                        view! { <div class="profile-empty">"No finite values on this line."</div> }.into_any()
+                    } else {
+                        if (y_max - y_min).abs() < f32::EPSILON {
+                            y_max = y_min + 1.0;
+                        }
+                        let width = 640.0_f32;
+                        let height = 140.0_f32;
+                        let pad = 10.0_f32;
+                        let length_label = profile_length_label(&response);
+                        let lines = response.channels.iter().filter_map(|channel| {
+                            let view = channel_views.iter().find(|view| view.source_index == channel.index)?;
+                            let points = profile_polyline(
+                                &response.samples, &channel.values, width, height, pad, y_min, y_max,
+                            );
+                            (!points.is_empty()).then(|| view! {
+                                <polyline class="profile-line" points=points stroke=color_hex(view.color_srgb)/>
+                            })
+                        }).collect_view();
+                        view! {
+                            <div class="profile-plot">
+                                <svg viewBox=format!("0 0 {width} {height}") preserveAspectRatio="none">
+                                    <line class="profile-axis" x1=pad y1=height-pad x2=width-pad y2=height-pad/>
+                                    <line class="profile-axis" x1=pad y1=pad x2=pad y2=height-pad/>
+                                    {lines}
+                                </svg>
+                                <div class="profile-range">
+                                    <span>{format!("{y_min:.3}")}</span>
+                                    <span>{format!("{length_label} · level {}", response.level)}</span>
+                                    <span>{format!("{y_max:.3}")}</span>
+                                </div>
+                            </div>
+                        }.into_any()
+                    }
+                } else {
+                    view! { <div class="profile-empty">"Draw a line in XY."</div> }.into_any()
+                };
+                view! {
+                    <section class="profile-panel">
+                        <header class="profile-header">
+                            <div>
+                                <h3>"Line profile"</h3>
+                                <div class="profile-channels">{legend}</div>
+                            </div>
+                            <button title="Close profile" on:click=move |_| {
+                                session.line_profile.set(None);
+                                session.annotation_draft.set(Vec::new());
+                            }>"×"</button>
+                        </header>
+                        {body}
+                    </section>
+                }.into_any()
+            }}
+        </Show>
+    }
+}
+
 /// One slice pane as a 2-D camera: the slice image is placed so the session's focus sits at
 /// the pane's centre at the pane's zoom; drag pans (moving the focus, hence the other panes'
 /// cuts), wheel zooms about the cursor. The crosshair is implicit — the centre — and not drawn.
@@ -1746,36 +2645,52 @@ fn annotation_geometry(tool: AnnotationTool, points: &[[f64; 2]]) -> Option<(Geo
     let last = *points.last()?;
     match tool {
         AnnotationTool::Point => Some((Geometry::Point(first), false)),
-        AnnotationTool::Rectangle => Some((Geometry::rect(first[0], first[1], last[0], last[1]), false)),
+        AnnotationTool::Rectangle => {
+            Some((Geometry::rect(first[0], first[1], last[0], last[1]), false))
+        }
         AnnotationTool::Ellipse => {
             let (cx, cy) = ((first[0] + last[0]) * 0.5, (first[1] + last[1]) * 0.5);
-            let (rx, ry) = ((first[0] - last[0]).abs() * 0.5, (first[1] - last[1]).abs() * 0.5);
-            if rx < 0.01 || ry < 0.01 { return None; }
-            let mut ring = (0..48).map(|step| {
-                let a = std::f64::consts::TAU * step as f64 / 48.0;
-                [cx + rx * a.cos(), cy + ry * a.sin()]
-            }).collect::<Vec<_>>();
+            let (rx, ry) = (
+                (first[0] - last[0]).abs() * 0.5,
+                (first[1] - last[1]).abs() * 0.5,
+            );
+            if rx < 0.01 || ry < 0.01 {
+                return None;
+            }
+            let mut ring = (0..48)
+                .map(|step| {
+                    let a = std::f64::consts::TAU * step as f64 / 48.0;
+                    [cx + rx * a.cos(), cy + ry * a.sin()]
+                })
+                .collect::<Vec<_>>();
             ring.push(ring[0]);
             Some((Geometry::Polygon(vec![ring]), true))
         }
         AnnotationTool::Polygon | AnnotationTool::FreehandRegion => {
             let mut ring = simplify_annotation_points(points);
-            if ring.len() < 3 { return None; }
-            if ring.first() != ring.last() { ring.push(ring[0]); }
+            if ring.len() < 3 {
+                return None;
+            }
+            if ring.first() != ring.last() {
+                ring.push(ring[0]);
+            }
             Some((Geometry::Polygon(vec![ring]), false))
         }
         AnnotationTool::Polyline | AnnotationTool::FreehandLine => {
             let path = simplify_annotation_points(points);
             (path.len() >= 2).then_some((Geometry::LineString(path), false))
         }
-        AnnotationTool::Pan | AnnotationTool::Select => None,
+        AnnotationTool::Pan | AnnotationTool::Select | AnnotationTool::Profile => None,
     }
 }
 
 fn simplify_annotation_points(points: &[[f64; 2]]) -> Vec<[f64; 2]> {
     let mut out = Vec::new();
     for point in points {
-        if out.last().is_none_or(|last: &[f64; 2]| (point[0] - last[0]).hypot(point[1] - last[1]) >= 0.5) {
+        if out
+            .last()
+            .is_none_or(|last: &[f64; 2]| (point[0] - last[0]).hypot(point[1] - last[1]) >= 0.5)
+        {
             out.push(*point);
         }
     }
@@ -1786,11 +2701,22 @@ fn annotation_svg_path(geometry: &Geometry, point_radius: f64) -> String {
     let mut result = String::new();
     for point in geometry.markers() {
         let (x, y, r) = (point[0], point[1], point_radius);
-        result.push_str(&format!("M {} {} a {r} {r} 0 1 0 {} 0 a {r} {r} 0 1 0 {} 0 ", x-r, y, 2.0*r, -2.0*r));
+        result.push_str(&format!(
+            "M {} {} a {r} {r} 0 1 0 {} 0 a {r} {r} 0 1 0 {} 0 ",
+            x - r,
+            y,
+            2.0 * r,
+            -2.0 * r
+        ));
     }
     for path in geometry.outlines() {
         for (index, point) in path.iter().enumerate() {
-            result.push_str(&format!("{} {} {} ", if index == 0 { "M" } else { "L" }, point[0], point[1]));
+            result.push_str(&format!(
+                "{} {} {} ",
+                if index == 0 { "M" } else { "L" },
+                point[0],
+                point[1]
+            ));
         }
     }
     result
@@ -1800,45 +2726,79 @@ fn annotation_z_fade(item: &Annotation, z: i32, slab: f64) -> f64 {
     let end = item.plane.z as i64 + item.z_extent as i64;
     let distance = if (z as i64) < item.plane.z as i64 {
         item.plane.z as i64 - z as i64
-    } else if z as i64 > end { z as i64 - end } else { 0 };
-    if slab > 0.0 { (1.0 - distance as f64 / slab).clamp(0.0, 1.0) } else { 1.0 }
+    } else if z as i64 > end {
+        z as i64 - end
+    } else {
+        0
+    };
+    if slab > 0.0 {
+        (1.0 - distance as f64 / slab).clamp(0.0, 1.0)
+    } else {
+        1.0
+    }
 }
 
 #[derive(Clone)]
-enum AnnotationHandle { Body, Vertex(usize, usize), Corner([f64; 2]) }
+enum AnnotationHandle {
+    Body,
+    Vertex(usize, usize),
+    Corner([f64; 2]),
+}
 
 #[derive(Clone)]
-struct AnnotationDrag { original: Annotation, start: [f64; 2], handle: AnnotationHandle }
+struct AnnotationDrag {
+    original: Annotation,
+    start: [f64; 2],
+    handle: AnnotationHandle,
+}
 
 fn selected_handle(annotation: &Annotation, at: [f64; 2], pad: f64) -> AnnotationHandle {
     if annotation.is_ellipse || is_rectangle_annotation(annotation) {
         if let Some([x0, y0, x1, y1]) = annotation.bounds() {
-            for (corner, opposite) in [([x0,y0],[x1,y1]), ([x1,y0],[x0,y1]), ([x1,y1],[x0,y0]), ([x0,y1],[x1,y0])] {
-                if (corner[0]-at[0]).hypot(corner[1]-at[1]) <= pad { return AnnotationHandle::Corner(opposite); }
+            for (corner, opposite) in [
+                ([x0, y0], [x1, y1]),
+                ([x1, y0], [x0, y1]),
+                ([x1, y1], [x0, y0]),
+                ([x0, y1], [x1, y0]),
+            ] {
+                if (corner[0] - at[0]).hypot(corner[1] - at[1]) <= pad {
+                    return AnnotationHandle::Corner(opposite);
+                }
             }
         }
     } else {
         for (path_index, path) in annotation.geometry.outlines().iter().enumerate() {
             for (vertex_index, point) in path.iter().enumerate() {
-                if (point[0]-at[0]).hypot(point[1]-at[1]) <= pad { return AnnotationHandle::Vertex(path_index, vertex_index); }
+                if (point[0] - at[0]).hypot(point[1] - at[1]) <= pad {
+                    return AnnotationHandle::Vertex(path_index, vertex_index);
+                }
             }
         }
     }
     AnnotationHandle::Body
 }
 
-fn closest_annotation_edge(annotation: &Annotation, at: [f64; 2], pad: f64) -> Option<(usize, usize)> {
+fn closest_annotation_edge(
+    annotation: &Annotation,
+    at: [f64; 2],
+    pad: f64,
+) -> Option<(usize, usize)> {
     let mut closest = None;
     let mut best = pad * pad;
     for (path_index, path) in annotation.geometry.outlines().iter().enumerate() {
         for (edge_index, pair) in path.windows(2).enumerate() {
             let (a, b) = (pair[0], pair[1]);
-            let (dx, dy) = (b[0]-a[0], b[1]-a[1]);
-            let length = dx*dx + dy*dy;
-            if length <= 0.0 { continue; }
-            let t = (((at[0]-a[0])*dx + (at[1]-a[1])*dy)/length).clamp(0.0, 1.0);
-            let distance = (at[0]-a[0]-t*dx).powi(2) + (at[1]-a[1]-t*dy).powi(2);
-            if distance < best { best = distance; closest = Some((path_index, edge_index)); }
+            let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
+            let length = dx * dx + dy * dy;
+            if length <= 0.0 {
+                continue;
+            }
+            let t = (((at[0] - a[0]) * dx + (at[1] - a[1]) * dy) / length).clamp(0.0, 1.0);
+            let distance = (at[0] - a[0] - t * dx).powi(2) + (at[1] - a[1] - t * dy).powi(2);
+            if distance < best {
+                best = distance;
+                closest = Some((path_index, edge_index));
+            }
         }
     }
     closest
@@ -1848,7 +2808,11 @@ fn is_rectangle_annotation(annotation: &Annotation) -> bool {
     match &annotation.geometry {
         Geometry::Polygon(rings) if rings.len() == 1 && rings[0].len() == 5 => {
             let p = &rings[0];
-            p[0] == p[4] && p[0][1] == p[1][1] && p[1][0] == p[2][0] && p[2][1] == p[3][1] && p[3][0] == p[0][0]
+            p[0] == p[4]
+                && p[0][1] == p[1][1]
+                && p[1][0] == p[2][0]
+                && p[2][1] == p[3][1]
+                && p[3][0] == p[0][0]
         }
         _ => false,
     }
@@ -1860,11 +2824,22 @@ fn move_annotation_drag(drag: &AnnotationDrag, at: [f64; 2]) -> Annotation {
     let dy = at[1] - drag.start[1];
     match drag.handle {
         AnnotationHandle::Body => next.geometry.translate(dx, dy),
-        AnnotationHandle::Vertex(path, vertex) => { next.geometry.move_vertex(path, vertex, dx, dy); }
+        AnnotationHandle::Vertex(path, vertex) => {
+            next.geometry.move_vertex(path, vertex, dx, dy);
+        }
         AnnotationHandle::Corner(opposite) => {
-            let sx = if (drag.start[0]-opposite[0]).abs() > 1e-6 { (at[0]-opposite[0])/(drag.start[0]-opposite[0]) } else { 1.0 };
-            let sy = if (drag.start[1]-opposite[1]).abs() > 1e-6 { (at[1]-opposite[1])/(drag.start[1]-opposite[1]) } else { 1.0 };
-            next.geometry.scale_about(opposite[0], opposite[1], sx.max(0.01), sy.max(0.01));
+            let sx = if (drag.start[0] - opposite[0]).abs() > 1e-6 {
+                (at[0] - opposite[0]) / (drag.start[0] - opposite[0])
+            } else {
+                1.0
+            };
+            let sy = if (drag.start[1] - opposite[1]).abs() > 1e-6 {
+                (at[1] - opposite[1]) / (drag.start[1] - opposite[1])
+            } else {
+                1.0
+            };
+            next.geometry
+                .scale_about(opposite[0], opposite[1], sx.max(0.01), sy.max(0.01));
         }
     }
     next
@@ -1922,7 +2897,9 @@ fn OrthoPane(plane: Plane) -> impl IntoView {
         let old_fit = (capture.pane_size[0] as f64 / shape[h_axis].max(1) as f64)
             .min(capture.pane_size[1] as f64 / shape[v_axis].max(1) as f64);
         let old_scale = old_fit * capture.zooms[pane_index];
-        if !old_scale.is_finite() || old_scale <= 0.0 { return None; }
+        if !old_scale.is_finite() || old_scale <= 0.0 {
+            return None;
+        }
         let current_scale = fit * session.zoom_2d.get()[pane_index];
         let current_focus = session.focus.get();
         let world_width = capture.pane_size[0] as f64 / old_scale;
@@ -1930,25 +2907,33 @@ fn OrthoPane(plane: Plane) -> impl IntoView {
         let drawn_width = world_width * current_scale;
         let drawn_height = world_height * current_scale;
         Some((
-            width * 0.5 + (capture.focus_xyz[h_axis] - current_focus[h_axis]) * current_scale - drawn_width * 0.5,
-            height * 0.5 + (capture.focus_xyz[v_axis] - current_focus[v_axis]) * current_scale - drawn_height * 0.5,
+            width * 0.5 + (capture.focus_xyz[h_axis] - current_focus[h_axis]) * current_scale
+                - drawn_width * 0.5,
+            height * 0.5 + (capture.focus_xyz[v_axis] - current_focus[v_axis]) * current_scale
+                - drawn_height * 0.5,
             drawn_width,
             drawn_height,
         ))
     };
-    let visible_tiles = move || -> Vec<SliceTilePlacement> {
-        if plane != Plane::Xy { return Vec::new(); }
-        let Some(shape0) = session.voxel_shape.get() else { return Vec::new() };
-        if shape0[2] != 1 { return Vec::new(); }
+    let visible_tiles = move || -> Option<SliceTileSet> {
+        if plane != Plane::Xy {
+            return None;
+        }
+        let shape0 = session.voxel_shape.get()?;
+        if shape0[2] != 1 {
+            return None;
+        }
         let levels = session.pyramid_shapes_xyz.get();
-        if levels.is_empty() { return Vec::new(); }
-        let Some(dataset) = session.dataset.get() else { return Vec::new() };
-        let Some(pane) = node_ref.get() else { return Vec::new() };
+        if levels.is_empty() {
+            return None;
+        }
+        let dataset = session.dataset.get()?;
+        let pane = node_ref.get()?;
         let [physical_width, physical_height] = {
             let (width, height) = physical_size(&pane);
             [width, height]
         };
-        let Some((width, height, fit)) = geometry() else { return Vec::new() };
+        let (width, height, fit) = geometry()?;
         let zoom = session.zoom_2d.get()[pane_index];
         let level = xy_tile_level(shape0, &levels, [physical_width, physical_height], zoom);
         let level_shape = levels[level];
@@ -1961,7 +2946,7 @@ fn OrthoPane(plane: Plane) -> impl IntoView {
             (focus[1] + height * 0.5 / scale).min(shape0[1] as f64),
         ];
         if world_bounds[2] <= world_bounds[0] || world_bounds[3] <= world_bounds[1] {
-            return Vec::new();
+            return None;
         }
         const TILE: u32 = 512;
         let source_bounds = [
@@ -1971,9 +2956,28 @@ fn OrthoPane(plane: Plane) -> impl IntoView {
             (world_bounds[3] * level_shape[1] as f64 / shape0[1] as f64).ceil() as u32,
         ];
         let tile_min = [source_bounds[0] / TILE, source_bounds[1] / TILE];
-        let tile_max = [source_bounds[2].saturating_sub(1) / TILE, source_bounds[3].saturating_sub(1) / TILE];
+        let tile_max = [
+            source_bounds[2].saturating_sub(1) / TILE,
+            source_bounds[3].saturating_sub(1) / TILE,
+        ];
         let origin = session.origin.get();
         let generation = session.tile_generation.get();
+        let layers = session.layers.get();
+        let base = layers.first()?;
+        let slice_windows = session.slice_windows.get();
+        let windows = base
+            .channels
+            .iter()
+            .map(|channel| {
+                (
+                    channel.source_index,
+                    slice_windows
+                        .get(&(base.layer_id, channel.source_index))
+                        .copied()
+                        .unwrap_or([channel.window_start, channel.window_end]),
+                )
+            })
+            .collect::<Vec<_>>();
         let mut tiles = Vec::new();
         for tile_y in tile_min[1]..=tile_max[1] {
             for tile_x in tile_min[0]..=tile_max[0] {
@@ -1982,7 +2986,15 @@ fn OrthoPane(plane: Plane) -> impl IntoView {
                 let source_width = TILE.min(level_shape[0].saturating_sub(source_x));
                 let source_height = TILE.min(level_shape[1].saturating_sub(source_y));
                 tiles.push(SliceTilePlacement {
-                    src: xy_tile_url(&origin, &dataset, level as u32, tile_x, tile_y, generation),
+                    src: xy_tile_url(
+                        &origin,
+                        &dataset,
+                        level as u32,
+                        tile_x,
+                        tile_y,
+                        generation,
+                        &windows,
+                    ),
                     source_x,
                     source_y,
                     source_width,
@@ -1990,24 +3002,24 @@ fn OrthoPane(plane: Plane) -> impl IntoView {
                 });
             }
         }
-        tiles
+        Some(SliceTileSet { level, tiles })
     };
     // Tile images keep source-level coordinates. One reactive parent transform moves them during
     // pan/zoom, so keyed tile nodes survive while their URL is valid. At a pyramid transition the
     // level in the URL changes and <For> removes the old bitmap instead of stretching it into the
     // new tile's position while the replacement image decodes.
-    let tile_layer_transform = move || -> String {
-        let Some(shape0) = session.voxel_shape.get() else { return String::new() };
-        let levels = session.pyramid_shapes_xyz.get();
-        let Some(pane) = node_ref.get() else { return String::new() };
-        let physical_size = {
-            let (width, height) = physical_size(&pane);
-            [width, height]
+    let tile_layer_transform = move |level: usize| -> String {
+        let Some(shape0) = session.voxel_shape.get() else {
+            return String::new();
         };
-        let Some((width, height, fit)) = geometry() else { return String::new() };
+        let levels = session.pyramid_shapes_xyz.get();
+        let Some((width, height, fit)) = geometry() else {
+            return String::new();
+        };
         let zoom = session.zoom_2d.get()[pane_index];
-        let level = xy_tile_level(shape0, &levels, physical_size, zoom);
-        let Some(level_shape) = levels.get(level).copied() else { return String::new() };
+        let Some(level_shape) = levels.get(level).copied() else {
+            return String::new();
+        };
         let focus = session.focus.get();
         let scale = fit * zoom;
         let scale_x = scale * shape0[0] as f64 / level_shape[0].max(1) as f64;
@@ -2016,19 +3028,48 @@ fn OrthoPane(plane: Plane) -> impl IntoView {
         let translate_y = height * 0.5 - focus[1] * scale;
         format!("matrix({scale_x},0,0,{scale_y},{translate_x},{translate_y})")
     };
+    let active_tiles = RwSignal::new(None::<SliceTileSet>);
+    let previous_tiles = RwSignal::new(None::<SliceTileSet>);
+    let last_complete_tiles = StoredValue::new(None::<SliceTileSet>);
+    let pending_tiles = StoredValue::new(HashSet::<String>::new());
+    let tile_transition = RwSignal::new(0_u64);
+    Effect::new(move |_| {
+        let desired = visible_tiles();
+        if active_tiles.get_untracked() == desired {
+            return;
+        }
+        previous_tiles.set(last_complete_tiles.get_value());
+        pending_tiles.set_value(
+            desired
+                .as_ref()
+                .map(|set| set.tiles.iter().map(|tile| tile.src.clone()).collect())
+                .unwrap_or_default(),
+        );
+        tile_transition.update(|transition| *transition = transition.wrapping_add(1));
+        active_tiles.set(desired.clone());
+        if pending_tiles.get_value().is_empty() {
+            last_complete_tiles.set_value(desired);
+            previous_tiles.set(None);
+        }
+    });
     let last = StoredValue::new(None::<(i32, i32)>);
     let annotation_drag = StoredValue::new(None::<AnnotationDrag>);
     let world_at = move |ev: &web_sys::PointerEvent| -> Option<([f64; 2], f64)> {
-        if plane != Plane::Xy { return None; }
+        if plane != Plane::Xy {
+            return None;
+        }
         let (width, height, fit) = geometry()?;
         let pane = node_ref.get_untracked()?;
         let rect = pane.get_bounding_client_rect();
         let scale = fit * session.zoom_2d.get_untracked()[pane_index];
         let focus = session.focus.get_untracked();
-        Some(([
-            focus[0] + (ev.client_x() as f64 - rect.left() - width * 0.5) / scale,
-            focus[1] + (ev.client_y() as f64 - rect.top() - height * 0.5) / scale,
-        ], scale))
+        Some((
+            [
+                focus[0] + (ev.client_x() as f64 - rect.left() - width * 0.5) / scale,
+                focus[1] + (ev.client_y() as f64 - rect.top() - height * 0.5) / scale,
+            ],
+            scale,
+        ))
     };
     let on_down = move |ev: web_sys::PointerEvent| {
         if ev.button() != 0 {
@@ -2036,81 +3077,159 @@ fn OrthoPane(plane: Plane) -> impl IntoView {
         }
         let tool = session.annotation_tool.get_untracked();
         if plane == Plane::Xy && tool != AnnotationTool::Pan {
-            let Some((at, scale)) = world_at(&ev) else { return };
-            if let Some(target) = ev.current_target().and_then(|t| t.dyn_into::<web_sys::Element>().ok()) {
+            let Some((at, scale)) = world_at(&ev) else {
+                return;
+            };
+            if let Some(target) = ev
+                .current_target()
+                .and_then(|t| t.dyn_into::<web_sys::Element>().ok())
+            {
                 let _ = target.set_pointer_capture(ev.pointer_id());
             }
             match tool {
                 AnnotationTool::Select => {
                     let z = session.crosshair.get_untracked()[2] as i32;
-                    let visible = session.active_annotations().into_iter().filter(|item| item.at_plane(z, 0)).collect::<Vec<_>>();
-                    let selected = session.selected_annotation.get_untracked().and_then(|id| visible.iter().find(|item| item.id == id)).cloned();
-                    let chosen = selected.filter(|item| item.contains(at[0], at[1], 8.0/scale))
-                        .or_else(|| qupath::pick_annotation(&visible, at[0], at[1], 8.0/scale).cloned());
-                    session.selected_annotation.set(chosen.as_ref().map(|item| item.id));
+                    let visible = session
+                        .active_annotations()
+                        .into_iter()
+                        .filter(|item| item.at_plane(z, 0))
+                        .collect::<Vec<_>>();
+                    let selected = session
+                        .selected_annotation
+                        .get_untracked()
+                        .and_then(|id| visible.iter().find(|item| item.id == id))
+                        .cloned();
+                    let chosen = selected
+                        .filter(|item| item.contains(at[0], at[1], 8.0 / scale))
+                        .or_else(|| {
+                            qupath::pick_annotation(&visible, at[0], at[1], 8.0 / scale).cloned()
+                        });
+                    session
+                        .selected_annotation
+                        .set(chosen.as_ref().map(|item| item.id));
                     if let Some(item) = chosen.filter(|item| !item.locked) {
-                        let handle = selected_handle(&item, at, 8.0/scale);
+                        let handle = selected_handle(&item, at, 8.0 / scale);
                         if ev.alt_key() {
-                            if let Some((path, edge)) = closest_annotation_edge(&item, at, 8.0/scale) {
+                            if let Some((path, edge)) =
+                                closest_annotation_edge(&item, at, 8.0 / scale)
+                            {
                                 let mut edited = item;
-                                if edited.geometry.insert_vertex(path, edge, at) { session.remember_annotations(); session.update_annotation(edited); }
+                                if edited.geometry.insert_vertex(path, edge, at) {
+                                    session.remember_annotations();
+                                    session.update_annotation(edited);
+                                }
                             }
                         } else if ev.shift_key() {
                             if let AnnotationHandle::Vertex(path, vertex) = handle {
                                 let mut edited = item;
-                                if edited.geometry.remove_vertex(path, vertex) { session.remember_annotations(); session.update_annotation(edited); }
+                                if edited.geometry.remove_vertex(path, vertex) {
+                                    session.remember_annotations();
+                                    session.update_annotation(edited);
+                                }
                             }
                         } else {
                             session.remember_annotations();
-                            annotation_drag.set_value(Some(AnnotationDrag { original: item, start: at, handle }));
+                            annotation_drag.set_value(Some(AnnotationDrag {
+                                original: item,
+                                start: at,
+                                handle,
+                            }));
                         }
                     }
                 }
-                AnnotationTool::Point => session.add_annotation(Annotation { geometry: Geometry::Point(at), plane: AnnotationPlane::at(session.crosshair.get_untracked()[2] as i32, 0), ..Annotation::default() }),
+                AnnotationTool::Point => session.add_annotation(Annotation {
+                    geometry: Geometry::Point(at),
+                    plane: AnnotationPlane::at(session.crosshair.get_untracked()[2] as i32, 0),
+                    ..Annotation::default()
+                }),
                 AnnotationTool::Polygon | AnnotationTool::Polyline => {
                     let mut points = session.annotation_draft.get_untracked();
-                    if tool == AnnotationTool::Polygon && points.len() >= 3 && (points[0][0]-at[0]).hypot(points[0][1]-at[1]) < 8.0/scale {
+                    if tool == AnnotationTool::Polygon
+                        && points.len() >= 3
+                        && (points[0][0] - at[0]).hypot(points[0][1] - at[1]) < 8.0 / scale
+                    {
                         session.finish_annotation_draft();
-                    } else { points.push(at); session.annotation_draft.set(points); }
+                    } else {
+                        points.push(at);
+                        session.annotation_draft.set(points);
+                    }
                 }
-                AnnotationTool::Rectangle | AnnotationTool::Ellipse => session.annotation_draft.set(vec![at, at]),
-                AnnotationTool::FreehandRegion | AnnotationTool::FreehandLine => session.annotation_draft.set(vec![at]),
+                AnnotationTool::Rectangle | AnnotationTool::Ellipse | AnnotationTool::Profile => {
+                    session.annotation_draft.set(vec![at, at])
+                }
+                AnnotationTool::FreehandRegion | AnnotationTool::FreehandLine => {
+                    session.annotation_draft.set(vec![at])
+                }
                 AnnotationTool::Pan => {}
             }
             return;
         }
         last.set_value(Some((ev.client_x(), ev.client_y())));
-        if let Some(target) = ev.current_target().and_then(|t| t.dyn_into::<web_sys::Element>().ok()) {
+        if let Some(target) = ev
+            .current_target()
+            .and_then(|t| t.dyn_into::<web_sys::Element>().ok())
+        {
             let _ = target.set_pointer_capture(ev.pointer_id());
         }
     };
     let on_move = move |ev: web_sys::PointerEvent| {
         let tool = session.annotation_tool.get_untracked();
         if plane == Plane::Xy && tool != AnnotationTool::Pan {
-            if ev.buttons() & 1 == 0 { return; }
+            if ev.buttons() & 1 == 0 {
+                return;
+            }
             let Some((at, _)) = world_at(&ev) else { return };
             match tool {
-                AnnotationTool::Select => if let Some(drag) = annotation_drag.get_value() {
-                    let edited = move_annotation_drag(&drag, at);
-                    session.annotation_layers.update(|layers| if let Some(layer) = layers.iter_mut().find(|layer| Some(layer.id) == session.annotation_layer.get_untracked()) {
-                        if let Some(item) = layer.annotations.iter_mut().find(|item| item.id == edited.id) { *item = edited; }
-                    });
-                },
-                AnnotationTool::Rectangle | AnnotationTool::Ellipse => session.annotation_draft.update(|points| if points.len() == 2 { points[1] = at; }),
-                AnnotationTool::FreehandRegion | AnnotationTool::FreehandLine => session.annotation_draft.update(|points| {
-                    if points.last().is_none_or(|last| (last[0]-at[0]).hypot(last[1]-at[1]) >= 0.5) { points.push(at); }
-                }),
+                AnnotationTool::Select => {
+                    if let Some(drag) = annotation_drag.get_value() {
+                        let edited = move_annotation_drag(&drag, at);
+                        session.annotation_layers.update(|layers| {
+                            if let Some(layer) = layers.iter_mut().find(|layer| {
+                                Some(layer.id) == session.annotation_layer.get_untracked()
+                            }) {
+                                if let Some(item) = layer
+                                    .annotations
+                                    .iter_mut()
+                                    .find(|item| item.id == edited.id)
+                                {
+                                    *item = edited;
+                                }
+                            }
+                        });
+                    }
+                }
+                AnnotationTool::Rectangle | AnnotationTool::Ellipse | AnnotationTool::Profile => {
+                    session.annotation_draft.update(|points| {
+                        if points.len() == 2 {
+                            points[1] = at;
+                        }
+                    })
+                }
+                AnnotationTool::FreehandRegion | AnnotationTool::FreehandLine => {
+                    session.annotation_draft.update(|points| {
+                        if points
+                            .last()
+                            .is_none_or(|last| (last[0] - at[0]).hypot(last[1] - at[1]) >= 0.5)
+                        {
+                            points.push(at);
+                        }
+                    })
+                }
                 _ => {}
             }
             return;
         }
-        let Some((lx, ly)) = last.get_value() else { return };
+        let Some((lx, ly)) = last.get_value() else {
+            return;
+        };
         if ev.buttons() & 1 == 0 {
             return;
         }
         let (x, y) = (ev.client_x(), ev.client_y());
         last.set_value(Some((x, y)));
-        let Some((_, _, fit)) = geometry() else { return };
+        let Some((_, _, fit)) = geometry() else {
+            return;
+        };
         let scale = fit * session.zoom_2d.get_untracked()[pane_index];
         let mut focus = session.focus.get_untracked();
         focus[h_axis] -= (x - lx) as f64 / scale;
@@ -2119,34 +3238,86 @@ fn OrthoPane(plane: Plane) -> impl IntoView {
     };
     let on_up = move |ev: web_sys::PointerEvent| {
         last.set_value(None);
-        if plane != Plane::Xy { return; }
+        if plane != Plane::Xy {
+            return;
+        }
         let tool = session.annotation_tool.get_untracked();
         if tool == AnnotationTool::Select {
             if let Some(drag) = annotation_drag.get_value() {
                 annotation_drag.set_value(None);
                 if let Some((at, _)) = world_at(&ev) {
-                    if (at[0]-drag.start[0]).hypot(at[1]-drag.start[1]) > 1e-6 { session.update_annotation(move_annotation_drag(&drag, at)); }
+                    if (at[0] - drag.start[0]).hypot(at[1] - drag.start[1]) > 1e-6 {
+                        session.update_annotation(move_annotation_drag(&drag, at));
+                    }
                 }
             }
-        } else if matches!(tool, AnnotationTool::Rectangle | AnnotationTool::Ellipse | AnnotationTool::FreehandRegion | AnnotationTool::FreehandLine) {
-            if session.annotation_draft.get_untracked().len() > 1 { session.finish_annotation_draft(); }
+        } else if tool == AnnotationTool::Profile {
+            let points = session.annotation_draft.get_untracked();
+            if points.len() == 2
+                && (points[0][0] - points[1][0]).hypot(points[0][1] - points[1][1]) > 1e-6
+            {
+                let level = session
+                    .voxel_shape
+                    .get_untracked()
+                    .zip(Some(session.pyramid_shapes_xyz.get_untracked()))
+                    .filter(|(_, levels)| !levels.is_empty())
+                    .map(|(shape, levels)| {
+                        let pane = node_ref.get_untracked().expect("XY pane is mounted");
+                        let (width, height) = physical_size(&pane);
+                        xy_tile_level(
+                            shape,
+                            &levels,
+                            [width, height],
+                            session.zoom_2d.get_untracked()[pane_index],
+                        ) as u32
+                    })
+                    .unwrap_or(0);
+                session.request_line_profile([points[0], points[1]], level);
+                session.annotation_draft.set(Vec::new());
+            }
+        } else if matches!(
+            tool,
+            AnnotationTool::Rectangle
+                | AnnotationTool::Ellipse
+                | AnnotationTool::FreehandRegion
+                | AnnotationTool::FreehandLine
+        ) {
+            if session.annotation_draft.get_untracked().len() > 1 {
+                session.finish_annotation_draft();
+            }
         }
     };
     let on_double = move |ev: web_sys::MouseEvent| {
-        if plane == Plane::Xy && matches!(session.annotation_tool.get_untracked(), AnnotationTool::Polygon | AnnotationTool::Polyline) {
+        if plane == Plane::Xy
+            && matches!(
+                session.annotation_tool.get_untracked(),
+                AnnotationTool::Polygon | AnnotationTool::Polyline
+            )
+        {
             ev.prevent_default();
             session.finish_annotation_draft();
         }
     };
     let on_wheel = move |ev: web_sys::WheelEvent| {
         ev.prevent_default();
-        let Some((width, height, fit)) = geometry() else { return };
-        let Some(pane) = node_ref.get_untracked() else { return };
+        let Some((width, height, fit)) = geometry() else {
+            return;
+        };
+        let Some(pane) = node_ref.get_untracked() else {
+            return;
+        };
         let rect = pane.get_bounding_client_rect();
-        let cursor = (ev.client_x() as f64 - rect.left() - width * 0.5, ev.client_y() as f64 - rect.top() - height * 0.5);
+        let cursor = (
+            ev.client_x() as f64 - rect.left() - width * 0.5,
+            ev.client_y() as f64 - rect.top() - height * 0.5,
+        );
         let old_zoom = session.zoom_2d.get_untracked()[pane_index];
         let candidate = old_zoom * (1.0 - ev.delta_y() * 0.001);
-        let new_zoom = if candidate.is_finite() { candidate.max(0.25) } else { old_zoom };
+        let new_zoom = if candidate.is_finite() {
+            candidate.max(0.25)
+        } else {
+            old_zoom
+        };
         // The voxel under the cursor stays under the cursor.
         let (old_scale, new_scale) = (fit * old_zoom, fit * new_zoom);
         let mut focus = session.focus.get_untracked();
@@ -2187,15 +3358,40 @@ fn OrthoPane(plane: Plane) -> impl IntoView {
                 (Some(src), _, _, _) => view! { <img class="pane-image" src=src alt=plane.label() draggable="false"/> }.into_any(),
                 (None, _, _, _) => view! { <div class="pane-empty">"waiting for slices…"</div> }.into_any(),
             }}
-            <div class="slice-tile-layer" style:transform=tile_layer_transform>
+            <div class="slice-tile-layer previous" style:transform=move || previous_tiles.get()
+                .map(|set| tile_layer_transform(set.level)).unwrap_or_default()>
                 <For
-                    each=visible_tiles
+                    each=move || previous_tiles.get().map(|set| set.tiles).unwrap_or_default()
                     key=|tile| tile.src.clone()
-                    children=|tile| {
+                    children=|tile| view! {
+                        <img class="slice-tile loaded" src=tile.src draggable="false"
+                            style:left=format!("{}px", tile.source_x)
+                            style:top=format!("{}px", tile.source_y)
+                            style:width=format!("{}px", tile.source_width)
+                            style:height=format!("{}px", tile.source_height)/>
+                    }
+                />
+            </div>
+            <div class="slice-tile-layer active" style:transform=move || active_tiles.get()
+                .map(|set| tile_layer_transform(set.level)).unwrap_or_default()>
+                <For
+                    each=move || active_tiles.get().map(|set| set.tiles).unwrap_or_default()
+                    key=|tile| tile.src.clone()
+                    children=move |tile| {
                         let loaded = RwSignal::new(false);
+                        let src = tile.src.clone();
+                        let transition = tile_transition.get_untracked();
                         view! {
                             <img class="slice-tile" class:loaded=move || loaded.get()
-                                src=tile.src draggable="false" on:load=move |_| loaded.set(true)
+                                src=tile.src draggable="false" on:load=move |_| {
+                                    loaded.set(true);
+                                    if tile_transition.get_untracked() != transition { return; }
+                                    pending_tiles.update_value(|pending| { pending.remove(&src); });
+                                    if pending_tiles.get_value().is_empty() {
+                                        last_complete_tiles.set_value(active_tiles.get_untracked());
+                                        previous_tiles.set(None);
+                                    }
+                                }
                                 style:left=format!("{}px", tile.source_x)
                                 style:top=format!("{}px", tile.source_y)
                                 style:width=format!("{}px", tile.source_width)
@@ -2233,6 +3429,27 @@ fn OrthoPane(plane: Plane) -> impl IntoView {
                         .unwrap_or_else(|| if draft.len() == 1 { Geometry::Point(draft[0]) } else { Geometry::LineString(draft) });
                     annotation_svg_path(&geometry, current_style.point_size * 0.5/scale)
                 };
+                let profile_display = session.line_profile.get().map(|profile| {
+                    let midpoint = [
+                        (profile.line[0][0] + profile.line[1][0]) * 0.5,
+                        (profile.line[0][1] + profile.line[1][1]) * 0.5 - 8.0 / scale,
+                    ];
+                    let label = profile.response.as_ref().map(profile_length_label).unwrap_or_else(|| {
+                        format!("{:.1} px", (profile.line[1][0] - profile.line[0][0])
+                            .hypot(profile.line[1][1] - profile.line[0][1]))
+                    });
+                    (
+                        annotation_svg_path(
+                            &Geometry::LineString(profile.line.to_vec()),
+                            current_style.point_size * 0.5 / scale,
+                        ),
+                        midpoint,
+                        label,
+                    )
+                });
+                let profile_path = profile_display.as_ref().map(|display| display.0.clone()).unwrap_or_default();
+                let profile_midpoint = profile_display.as_ref().map(|display| display.1).unwrap_or_default();
+                let profile_label = profile_display.map(|display| display.2).unwrap_or_default();
                 view! {
                     <svg class="annotation-overlay" style:left=format!("{left}px") style:top=format!("{top}px")
                         style:width=format!("{width}px") style:height=format!("{height}px")
@@ -2266,6 +3483,9 @@ fn OrthoPane(plane: Plane) -> impl IntoView {
                                 </g>
                             }
                         }).collect_view()}
+                        <path class="profile-measurement" d=profile_path stroke="#ffd848" stroke-width="2" fill="none"/>
+                        <text class="profile-measurement-label" x=profile_midpoint[0] y=profile_midpoint[1]
+                            font-size=12.0/scale text-anchor="middle">{profile_label}</text>
                         <path class="annotation-shape selected" d=draft_path stroke="#ffd848" stroke-width="2" fill="none"/>
                     </svg>
                 }.into_any()
@@ -2283,12 +3503,17 @@ fn VolumePane() -> impl IntoView {
     let last = StoredValue::new(None::<(i32, i32)>);
     let on_down = move |ev: web_sys::PointerEvent| {
         last.set_value(Some((ev.client_x(), ev.client_y())));
-        if let Some(target) = ev.current_target().and_then(|t| t.dyn_into::<web_sys::Element>().ok()) {
+        if let Some(target) = ev
+            .current_target()
+            .and_then(|t| t.dyn_into::<web_sys::Element>().ok())
+        {
             let _ = target.set_pointer_capture(ev.pointer_id());
         }
     };
     let on_move = move |ev: web_sys::PointerEvent| {
-        let Some((lx, ly)) = last.get_value() else { return };
+        let Some((lx, ly)) = last.get_value() else {
+            return;
+        };
         if ev.buttons() & 1 == 0 {
             return;
         }
@@ -2337,7 +3562,10 @@ fn CubePane() -> impl IntoView {
     let view_for = move |canvas: &web_sys::HtmlCanvasElement| {
         let shape = session.voxel_shape.get_untracked().unwrap_or([1; 3]);
         let rect = canvas.get_bounding_client_rect();
-        CubeView::new([shape[0] as f32, shape[1] as f32, shape[2] as f32], (rect.width() as f32, rect.height() as f32))
+        CubeView::new(
+            [shape[0] as f32, shape[1] as f32, shape[2] as f32],
+            (rect.width() as f32, rect.height() as f32),
+        )
     };
     let cut_fractions = move || {
         let shape = session.voxel_shape.get_untracked().unwrap_or([1; 3]);
@@ -2347,19 +3575,38 @@ fn CubePane() -> impl IntoView {
     let pointer = move |ev: &web_sys::MouseEvent| -> Option<(f32, f32)> {
         let target = ev.current_target()?.dyn_into::<web_sys::Element>().ok()?;
         let rect = target.get_bounding_client_rect();
-        Some(((ev.client_x() as f64 - rect.left()) as f32, (ev.client_y() as f64 - rect.top()) as f32))
+        Some((
+            (ev.client_x() as f64 - rect.left()) as f32,
+            (ev.client_y() as f64 - rect.top()) as f32,
+        ))
     };
 
     // Redraw whenever the crosshair, shape or hover changes.
     Effect::new(move |_| {
-        let _ = (session.crosshair.get(), session.voxel_shape.get(), hover.get(), session.view_mode.get(), session.volume_png.get());
-        let Some(canvas) = canvas_ref.get() else { return };
+        let _ = (
+            session.crosshair.get(),
+            session.voxel_shape.get(),
+            hover.get(),
+            session.view_mode.get(),
+            session.volume_png.get(),
+        );
+        let Some(canvas) = canvas_ref.get() else {
+            return;
+        };
         let canvas: web_sys::HtmlCanvasElement = canvas.clone();
-        draw_cube(&canvas, &view_for(&canvas), cut_fractions(), hover.get_untracked(), drag.get_value().map(|d| d.0));
+        draw_cube(
+            &canvas,
+            &view_for(&canvas),
+            cut_fractions(),
+            hover.get_untracked(),
+            drag.get_value().map(|d| d.0),
+        );
     });
 
     let on_down = move |ev: web_sys::PointerEvent| {
-        let Some(canvas) = canvas_ref.get_untracked() else { return };
+        let Some(canvas) = canvas_ref.get_untracked() else {
+            return;
+        };
         let canvas: web_sys::HtmlCanvasElement = canvas.clone();
         let Some(at) = pointer(&ev) else { return };
         let view = view_for(&canvas);
@@ -2371,16 +3618,21 @@ fn CubePane() -> impl IntoView {
         }
     };
     let on_move = move |ev: web_sys::PointerEvent| {
-        let Some(canvas) = canvas_ref.get_untracked() else { return };
+        let Some(canvas) = canvas_ref.get_untracked() else {
+            return;
+        };
         let canvas: web_sys::HtmlCanvasElement = canvas.clone();
         let Some(at) = pointer(&ev) else { return };
         let view = view_for(&canvas);
         match drag.get_value() {
             Some((axis, start, from)) => {
-                if let Some(fraction) = view.drag_fraction(axis, start, (at.0 - from.0, at.1 - from.1)) {
+                if let Some(fraction) =
+                    view.drag_fraction(axis, start, (at.0 - from.0, at.1 - from.1))
+                {
                     let shape = session.voxel_shape.get_untracked().unwrap_or([1; 3]);
                     let mut next = session.crosshair.get_untracked();
-                    next[axis] = ((fraction * shape[axis] as f32).floor() as u32).min(shape[axis].saturating_sub(1));
+                    next[axis] = ((fraction * shape[axis] as f32).floor() as u32)
+                        .min(shape[axis].saturating_sub(1));
                     session.move_crosshair(next);
                 }
             }
@@ -2389,7 +3641,14 @@ fn CubePane() -> impl IntoView {
                 if picked != hover.get_untracked() {
                     hover.set(picked);
                 }
-                let _ = canvas.set_attribute("style", if picked.is_some() { "cursor: grab" } else { "cursor: default" });
+                let _ = canvas.set_attribute(
+                    "style",
+                    if picked.is_some() {
+                        "cursor: grab"
+                    } else {
+                        "cursor: default"
+                    },
+                );
             }
         }
     };
@@ -2404,13 +3663,26 @@ fn CubePane() -> impl IntoView {
     }
 }
 
-fn draw_cube(canvas: &web_sys::HtmlCanvasElement, view: &CubeView, cut: [f32; 3], hover: Option<usize>, dragging: Option<usize>) {
+fn draw_cube(
+    canvas: &web_sys::HtmlCanvasElement,
+    view: &CubeView,
+    cut: [f32; 3],
+    hover: Option<usize>,
+    dragging: Option<usize>,
+) {
     let rect = canvas.get_bounding_client_rect();
     let scale = window().device_pixel_ratio().max(0.5);
     let (w, h) = (rect.width().max(1.0), rect.height().max(1.0));
     canvas.set_width((w * scale) as u32);
     canvas.set_height((h * scale) as u32);
-    let Some(context) = canvas.get_context("2d").ok().flatten().and_then(|c| c.dyn_into::<web_sys::CanvasRenderingContext2d>().ok()) else { return };
+    let Some(context) = canvas
+        .get_context("2d")
+        .ok()
+        .flatten()
+        .and_then(|c| c.dyn_into::<web_sys::CanvasRenderingContext2d>().ok())
+    else {
+        return;
+    };
     let _ = context.scale(scale, scale);
     context.set_fill_style_str("#0d0d1a");
     context.fill_rect(0.0, 0.0, w, h);
@@ -2437,7 +3709,11 @@ fn draw_cube(canvas: &web_sys::HtmlCanvasElement, view: &CubeView, cut: [f32; 3]
         context.close_path();
         context.set_fill_style_str(&format!("rgba({}, {alpha})", colours[axis]));
         context.fill();
-        context.set_stroke_style_str(&format!("rgba({}, {})", colours[axis], if active { 1.0 } else { 0.7 }));
+        context.set_stroke_style_str(&format!(
+            "rgba({}, {})",
+            colours[axis],
+            if active { 1.0 } else { 0.7 }
+        ));
         context.set_line_width(if active { 1.5 } else { 1.0 });
         context.stroke();
     }
@@ -2461,7 +3737,10 @@ fn draw_cube(canvas: &web_sys::HtmlCanvasElement, view: &CubeView, cut: [f32; 3]
     for (axis, letter) in ["x", "y", "z"].iter().enumerate() {
         let end = corners[1 << axis].1;
         let start = corners[0].1;
-        let (x, y) = (end.0 + (end.0 - start.0) * 0.06, end.1 + (end.1 - start.1) * 0.06);
+        let (x, y) = (
+            end.0 + (end.0 - start.0) * 0.06,
+            end.1 + (end.1 - start.1) * 0.06,
+        );
         let _ = context.fill_text(letter, x as f64, y as f64);
     }
 }
@@ -2469,10 +3748,16 @@ fn draw_cube(canvas: &web_sys::HtmlCanvasElement, view: &CubeView, cut: [f32; 3]
 #[component]
 fn AxisSliders() -> impl IntoView {
     let session = expect_context::<Session>();
-    let slider = move |axis: usize, label: &'static str| {
-        let max = move || session.voxel_shape.get().map(|s| s[axis].saturating_sub(1)).unwrap_or(0);
+    let slider = move |axis: usize, label: &'static str, class: &'static str, show_value: bool| {
+        let max = move || {
+            session
+                .voxel_shape
+                .get()
+                .map(|s| s[axis].saturating_sub(1))
+                .unwrap_or(0)
+        };
         view! {
-            <div class="slider-row">
+            <div class=format!("slider-row {class}")>
                 <span>{label}</span>
                 <input
                     type="range"
@@ -2488,17 +3773,19 @@ fn AxisSliders() -> impl IntoView {
                         }
                     }
                 />
-                <span class="slider-value">{move || format!("{} / {}", session.crosshair.get()[axis], max())}</span>
+                <Show when=move || show_value>
+                    <span class="slider-value">{move || format!("{} / {}", session.crosshair.get()[axis], max())}</span>
+                </Show>
             </div>
         }
     };
     view! {
         <div class="axis-sliders">
-            {slider(0, "X")}
-            {slider(1, "Y")}
+            {slider(0, "X", "x-axis", false)}
             <Show when=move || session.voxel_shape.get().is_none_or(|shape| shape[2] > 1)>
-                {slider(2, "Z")}
+                {slider(2, "Z", "z-axis", true)}
             </Show>
+            {slider(1, "Y", "y-axis", false)}
         </div>
     }
 }
@@ -2517,13 +3804,24 @@ fn Sidebar() -> impl IntoView {
             <Show when=move || session.voxel_shape.get().is_none_or(|shape| shape[2] > 1)>
                 <div class="layer-block">
                     <h3>"Scene"</h3>
-                    <div class="slider-row" title="How far light penetrates: a multiplier on the distance over which an opaque voxel absorbs everything (the scene diagonal / 256 at 1×). Larger sees deeper.">
-                        <span>"Depth"</span>
+                    <div class="depth-control" title="How far light penetrates: a multiplier on the distance over which an opaque voxel absorbs everything (the scene diagonal / 256 at 1×). Larger sees deeper.">
+                        <div class="depth-header">
+                            <span>"Ray depth"</span>
+                            <input type="number" min="0.05" max="100" step="0.05"
+                                prop:value=move || session.depth_scale.get().to_string()
+                                on:change=move |ev| {
+                                    if let Ok(value) = event_target_value(&ev).parse::<f32>() {
+                                        session.set_depth_scale(value.clamp(0.05, 100.0));
+                                    }
+                                }/>
+                            <span>"×"</span>
+                        </div>
                         <input
+                            aria-label="3D ray depth"
                             type="range"
-                            min="-1"
+                            min="-1.30103"
                             max="2"
-                            step="0.02"
+                            step="0.01"
                             prop:value=move || slider_from_depth_scale(session.depth_scale.get()).to_string()
                             on:input=move |ev| {
                                 if let Ok(position) = event_target_value(&ev).parse::<f32>() {
@@ -2531,7 +3829,6 @@ fn Sidebar() -> impl IntoView {
                                 }
                             }
                         />
-                        <span class="slider-value">{move || format!("{:.2}×", session.depth_scale.get())}</span>
                     </div>
                     <div class="hint">"Each channel's window start is its transparency cutoff and its opacity scales alpha; depth changes how far the ray sees before it saturates."</div>
                 </div>
@@ -2560,8 +3857,21 @@ fn AnnotationControls() -> impl IntoView {
     let new_name = RwSignal::new("manual".to_string());
     let import_text = RwSignal::new(String::new());
     let roi_choice = RwSignal::new(String::new());
-    let active = move || session.annotation_layers.get().into_iter().find(|layer| Some(layer.id) == session.annotation_layer.get());
-    let selected = move || active().and_then(|layer| layer.annotations.into_iter().find(|item| Some(item.id) == session.selected_annotation.get()));
+    let active = move || {
+        session
+            .annotation_layers
+            .get()
+            .into_iter()
+            .find(|layer| Some(layer.id) == session.annotation_layer.get())
+    };
+    let selected = move || {
+        active().and_then(|layer| {
+            layer
+                .annotations
+                .into_iter()
+                .find(|item| Some(item.id) == session.selected_annotation.get())
+        })
+    };
     view! {
         <h3>"Annotations"</h3>
         <div class="hint">"Draw in XY. Double-click or Enter finishes a polygon or line. In Select, drag to edit, Alt-click an edge to add a vertex, Shift-click a vertex to remove it. Escape cancels; Ctrl+Z undoes."</div>
@@ -2765,33 +4075,145 @@ fn LayerCard(layer: LayerChannelSummary) -> impl IntoView {
     }
 }
 
+fn contrast_pointer_value(ev: &web_sys::PointerEvent, bound: f64) -> Option<f64> {
+    let target = ev.current_target()?.dyn_into::<web_sys::Element>().ok()?;
+    let rect = target.get_bounding_client_rect();
+    // Native range thumbs travel between their half-widths rather than the element's outer edges.
+    let thumb_radius = 7.0_f64.min(rect.width() * 0.5);
+    let travel = (rect.width() - 2.0 * thumb_radius).max(1.0);
+    let fraction = ((ev.client_x() as f64 - rect.left() - thumb_radius) / travel).clamp(0.0, 1.0);
+    Some((fraction * bound).round())
+}
+
+fn set_contrast_endpoint(window: RwSignal<[f64; 2]>, value: f64, endpoint: usize) {
+    window.update(|current| {
+        if endpoint == 0 {
+            current[0] = value.min(current[1] - 1.0).max(0.0);
+        } else {
+            current[1] = value.max(current[0] + 1.0);
+        }
+    });
+}
+
+#[component]
+fn ContrastRange(
+    label: &'static str,
+    window: RwSignal<[f64; 2]>,
+    bound: f64,
+    commit: Callback<[f64; 2]>,
+) -> impl IntoView {
+    let drag = StoredValue::new(None::<usize>);
+    let on_down = move |ev: web_sys::PointerEvent| {
+        if ev.button() != 0 {
+            return;
+        }
+        let Some(value) = contrast_pointer_value(&ev, bound) else {
+            return;
+        };
+        let current = window.get_untracked();
+        let endpoint = usize::from((value - current[0]).abs() > (value - current[1]).abs());
+        drag.set_value(Some(endpoint));
+        set_contrast_endpoint(window, value, endpoint);
+        if let Some(target) = ev
+            .current_target()
+            .and_then(|target| target.dyn_into::<web_sys::Element>().ok())
+        {
+            let _ = target.set_pointer_capture(ev.pointer_id());
+        }
+        ev.prevent_default();
+    };
+    let on_move = move |ev: web_sys::PointerEvent| {
+        let Some(endpoint) = drag.get_value() else {
+            return;
+        };
+        if ev.buttons() & 1 == 0 {
+            drag.set_value(None);
+            return;
+        }
+        if let Some(value) = contrast_pointer_value(&ev, bound) {
+            set_contrast_endpoint(window, value, endpoint);
+        }
+    };
+    let finish = move |_: web_sys::PointerEvent| {
+        if drag.get_value().is_some() {
+            commit.run(window.get_untracked());
+        }
+        drag.set_value(None);
+    };
+    let input = move |ev: web_sys::Event, endpoint: usize| {
+        if let Ok(value) = event_target_value(&ev).parse::<f64>() {
+            set_contrast_endpoint(window, value, endpoint);
+            commit.run(window.get_untracked());
+        }
+    };
+    view! {
+        <div class="slider-row contrast-row compact">
+            <span>{label}</span>
+            <div class="dual-range" on:pointerdown=on_down on:pointermove=on_move
+                on:pointerup=finish on:pointercancel=finish>
+                <input type="range" class="min" aria-label=format!("{label} black point")
+                    min="0" max=bound.to_string() step="1"
+                    prop:value=move || window.get()[0].to_string()
+                    on:input=move |ev| input(ev, 0)/>
+                <input type="range" class="max" aria-label=format!("{label} white point")
+                    min="0" max=bound.to_string() step="1"
+                    prop:value=move || window.get()[1].to_string()
+                    on:input=move |ev| input(ev, 1)/>
+            </div>
+            <span class="slider-value contrast-value">{move || {
+                let [start, end] = window.get();
+                format!("{start:.0}–{end:.0}")
+            }}</span>
+        </div>
+    }
+}
+
 #[component]
 fn ChannelRow(layer_id: u64, channel: ChannelSummary) -> impl IntoView {
     let session = expect_context::<Session>();
     let index = channel.source_index;
+    let channel_name = channel
+        .label
+        .as_deref()
+        .map(str::trim)
+        .filter(|label| !label.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("Channel {}", index + 1));
     let state = RwSignal::new(channel.to_input());
+    let slice_window = RwSignal::new(
+        session
+            .slice_windows
+            .get_untracked()
+            .get(&(layer_id, index))
+            .copied()
+            .unwrap_or([channel.window_start, channel.window_end]),
+    );
+    let volume_window = RwSignal::new([channel.window_start, channel.window_end]);
     // Use the conventional integer range enclosing the current window. Keeping 255 and 65535
     // exact matters: doubling a padded endpoint put a dtype-wide window halfway along its track.
     let bound = {
         let top = state.get_untracked().window_end.max(1.0);
-        if top <= 255.0 { 255.0 }
-        else if top <= 4_095.0 { 4_095.0 }
-        else if top <= 65_535.0 { 65_535.0 }
-        else { top }
+        if top <= 255.0 {
+            255.0
+        } else if top <= 4_095.0 {
+            4_095.0
+        } else if top <= 65_535.0 {
+            65_535.0
+        } else {
+            top
+        }
     };
     let send = move || session.set_channel(layer_id, index, state.get_untracked());
-    let on_min = move |ev: web_sys::Event| {
-        if let Ok(value) = event_target_value(&ev).parse::<f64>() {
-            state.update(|s| s.window_start = value.min(s.window_end - 1.0).max(0.0));
-            send();
-        }
-    };
-    let on_max = move |ev: web_sys::Event| {
-        if let Ok(value) = event_target_value(&ev).parse::<f64>() {
-            state.update(|s| s.window_end = value.max(s.window_start + 1.0));
-            send();
-        }
-    };
+    let commit_slice =
+        Callback::new(move |window: [f64; 2]| session.set_slice_window(layer_id, index, window));
+    let commit_volume = Callback::new(move |window: [f64; 2]| {
+        let [start, end] = window;
+        state.update(|current| {
+            current.window_start = start;
+            current.window_end = end;
+        });
+        send();
+    });
     view! {
         <div class="image-channel-control">
             <div class="channel-header">
@@ -2800,7 +4222,7 @@ fn ChannelRow(layer_id: u64, channel: ChannelSummary) -> impl IntoView {
                     prop:checked=move || state.get().enabled
                     on:change=move |ev| { state.update(|s| s.enabled = event_target_checked(&ev)); send(); }
                 />
-                <span class="channel-name">{format!("channel {index}")}</span>
+                <span class="channel-name" title=channel_name.clone()>{channel_name.clone()}</span>
                 <input
                     type="color"
                     class="color-picker"
@@ -2814,18 +4236,10 @@ fn ChannelRow(layer_id: u64, channel: ChannelSummary) -> impl IntoView {
                 />
             </div>
             <Show when=move || state.get().enabled>
-                <div class="slider-row contrast-row">
-                    <span>"Black"</span>
-                    <input type="range" min="0" max=bound.to_string() step="1"
-                        prop:value=move || state.get().window_start.to_string() on:input=on_min/>
-                    <span class="slider-value">{move || format!("{:.0}", state.get().window_start)}</span>
-                </div>
-                <div class="slider-row contrast-row">
-                    <span>"White"</span>
-                    <input type="range" min="0" max=bound.to_string() step="1"
-                        prop:value=move || state.get().window_end.to_string() on:input=on_max/>
-                    <span class="slider-value">{move || format!("{:.0}", state.get().window_end)}</span>
-                </div>
+                <ContrastRange label="2D contrast" window=slice_window bound=bound commit=commit_slice/>
+                <Show when=move || session.voxel_shape.get().is_some_and(|shape| shape[2] > 1)>
+                    <ContrastRange label="3D contrast" window=volume_window bound=bound commit=commit_volume/>
+                </Show>
                 <div class="slider-row">
                     <span>"Opacity"</span>
                     <input

@@ -63,6 +63,8 @@ button { cursor: pointer; }
 .pane .annotation-overlay .annotation-shape { vector-effect: non-scaling-stroke; fill-rule: evenodd; }
 .pane .annotation-overlay .annotation-shape.selected { stroke: #fff; stroke-width: 3; }
 .pane .annotation-overlay .annotation-handle { fill: #fff; stroke: #18213e; stroke-width: 1; vector-effect: non-scaling-stroke; }
+.pane .annotation-overlay .profile-measurement { vector-effect: non-scaling-stroke; }
+.pane .annotation-overlay .profile-measurement-label { fill: #ffd848; stroke: #000; stroke-width: 3px; paint-order: stroke; stroke-linejoin: round; font-weight: 600; }
 .pane .pane-zoom { position: absolute; right: 8px; bottom: 6px; font-size: 11px; color: var(--muted); pointer-events: none; text-shadow: 0 0 3px #000; }
 .pane.volume { cursor: grab; }
 .pane.volume:active { cursor: grabbing; }
@@ -77,6 +79,9 @@ button { cursor: pointer; }
 .tool-button:hover { color: #fff; }
 .tool-button.active { color: #fff; background: var(--accent); border-color: var(--accent); }
 .tool-button:disabled { opacity: 0.4; cursor: default; }
+.tool-button .tool-icon { display: block; width: 18px; height: 18px; margin: auto; fill: currentColor; }
+.tool-button .tool-icon.outline { fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+.tool-button .tool-glyph { display: block; font-size: 16px; line-height: 18px; }
 .annotation-tools { max-width: min(100%, 710px); overflow-x: auto; }
 .annotation-name { width: 100px; }
 .annotation-list { max-height: 180px; overflow-y: auto; display: flex; flex-direction: column; gap: 2px; margin: 6px 0; }
@@ -95,9 +100,28 @@ button { cursor: pointer; }
 .status-bar .busy { color: var(--accent); }
 .status-bar .readout { color: var(--muted); }
 
+.profile-panel { position: absolute; left: 10px; right: 42px; bottom: 66px; z-index: 28; padding: 8px 12px 6px; background: rgba(17, 20, 29, 0.96); border: 1px solid var(--border); border-radius: 6px; box-shadow: 0 6px 24px #0009; }
+.profile-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; }
+.profile-header h3 { margin: 0 0 4px; font-size: 12px; color: var(--text); }
+.profile-header button { border: 0; background: none; color: var(--muted); font-size: 18px; line-height: 1; }
+.profile-header button:hover { color: var(--text); }
+.profile-channels { display: flex; flex-wrap: wrap; gap: 10px; min-height: 14px; }
+.profile-channel { display: inline-flex; align-items: center; gap: 4px; color: var(--muted-light); font-size: 10px; }
+.profile-swatch { width: 9px; height: 9px; border-radius: 50%; }
+.profile-plot { height: 150px; }
+.profile-plot svg { display: block; width: 100%; height: 128px; }
+.profile-axis { stroke: var(--border-soft); stroke-width: 1; vector-effect: non-scaling-stroke; }
+.profile-line { fill: none; stroke-width: 1.5; vector-effect: non-scaling-stroke; }
+.profile-range { display: flex; justify-content: space-between; color: var(--muted); font-size: 10px; }
+.profile-empty, .profile-error { height: 80px; display: flex; align-items: center; justify-content: center; color: var(--muted); font-size: 11px; }
+.profile-error { color: var(--accent); }
+
 /* ---- axis sliders under the viewer ---------------------------------------------------- */
 .axis-sliders { flex: none; display: flex; gap: 12px; padding: 4px 10px; background: var(--panel); border-top: 1px solid var(--border); }
 .axis-sliders .slider-row { flex: 1; margin: 0; }
+.axis-sliders .y-axis { position: absolute; z-index: 18; right: 6px; top: 54px; bottom: 66px; width: 28px; padding: 7px 3px; flex: none; flex-direction: column; background: rgba(22, 33, 62, 0.88); border: 1px solid var(--border-soft); border-radius: 5px; }
+.axis-sliders .y-axis > span:first-child { width: auto; }
+.axis-sliders .y-axis input[type="range"] { writing-mode: vertical-lr; width: 18px; height: auto; min-width: 0; flex: 1; }
 
 /* ---- sidebar ---------------------------------------------------------------------------- */
 .control-panel { width: var(--sidebar); flex-shrink: 0; background: var(--panel); padding: 12px; overflow-y: auto; border-left: 1px solid var(--border); }
@@ -112,7 +136,14 @@ button { cursor: pointer; }
 .channel-header { display: flex; align-items: center; gap: 6px; }
 .channel-header input[type="checkbox"] { accent-color: var(--accent); width: 18px; height: 18px; margin: 0; }
 .channel-header .layer-name { flex: 1; font-weight: 600; font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.channel-header .channel-name { flex: 1; font-size: 12px; }
+.channel-header .channel-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+}
 .channel-header .layer-remove { border: 0; background: none; color: var(--muted); font-size: 14px; }
 .channel-header .layer-remove:hover { color: var(--accent); }
 .color-picker { width: 24px; height: 24px; padding: 0; border: 1px solid var(--border-soft); border-radius: 4px; background: none; }
@@ -123,20 +154,25 @@ button { cursor: pointer; }
 .slider-row { display: flex; align-items: center; gap: 6px; margin: 4px 0; }
 .slider-row > span:first-child { font-size: 11px; width: 54px; color: var(--muted); flex-shrink: 0; }
 .slider-row input[type="range"] { flex: 1; height: 6px; accent-color: var(--accent); min-width: 40px; margin: 0; }
-.slider-row.contrast-row input[type="range"] { height: 20px; cursor: pointer; }
 .slider-row .slider-value { font-size: 11px; min-width: 46px; text-align: right; color: var(--muted-light); }
+.slider-row .contrast-value { min-width: 68px; }
 .slider-row label { font-size: 11px; color: var(--muted); display: flex; align-items: center; gap: 4px; }
 .slider-row input[type="checkbox"] { accent-color: var(--accent); margin: 0; }
+.depth-control { display: flex; flex-direction: column; gap: 5px; margin: 4px 0; }
+.depth-control .depth-header { display: flex; align-items: center; gap: 4px; color: var(--muted); font-size: 11px; }
+.depth-control .depth-header span:first-child { flex: 1; }
+.depth-control .depth-header input { width: 76px; padding: 2px 4px; background: var(--bg-deep); border: 1px solid var(--border-soft); border-radius: 3px; }
+.depth-control > input[type="range"] { width: 100%; height: 18px; margin: 0; accent-color: var(--accent); cursor: pointer; }
 
 /* Two overlapping ranges: only the min slider paints a track; both thumbs stay clickable. */
-.dual-range { position: relative; flex: 1; height: 18px; min-width: 40px; }
+.dual-range { position: relative; flex: 1; height: 20px; min-width: 40px; cursor: pointer; touch-action: none; }
 .dual-range input[type="range"] { position: absolute; left: 0; right: 0; top: 0; width: 100%; height: 18px; margin: 0; background: none; pointer-events: none; -webkit-appearance: none; appearance: none; }
 .dual-range input[type="range"]::-webkit-slider-runnable-track { height: 4px; background: transparent; }
 .dual-range input[type="range"].min::-webkit-slider-runnable-track { background: #333; border-radius: 2px; }
 .dual-range input[type="range"]::-moz-range-track { height: 4px; background: transparent; }
 .dual-range input[type="range"].min::-moz-range-track { background: #333; border-radius: 2px; }
-.dual-range input[type="range"]::-webkit-slider-thumb { -webkit-appearance: none; appearance: none; width: 14px; height: 14px; margin-top: -5px; border-radius: 50%; background: var(--accent); border: 0; pointer-events: auto; cursor: pointer; }
-.dual-range input[type="range"]::-moz-range-thumb { width: 14px; height: 14px; border-radius: 50%; background: var(--accent); border: 0; pointer-events: auto; cursor: pointer; }
+.dual-range input[type="range"]::-webkit-slider-thumb { -webkit-appearance: none; appearance: none; width: 14px; height: 14px; margin-top: -5px; border-radius: 50%; background: var(--accent); border: 0; pointer-events: none; }
+.dual-range input[type="range"]::-moz-range-thumb { width: 14px; height: 14px; border-radius: 50%; background: var(--accent); border: 0; pointer-events: none; }
 
 .add-layer { display: flex; flex-direction: column; gap: 6px; }
 .add-layer select, .add-layer input, .front-page input { background: var(--bg-deep); border: 1px solid var(--border-soft); border-radius: 4px; padding: 4px 6px; color: var(--text); font-size: 12px; }
