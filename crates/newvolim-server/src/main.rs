@@ -16,9 +16,11 @@ use std::{
 };
 
 mod annotation_store;
+mod feature_store;
 use annotation_store::{
     AnnotationLayer, AnnotationSaveReport, AnnotationStore, RoiSaveReport, RoiTableSummary,
 };
+use feature_store::FeatureStore;
 
 use axum::{
     extract::{
@@ -101,6 +103,7 @@ struct AppState {
     /// requests from every client of that dataset.
     sessions: SessionStore,
     annotations: AnnotationStore,
+    features: FeatureStore,
     /// Palace tasks are not yet cancellable. The dispatcher retains one active task and only
     /// the newest waiting request, preventing an unbounded stale-render backlog.
     render_queue: mpsc::Sender<FrameJob>,
@@ -162,13 +165,12 @@ impl SessionStore {
         Ok(session.layer_channels())
     }
 
-    /// Apply one channel edit to the dataset's session and return every layer's channels.
-    /// Set the dataset session's see-through depth scale; returns the settings as stored.
-    fn set_depth_scale(
+    /// Atomically replace scene-wide settings after validating them on a session clone.
+    fn set_settings(
         &self,
         dataset: &str,
         root: &Path,
-        scale: f32,
+        settings: SceneSettings,
     ) -> Result<SceneSettings, String> {
         self.session_for(dataset, root)?;
         let mut sessions = self
@@ -178,12 +180,13 @@ impl SessionStore {
         let session = sessions
             .get_mut(dataset)
             .ok_or_else(|| "session vanished while setting the depth scale".to_owned())?;
-        session
-            .set_depth_scale(scale)
+        let mut next = session.clone();
+        next.set_depth_scale(settings.depth_scale)
             .map_err(|error| error.to_string())?;
-        Ok(SceneSettings {
-            depth_scale: session.depth_scale(),
-        })
+        next.set_timepoint(settings.timepoint)
+            .map_err(|error| error.to_string())?;
+        *session = next;
+        Ok(scene_settings(session))
     }
 
     fn set_channel_state(
@@ -301,6 +304,10 @@ struct RenderedOrthogonal {
     pyramid_levels: Option<[u32; 3]>,
     viewport: bool,
     pyramid_shapes_xyz: Vec<[u32; 3]>,
+    voxel_spacing_xyz: [f64; 3],
+    spatial_units_xyz: [Option<String>; 3],
+    timepoint: u32,
+    timepoint_count: u32,
 }
 
 enum RenderOutput {
@@ -438,6 +445,10 @@ struct SocketOrthogonal {
     pyramid_levels: Option<[u32; 3]>,
     viewport: bool,
     pyramid_shapes_xyz: Vec<[u32; 3]>,
+    voxel_spacing_xyz: [f64; 3],
+    spatial_units_xyz: [Option<String>; 3],
+    timepoint: u32,
+    timepoint_count: u32,
 }
 
 #[derive(Serialize)]
@@ -477,6 +488,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         next_session_id: Arc::new(AtomicU64::new(1)),
         sessions: SessionStore::default(),
         annotations: AnnotationStore::default(),
+        features: FeatureStore::default(),
     };
     let app = app_router(state, args.cors_origin, args.page_dir);
     let listener = tokio::net::TcpListener::bind(args.bind).await?;
@@ -499,10 +511,25 @@ fn app_router(
             "/v1/datasets/{dataset}/tiles/xy/{level}/{tile_x}/{tile_y}",
             get(dataset_xy_tile),
         )
+        .route("/v1/datasets/{dataset}/features", get(dataset_features))
         .route(
-            "/v1/datasets/{dataset}/profile/xy",
-            get(dataset_xy_profile),
+            "/v1/datasets/{dataset}/labels/{label}/tiles/xy/{level}/{tile_x}/{tile_y}",
+            get(dataset_label_tile),
         )
+        .route(
+            "/v1/datasets/{dataset}/labels/{label}/value",
+            get(dataset_label_value),
+        )
+        .route(
+            "/v1/datasets/{dataset}/objects/{objects}",
+            get(dataset_objects),
+        )
+        .route(
+            "/v1/datasets/{dataset}/objects/{objects}/rows/{row}",
+            get(dataset_object_row),
+        )
+        .route("/v1/datasets/{dataset}/regions", get(dataset_region_counts))
+        .route("/v1/datasets/{dataset}/profile/xy", get(dataset_xy_profile))
         .route(
             "/v1/datasets/{dataset}/channels",
             get(dataset_channels).post(set_dataset_channel),
@@ -972,6 +999,18 @@ async fn dataset_channels(
 struct SceneSettings {
     /// See-through depth: a multiplier on the opacity reference, 1 by default.
     depth_scale: f32,
+    #[serde(default)]
+    timepoint: u32,
+    #[serde(default)]
+    timepoint_count: u32,
+}
+
+fn scene_settings(session: &LocalSession) -> SceneSettings {
+    SceneSettings {
+        depth_scale: session.depth_scale(),
+        timepoint: session.timepoint(),
+        timepoint_count: session.timepoint_count(),
+    }
 }
 
 async fn dataset_settings(
@@ -988,9 +1027,7 @@ async fn dataset_settings(
             )
         })?
         .map_err(|message| (StatusCode::BAD_REQUEST, message))?;
-    Ok(Json(SceneSettings {
-        depth_scale: session.depth_scale(),
-    }))
+    Ok(Json(scene_settings(&session)))
 }
 
 async fn set_dataset_settings(
@@ -1000,18 +1037,16 @@ async fn set_dataset_settings(
 ) -> Result<Json<SceneSettings>, (StatusCode, String)> {
     let root = resolve_frame_dataset(&state.datasets, &dataset)?;
     let sessions = state.sessions.clone();
-    tokio::task::spawn_blocking(move || {
-        sessions.set_depth_scale(&dataset, &root, settings.depth_scale)
-    })
-    .await
-    .map_err(|_| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "settings task failed".to_owned(),
-        )
-    })?
-    .map_err(|message| (StatusCode::BAD_REQUEST, message))
-    .map(Json)
+    tokio::task::spawn_blocking(move || sessions.set_settings(&dataset, &root, settings))
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "settings task failed".to_owned(),
+            )
+        })?
+        .map_err(|message| (StatusCode::BAD_REQUEST, message))
+        .map(Json)
 }
 
 /// The camera for a browser scene packet; the same controls a frame request carries.
@@ -1436,6 +1471,208 @@ async fn list_datasets(State(state): State<AppState>) -> Json<DatasetList> {
 
 const XY_TILE_EDGE: u32 = 512;
 const MAX_PROFILE_SAMPLES: usize = 1024;
+
+async fn dataset_features(
+    State(state): State<AppState>,
+    AxumPath(dataset): AxumPath<String>,
+) -> Result<Json<feature_store::FeatureManifest>, ApiError> {
+    let root = resolve_frame_dataset(&state.datasets, &dataset)?;
+    let features = state.features.clone();
+    tokio::task::spawn_blocking(move || features.manifest(&root))
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "feature discovery task failed".into(),
+            )
+        })?
+        .map(Json)
+        .map_err(|message| (StatusCode::BAD_REQUEST, message))
+}
+
+#[derive(Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LabelTileQuery {
+    #[serde(default)]
+    outline: bool,
+    selected: Option<u64>,
+    #[serde(default = "default_label_opacity")]
+    opacity: f32,
+    #[serde(default)]
+    z: u32,
+    table: Option<String>,
+    column: Option<usize>,
+    min: Option<f64>,
+    max: Option<f64>,
+}
+
+fn default_label_opacity() -> f32 {
+    0.65
+}
+
+async fn dataset_label_tile(
+    State(state): State<AppState>,
+    AxumPath((dataset, label, level, tile_x, tile_y)): AxumPath<(String, String, usize, u32, u32)>,
+    Query(query): Query<LabelTileQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    let root = resolve_frame_dataset(&state.datasets, &dataset)?;
+    let features = state.features.clone();
+    let png = tokio::task::spawn_blocking(move || {
+        features.label_tile(
+            &root,
+            &label,
+            level,
+            tile_x,
+            tile_y,
+            XY_TILE_EDGE,
+            query.outline,
+            query.selected,
+            query.opacity,
+            query.z,
+            query
+                .table
+                .as_deref()
+                .zip(query.column)
+                .zip(query.min.zip(query.max))
+                .map(|((table, column), range)| (table, column, [range.0, range.1])),
+        )
+    })
+    .await
+    .map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "label tile task failed".into(),
+        )
+    })?
+    .map_err(|message| (StatusCode::BAD_REQUEST, message))?;
+    Ok((
+        [
+            (header::CONTENT_TYPE, HeaderValue::from_static("image/png")),
+            (
+                header::CACHE_CONTROL,
+                HeaderValue::from_static("private, max-age=31536000, immutable"),
+            ),
+        ],
+        png,
+    ))
+}
+
+#[derive(Deserialize)]
+struct LabelValueQuery {
+    x: u32,
+    y: u32,
+    #[serde(default)]
+    z: u32,
+}
+
+async fn dataset_label_value(
+    State(state): State<AppState>,
+    AxumPath((dataset, label)): AxumPath<(String, String)>,
+    Query(query): Query<LabelValueQuery>,
+) -> Result<Json<feature_store::LabelInspection>, ApiError> {
+    let root = resolve_frame_dataset(&state.datasets, &dataset)?;
+    let features = state.features.clone();
+    tokio::task::spawn_blocking(move || {
+        features.inspect_label(&root, &label, query.x, query.y, query.z)
+    })
+    .await
+    .map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "label inspection task failed".into(),
+        )
+    })?
+    .map(Json)
+    .map_err(|message| (StatusCode::BAD_REQUEST, message))
+}
+
+#[derive(Deserialize)]
+struct ObjectsQuery {
+    x0: f64,
+    x1: f64,
+    y0: f64,
+    y1: f64,
+    #[serde(default)]
+    z0: Option<f64>,
+    #[serde(default)]
+    z1: Option<f64>,
+    #[serde(default = "default_object_limit")]
+    max: usize,
+}
+fn default_object_limit() -> usize {
+    200_000
+}
+
+async fn dataset_objects(
+    State(state): State<AppState>,
+    AxumPath((dataset, objects)): AxumPath<(String, String)>,
+    Query(query): Query<ObjectsQuery>,
+) -> Result<Json<feature_store::ObjectQueryResult>, ApiError> {
+    let root = resolve_frame_dataset(&state.datasets, &dataset)?;
+    let features = state.features.clone();
+    let bounds = [
+        query.x0.min(query.x1),
+        query.x0.max(query.x1),
+        query.y0.min(query.y1),
+        query.y0.max(query.y1),
+        query.z0.unwrap_or(f64::NEG_INFINITY),
+        query.z1.unwrap_or(f64::INFINITY),
+    ];
+    tokio::task::spawn_blocking(move || {
+        features.query_objects(&root, &objects, bounds, query.max.min(200_000))
+    })
+    .await
+    .map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "object query task failed".into(),
+        )
+    })?
+    .map(Json)
+    .map_err(|message| (StatusCode::BAD_REQUEST, message))
+}
+
+async fn dataset_object_row(
+    State(state): State<AppState>,
+    AxumPath((dataset, objects, row)): AxumPath<(String, String, usize)>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let root = resolve_frame_dataset(&state.datasets, &dataset)?;
+    let features = state.features.clone();
+    tokio::task::spawn_blocking(move || features.inspect_object(&root, &objects, row))
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "object inspection task failed".into(),
+            )
+        })?
+        .map(Json)
+        .map_err(|message| (StatusCode::BAD_REQUEST, message))
+}
+
+#[derive(Deserialize)]
+struct RegionQuery {
+    label: String,
+    objects: String,
+}
+async fn dataset_region_counts(
+    State(state): State<AppState>,
+    AxumPath(dataset): AxumPath<String>,
+    Query(query): Query<RegionQuery>,
+) -> Result<Json<Vec<feature_store::RegionCount>>, ApiError> {
+    let root = resolve_frame_dataset(&state.datasets, &dataset)?;
+    let features = state.features.clone();
+    tokio::task::spawn_blocking(move || features.region_counts(&root, &query.label, &query.objects))
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "region count task failed".into(),
+            )
+        })?
+        .map(Json)
+        .map_err(|message| (StatusCode::BAD_REQUEST, message))
+}
 
 #[derive(Default, Deserialize)]
 struct XyTileQuery {
@@ -1979,6 +2216,10 @@ async fn serve_frame_socket(mut socket: WebSocket, state: AppState, session_id: 
                     pyramid_levels: rendered.pyramid_levels,
                     viewport: rendered.viewport,
                     pyramid_shapes_xyz: rendered.pyramid_shapes_xyz,
+                    voxel_spacing_xyz: rendered.voxel_spacing_xyz,
+                    spatial_units_xyz: rendered.spatial_units_xyz,
+                    timepoint: rendered.timepoint,
+                    timepoint_count: rendered.timepoint_count,
                 };
                 if socket
                     .send(Message::Text(
@@ -2099,18 +2340,26 @@ fn start_render(job: FrameJob, completed_tx: &mpsc::UnboundedSender<RenderComple
             RenderView::Orthogonal => {
                 // Select a level from pane size and 2D zoom, then slice the whole base layer on
                 // the CPU. Palace's Vulkan slicer remains the fallback for unsupported stores.
-                let portable =
-                    job.sessions
-                        .session_for(&job.dataset, &job.root)
-                        .and_then(|session| {
-                            portable_orthogonal_slice_pngs_for_view(
-                                &session,
-                                job.crosshair,
-                                [job.size.width, job.size.height],
-                                job.slice_zooms,
-                                job.controls.focus_xyz,
-                            )
-                        });
+                let session = job.sessions.session_for(&job.dataset, &job.root);
+                let calibration = session
+                    .as_ref()
+                    .ok()
+                    .and_then(|session| session.spatial_calibration().ok())
+                    .unwrap_or(([1.0; 3], [None, None, None]));
+                let time = session
+                    .as_ref()
+                    .ok()
+                    .map(|session| (session.timepoint(), session.timepoint_count()))
+                    .unwrap_or((0, 1));
+                let portable = session.and_then(|session| {
+                    portable_orthogonal_slice_pngs_for_view(
+                        &session,
+                        job.crosshair,
+                        [job.size.width, job.size.height],
+                        job.slice_zooms,
+                        job.controls.focus_xyz,
+                    )
+                });
                 match portable {
                     Ok((png, slices)) => Ok(RenderOutput::Orthogonal(RenderedOrthogonal {
                         png,
@@ -2119,6 +2368,10 @@ fn start_render(job: FrameJob, completed_tx: &mpsc::UnboundedSender<RenderComple
                         pyramid_levels: Some(slices.levels),
                         viewport: true,
                         pyramid_shapes_xyz: slices.pyramid_shapes_xyz,
+                        voxel_spacing_xyz: calibration.0,
+                        spatial_units_xyz: calibration.1.clone(),
+                        timepoint: time.0,
+                        timepoint_count: time.1,
                         render_ms: started.elapsed().as_secs_f64() * 1_000.0,
                     })),
                     Err(portable_error) => dataset_xyz_extent(&job.root).and_then(|shape| {
@@ -2141,6 +2394,10 @@ fn start_render(job: FrameJob, completed_tx: &mpsc::UnboundedSender<RenderComple
                                 pyramid_levels: None,
                                 viewport: false,
                                 pyramid_shapes_xyz: Vec::new(),
+                                voxel_spacing_xyz: calibration.0,
+                                spatial_units_xyz: calibration.1.clone(),
+                                timepoint: time.0,
+                                timepoint_count: time.1,
                                 render_ms: started.elapsed().as_secs_f64() * 1_000.0,
                             })
                         })
@@ -3047,6 +3304,14 @@ mod tests {
             pyramid_levels: Some([2, 3, 4]),
             viewport: true,
             pyramid_shapes_xyz: vec![[128, 128, 32]],
+            voxel_spacing_xyz: [0.3, 0.3, 1.0],
+            spatial_units_xyz: [
+                Some("micrometer".into()),
+                Some("micrometer".into()),
+                Some("micrometer".into()),
+            ],
+            timepoint: 2,
+            timepoint_count: 5,
         })
         .unwrap();
         assert_eq!(json["type"], "orthogonal");
@@ -3054,6 +3319,8 @@ mod tests {
         assert_eq!(json["voxelShapeXyz"], serde_json::json!([128, 128, 32]));
         assert_eq!(json["crosshairXyz"], serde_json::json!([64, 64, 16]));
         assert_eq!(json["pyramidLevels"], serde_json::json!([2, 3, 4]));
+        assert_eq!(json["timepoint"], 2);
+        assert_eq!(json["timepointCount"], 5);
         assert_eq!(json["target"]["depth"], "none");
         assert_eq!(json["progress"], "final");
     }
@@ -3126,6 +3393,7 @@ mod tests {
             next_session_id: Arc::new(AtomicU64::new(1)),
             sessions: SessionStore::default(),
             annotations: AnnotationStore::default(),
+            features: FeatureStore::default(),
         };
         let app = app_router(
             state,
@@ -3201,6 +3469,7 @@ mod tests {
                 next_session_id: Arc::new(AtomicU64::new(1)),
                 sessions: SessionStore::default(),
                 annotations: AnnotationStore::default(),
+                features: FeatureStore::default(),
             },
             vec![],
             None,
@@ -3283,6 +3552,7 @@ mod tests {
                 next_session_id: Arc::new(AtomicU64::new(1)),
                 sessions: SessionStore::default(),
                 annotations: AnnotationStore::default(),
+                features: FeatureStore::default(),
             }
         };
         let get = |app: Router, uri: &str| {
@@ -3352,6 +3622,7 @@ mod tests {
             next_session_id: Arc::new(AtomicU64::new(1)),
             sessions: SessionStore::default(),
             annotations: AnnotationStore::default(),
+            features: FeatureStore::default(),
         };
         let app = app_router(state, vec![], None);
         let call = |app: Router, method: &str, uri: &str, body: Option<String>| {
@@ -3375,7 +3646,7 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(&body).unwrap(),
-            serde_json::json!({"depthScale": 1.0})
+            serde_json::json!({"depthScale": 1.0, "timepoint": 0, "timepointCount": 1})
         );
         let (status, plan_body) = call(
             app.clone(),
@@ -3431,7 +3702,7 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(&body).unwrap(),
-            serde_json::json!({"depthScale": 2.5})
+            serde_json::json!({"depthScale": 2.5, "timepoint": 0, "timepointCount": 1})
         );
         let (status, body) = call(
             app.clone(),
@@ -3512,6 +3783,7 @@ mod tests {
             next_session_id: Arc::new(AtomicU64::new(1)),
             sessions: SessionStore::default(),
             annotations: AnnotationStore::default(),
+            features: FeatureStore::default(),
         };
         let app = app_router(state, vec![], None);
         let call = |app: Router, method: &str, uri: String, body: Option<String>| {
@@ -3673,6 +3945,7 @@ mod tests {
             next_session_id: Arc::new(AtomicU64::new(1)),
             sessions: SessionStore::default(),
             annotations: AnnotationStore::default(),
+            features: FeatureStore::default(),
         };
         let app = app_router(state.clone(), vec![], None);
 
@@ -3812,12 +4085,11 @@ mod tests {
             .png
             .iter()
             .all(|png| png.starts_with(b"\x89PNG\r\n\x1a\n")));
-        // The portable session slices the volume at the finest level that fits its pages —
-        // level zero for this fixture — so each plane is at voxel resolution, not the
-        // requested frame size: XY is x by y, XZ is x by z, YZ is y by z. The page stretches
-        // whatever it gets, so the crosshair overlay stays a fraction of the pane.
-        assert_eq!(png_dimensions(&orthogonal.png[0]), [128, 128], "XY");
-        assert_eq!(png_dimensions(&orthogonal.png[1]), [128, 32], "XZ");
-        assert_eq!(png_dimensions(&orthogonal.png[2]), [128, 32], "YZ");
+        // Interactive orthogonal responses are pane-sized viewports for every plane. Their
+        // capture metadata registers them back into voxel space while the next viewport loads.
+        assert!(orthogonal.viewport);
+        assert_eq!(png_dimensions(&orthogonal.png[0]), [32, 24], "XY");
+        assert_eq!(png_dimensions(&orthogonal.png[1]), [32, 24], "XZ");
+        assert_eq!(png_dimensions(&orthogonal.png[2]), [32, 24], "YZ");
     }
 }

@@ -123,6 +123,19 @@ it decodes only chunks intersecting the visible viewport and returns a pane-size
 image. Level choice is independent per plane and no longer limited by fitting the
 whole level into four pages. At 64× on R1, 150×100, 300×200 and 600×400 physical
 panes select XY levels 4, 3 and 2 respectively; a warm 300×200 response was 45 ms.
+
+**Feature layers (2026-09-22):** ROZT discovers NGFF `labels/*` and `tables/*` beside
+the image. Label IDs remain unsigned integers through picking and tile rendering, including
+IDs above 2^24; overlays support hashed or `image-label` colors, outlines, opacity, selection,
+and isolation. Coordinate CSV/Parquet tables render visible, z-faded objects with numeric
+filters, column coloring, and exact row inspection. Label-ID CSV/Parquet feature tables paint
+and filter their matching label image. `image-label.properties` and dataset-local
+`atlas.jsonl`, `ontology.jsonl`, or `ABA_annotation_last.jsonl` supply region names, and the
+Regions action counts an object table by label ID using a tiled label-read cache.
+Time-series datasets now expose a T slider; the selected timepoint reaches every server and
+browser render path, and decoded-chunk and packed-page cache keys include T. Orthogonal panes
+show scale bars from the finest NGFF spatial calibration. Channels without an OMERO display
+window get a bounded 0.5/99.5-percentile estimate from the coarsest pyramid array.
 The socket response reports `pyramidLevels` and every pyramid shape; the UI status
 displays the selected levels. The 2D zoom has a 0.25× lower bound and no upper bound.
 After the first viewport frame, a true 2D XY view switches to progressive 512×512

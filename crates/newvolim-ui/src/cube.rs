@@ -99,7 +99,10 @@ impl CubeView {
         let at = self.cut_coord(axis, fraction);
         let (a, b) = ((axis + 1) % 3, (axis + 2) % 3);
         let mut quad = [(0.0, 0.0); 4];
-        for (index, (sa, sb)) in [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)].into_iter().enumerate() {
+        for (index, (sa, sb)) in [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)]
+            .into_iter()
+            .enumerate()
+        {
             let mut point = [0.0; 3];
             point[axis] = at;
             point[a] = sa * self.half[a];
@@ -111,7 +114,13 @@ impl CubeView {
 
     /// Where the ray under `pointer` meets the plane, if within the box plus `margin_px`.
     /// Returns the ray parameter (smaller is nearer the camera) and the point.
-    pub fn plane_hit(&self, axis: usize, fraction: f32, pointer: (f32, f32), margin_px: f32) -> Option<(f32, [f32; 3])> {
+    pub fn plane_hit(
+        &self,
+        axis: usize,
+        fraction: f32,
+        pointer: (f32, f32),
+        margin_px: f32,
+    ) -> Option<(f32, [f32; 3])> {
         let u = (pointer.0 - self.size.0 * 0.5) / self.scale_px;
         let v = (self.size.1 * 0.5 - pointer.1) / self.scale_px;
         let origin = [
@@ -124,7 +133,11 @@ impl CubeView {
             return None;
         }
         let t = (self.cut_coord(axis, fraction) - origin[axis]) / dir[axis];
-        let point = [origin[0] + t * dir[0], origin[1] + t * dir[1], origin[2] + t * dir[2]];
+        let point = [
+            origin[0] + t * dir[0],
+            origin[1] + t * dir[1],
+            origin[2] + t * dir[2],
+        ];
         let margin = margin_px / self.scale_px;
         for (other, at) in point.iter().enumerate() {
             if other != axis && at.abs() > self.half[other] + margin {
@@ -150,7 +163,10 @@ impl CubeView {
     /// The screen vector of the whole axis, fraction 0 to 1.
     pub fn axis_span_px(&self, axis: usize) -> (f32, f32) {
         let e = self.extent[axis];
-        (e * self.right[axis] * self.scale_px, -e * self.up[axis] * self.scale_px)
+        (
+            e * self.right[axis] * self.scale_px,
+            -e * self.up[axis] * self.scale_px,
+        )
     }
 
     /// The fraction after dragging by `moved` pixels since the press that found `start`.
@@ -174,7 +190,11 @@ fn corners(half: [f32; 3]) -> [[f32; 3]; 8] {
     let mut out = [[0.0; 3]; 8];
     for (i, corner) in out.iter_mut().enumerate() {
         for (axis, c) in corner.iter_mut().enumerate() {
-            *c = if i >> axis & 1 == 1 { half[axis] } else { -half[axis] };
+            *c = if i >> axis & 1 == 1 {
+                half[axis]
+            } else {
+                -half[axis]
+            };
         }
     }
     out
@@ -188,13 +208,19 @@ mod tests {
     fn the_box_fits_the_canvas_and_no_axis_is_edge_on() {
         let view = CubeView::new([256.0, 256.0, 64.0], (200.0, 160.0));
         for (_, (x, y)) in view.corner_points() {
-            assert!((0.0..=200.0).contains(&x) && (0.0..=160.0).contains(&y), "corner {x},{y} off canvas");
+            assert!(
+                (0.0..=200.0).contains(&x) && (0.0..=160.0).contains(&y),
+                "corner {x},{y} off canvas"
+            );
         }
         // The camera, not the proportions, decides edge-on: every axis of a plausible volume
         // has a screen direction long enough to drag along.
         for axis in 0..3 {
             let (sx, sy) = view.axis_span_px(axis);
-            assert!((sx * sx + sy * sy).sqrt() > MIN_AXIS_SPAN_PX, "axis {axis} is edge-on");
+            assert!(
+                (sx * sx + sy * sy).sqrt() > MIN_AXIS_SPAN_PX,
+                "axis {axis} is edge-on"
+            );
         }
         // A slab stays a slab: drawn to true proportions, a 512×512×8 volume's z axis is a
         // pixel or two, and a drag along it is refused rather than made to leap.
@@ -203,7 +229,12 @@ mod tests {
             let (sx, sy) = view.axis_span_px(axis);
             (sx * sx + sy * sy).sqrt()
         };
-        assert!(span(&slab, 2) * 8.0 < span(&slab, 0), "z span {} vs x span {}", span(&slab, 2), span(&slab, 0));
+        assert!(
+            span(&slab, 2) * 8.0 < span(&slab, 0),
+            "z span {} vs x span {}",
+            span(&slab, 2),
+            span(&slab, 0)
+        );
         assert_eq!(slab.drag_fraction(2, 0.5, (10.0, 10.0)), None);
     }
 
@@ -231,7 +262,9 @@ mod tests {
             let span = view.axis_span_px(axis);
             assert_eq!(view.drag_fraction(axis, 0.0, span), Some(1.0));
             assert_eq!(view.drag_fraction(axis, 1.0, (-span.0, -span.1)), Some(0.0));
-            let half = view.drag_fraction(axis, 0.0, (span.0 * 0.5, span.1 * 0.5)).unwrap();
+            let half = view
+                .drag_fraction(axis, 0.0, (span.0 * 0.5, span.1 * 0.5))
+                .unwrap();
             assert!((half - 0.5).abs() < 1e-5, "axis {axis}: {half}");
             // Motion perpendicular to the axis does not move it.
             let perpendicular = (-span.1, span.0);

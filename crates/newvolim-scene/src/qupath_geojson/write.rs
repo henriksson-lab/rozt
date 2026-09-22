@@ -5,8 +5,8 @@
 //! something — an absent `isLocked` and a `false` one mean the same thing, and
 //! the smaller file is the one a human can read.
 
-use anyhow::{Context, Result};
 use crate::qupath::Annotation;
+use anyhow::{Context, Result};
 use serde_json::{json, Map, Value};
 
 use super::{DENSE_REGION, STROKE_WIDTH, T_EXTENT, Z_EXTENT};
@@ -151,4 +151,3 @@ fn write_feature(annotation: &Annotation, all: &[Annotation]) -> Result<Value> {
     feature.insert("properties".into(), Value::Object(properties));
     Ok(Value::Object(feature))
 }
-

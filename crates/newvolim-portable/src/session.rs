@@ -20,16 +20,15 @@ use newvolim_render::{
     NativePortableVolumeInput, PickRay, PortableChannelTransfer, PortablePageSubmission,
     PortablePageUpload, PortableScalarType, PortableSceneLayerInput, PortableVolumeChannel,
 };
+use newvolim_scene::qupath::{Annotation as QuPathAnnotation, Geometry as QuPathGeometry};
 use newvolim_scene::{
     Annotation, AnnotationGeometry, AnnotationId, ChannelState, ChannelWindow, Layer, LayerId,
     LayerTransform, Scene,
 };
-use newvolim_scene::qupath::{Annotation as QuPathAnnotation, Geometry as QuPathGeometry};
 use serde::{Deserialize, Serialize};
 use std::sync::{
-    Mutex,
-    Arc, OnceLock,
     atomic::{AtomicUsize, Ordering},
+    Arc, Mutex, OnceLock,
 };
 
 #[derive(Clone, Debug, Default)]
@@ -57,8 +56,14 @@ pub struct LocalSession {
 
 #[derive(Debug)]
 struct SessionPageCache {
-    entries: HashMap<(PathBuf, u64, u32, u32), (palace_core::gpu::PortableChunkPlan, Vec<palace_core::gpu::PortableTensorPage>)>,
-    order: std::collections::VecDeque<(PathBuf, u64, u32, u32)>,
+    entries: HashMap<
+        (PathBuf, u64, u32, u32, u32),
+        (
+            palace_core::gpu::PortableChunkPlan,
+            Vec<palace_core::gpu::PortableTensorPage>,
+        ),
+    >,
+    order: std::collections::VecDeque<(PathBuf, u64, u32, u32, u32)>,
     total_words: usize,
     hits: u64,
     misses: u64,
@@ -67,8 +72,14 @@ struct SessionPageCache {
 impl SessionPageCache {
     const BUDGET_WORDS: usize = 64 * 1024 * 1024; // 256 MiB, separate from decoded chunks.
 
-    fn get(&mut self, key: &(PathBuf, u64, u32, u32), plan: &palace_core::gpu::PortableChunkPlan) -> Option<Vec<palace_core::gpu::PortableTensorPage>> {
-        let pages = self.entries.get(key)
+    fn get(
+        &mut self,
+        key: &(PathBuf, u64, u32, u32, u32),
+        plan: &palace_core::gpu::PortableChunkPlan,
+    ) -> Option<Vec<palace_core::gpu::PortableTensorPage>> {
+        let pages = self
+            .entries
+            .get(key)
             .and_then(|(cached_plan, pages)| (cached_plan == plan).then(|| pages.clone()));
         if pages.is_some() {
             self.hits += 1;
@@ -80,16 +91,24 @@ impl SessionPageCache {
         pages
     }
 
-    fn insert(&mut self, key: (PathBuf, u64, u32, u32), plan: &palace_core::gpu::PortableChunkPlan, pages: &[palace_core::gpu::PortableTensorPage]) {
+    fn insert(
+        &mut self,
+        key: (PathBuf, u64, u32, u32, u32),
+        plan: &palace_core::gpu::PortableChunkPlan,
+        pages: &[palace_core::gpu::PortableTensorPage],
+    ) {
         if let Some((_, old)) = self.entries.remove(&key) {
             self.total_words -= old.iter().map(|page| page.words().len()).sum::<usize>();
             self.order.retain(|held| *held != key);
         }
         self.total_words += pages.iter().map(|page| page.words().len()).sum::<usize>();
-        self.entries.insert(key.clone(), (plan.clone(), pages.to_vec()));
+        self.entries
+            .insert(key.clone(), (plan.clone(), pages.to_vec()));
         self.order.push_back(key);
         while self.total_words > Self::BUDGET_WORDS && self.order.len() > 1 {
-            let Some(oldest) = self.order.pop_front() else { break };
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
             if let Some((_, old)) = self.entries.remove(&oldest) {
                 self.total_words -= old.iter().map(|page| page.words().len()).sum::<usize>();
             }
@@ -103,16 +122,22 @@ impl SessionPageCache {
 
 impl Default for SessionPageCache {
     fn default() -> Self {
-        Self { entries: HashMap::new(), order: Default::default(), total_words: 0, hits: 0, misses: 0 }
+        Self {
+            entries: HashMap::new(),
+            order: Default::default(),
+            total_words: 0,
+            hits: 0,
+            misses: 0,
+        }
     }
 }
 
-/// Chunk words by (layer, level, source channel, chunk index), bounded in words, oldest out
+/// Chunk words by (layer, level, timepoint, source channel, chunk index), bounded in words, oldest out
 /// first; the newest chunk always lands so a frame can never starve.
 #[derive(Debug)]
 pub struct SessionChunkCache {
-    words: HashMap<(u64, u32, u32, u32), Arc<Vec<u32>>>,
-    order: std::collections::VecDeque<(u64, u32, u32, u32)>,
+    words: HashMap<(u64, u32, u32, u32, u32), Arc<Vec<u32>>>,
+    order: std::collections::VecDeque<(u64, u32, u32, u32, u32)>,
     total_words: usize,
     budget_words: usize,
     hits: u64,
@@ -124,16 +149,27 @@ impl SessionChunkCache {
     pub const DEFAULT_BUDGET_WORDS: usize = 128 * 1024 * 1024;
 
     pub fn new(budget_words: usize) -> Self {
-        Self { words: HashMap::new(), order: Default::default(), total_words: 0, budget_words, hits: 0, misses: 0 }
+        Self {
+            words: HashMap::new(),
+            order: Default::default(),
+            total_words: 0,
+            budget_words,
+            hits: 0,
+            misses: 0,
+        }
     }
 
-    fn get(&mut self, key: (u64, u32, u32, u32)) -> Option<Arc<Vec<u32>>> {
+    fn get(&mut self, key: (u64, u32, u32, u32, u32)) -> Option<Arc<Vec<u32>>> {
         let found = self.words.get(&key).cloned();
-        if found.is_some() { self.hits += 1 } else { self.misses += 1 }
+        if found.is_some() {
+            self.hits += 1
+        } else {
+            self.misses += 1
+        }
         found
     }
 
-    fn insert(&mut self, key: (u64, u32, u32, u32), words: Arc<Vec<u32>>) {
+    fn insert(&mut self, key: (u64, u32, u32, u32, u32), words: Arc<Vec<u32>>) {
         if let Some(previous) = self.words.insert(key, words.clone()) {
             self.total_words -= previous.len();
             self.order.retain(|k| *k != key);
@@ -141,7 +177,9 @@ impl SessionChunkCache {
         self.total_words += words.len();
         self.order.push_back(key);
         while self.total_words > self.budget_words && self.order.len() > 1 {
-            let Some(oldest) = self.order.pop_front() else { break };
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
             if let Some(evicted) = self.words.remove(&oldest) {
                 self.total_words -= evicted.len();
             }
@@ -314,7 +352,8 @@ impl LocalOmeZarrSource {
     }
 
     pub(crate) fn spatial_chunk_shape(&self, xyz: usize) -> u64 {
-        self.spatial_axis(xyz).map_or(1, |axis| self.chunk_shape[axis])
+        self.spatial_axis(xyz)
+            .map_or(1, |axis| self.chunk_shape[axis])
     }
 
     fn logical_extent_xyz(&self, extent: &[u64], xyz: usize) -> u64 {
@@ -541,14 +580,11 @@ impl LocalSession {
                 "default portable layer can only be prepared for an empty scene".into(),
             ));
         }
-        let root = self
-            .dataset_root
-            .clone()
-            .ok_or_else(|| {
-                SessionError::LayerSource(
-                    "open a local OME-Zarr dataset before preparing a layer".into(),
-                )
-            })?;
+        let root = self.dataset_root.clone().ok_or_else(|| {
+            SessionError::LayerSource(
+                "open a local OME-Zarr dataset before preparing a layer".into(),
+            )
+        })?;
         let metadata = self.metadata.clone().ok_or_else(|| {
             SessionError::LayerSource("opened dataset has no parsed metadata".into())
         })?;
@@ -672,7 +708,9 @@ impl LocalSession {
                         Some([
                             array.shape.get(axis("x")?)?.to_owned(),
                             array.shape.get(axis("y")?)?.to_owned(),
-                            axis("z").and_then(|index| array.shape.get(index).copied()).unwrap_or(1),
+                            axis("z")
+                                .and_then(|index| array.shape.get(index).copied())
+                                .unwrap_or(1),
                         ])
                     })
             });
@@ -725,6 +763,75 @@ impl LocalSession {
         self.depth_scale.get()
     }
 
+    /// Number of timepoints in the base image. A dataset without a T axis has one timepoint.
+    pub fn timepoint_count(&self) -> u32 {
+        self.layer_sources
+            .get(&LayerId(0))
+            .and_then(|source| source.time_axis.map(|axis| source.shape[axis as usize]))
+            .and_then(|count| u32::try_from(count).ok())
+            .unwrap_or(1)
+            .max(1)
+    }
+
+    pub fn timepoint(&self) -> u32 {
+        self.layer_sources
+            .get(&LayerId(0))
+            .map_or(0, |source| source.timepoint)
+    }
+
+    /// Select a scene-wide timepoint. Static layers without a T axis remain at their sole image;
+    /// time-varying added layers must contain the selected index so layers stay synchronized.
+    pub fn set_timepoint(&mut self, timepoint: u32) -> Result<(), SessionError> {
+        for source in self.layer_sources.values() {
+            if let Some(axis) = source.time_axis {
+                let count = source.shape[axis as usize];
+                if u64::from(timepoint) >= count {
+                    return Err(SessionError::LayerSource(format!(
+                        "timepoint {timepoint} is outside layer extent {count}"
+                    )));
+                }
+            }
+        }
+        for source in self.layer_sources.values_mut() {
+            if source.time_axis.is_some() {
+                source.timepoint = timepoint;
+            }
+        }
+        Ok(())
+    }
+
+    /// Finest-level spatial calibration in XYZ order and the declared unit of each axis.
+    pub fn spatial_calibration(&self) -> Result<([f64; 3], [Option<String>; 3]), SessionError> {
+        let metadata = self.metadata.as_ref().ok_or_else(|| {
+            SessionError::LayerSource("opened dataset has no parsed metadata".into())
+        })?;
+        let multiscale = metadata.multiscales.first().ok_or_else(|| {
+            SessionError::LayerSource("dataset has no multiscale metadata".into())
+        })?;
+        let transform = portable_axis_aligned_transform(multiscale, 0)?;
+        let units = std::array::from_fn(|output_axis| {
+            let name = ["x", "y", "z"][output_axis];
+            multiscale
+                .axes
+                .iter()
+                .find(|axis| axis.name.eq_ignore_ascii_case(name))
+                .and_then(|axis| axis.unit.clone())
+        });
+        let spacing = std::array::from_fn(|axis| {
+            if units[axis].is_some()
+                || multiscale
+                    .axes
+                    .iter()
+                    .any(|candidate| candidate.name.eq_ignore_ascii_case(["x", "y", "z"][axis]))
+            {
+                transform.scale[axis].abs()
+            } else {
+                1.0
+            }
+        });
+        Ok((spacing, units))
+    }
+
     pub fn set_depth_scale(&mut self, scale: f32) -> Result<(), SessionError> {
         self.depth_scale = DepthScale::new(scale).ok_or_else(|| {
             SessionError::LayerSource(format!(
@@ -742,7 +849,10 @@ impl LocalSession {
             .iter()
             .filter(|layer| layer.kind == newvolim_scene::LayerKind::Image)
             .map(|layer| {
-                let metadata = self.layer_dataset(layer.id).ok().map(|(_, metadata)| metadata);
+                let metadata = self
+                    .layer_dataset(layer.id)
+                    .ok()
+                    .map(|(_, metadata)| metadata);
                 LayerChannelSummary {
                     layer_id: layer.id.0,
                     name: layer.name.clone(),
@@ -886,13 +996,25 @@ impl LocalSession {
 
     /// Project QuPath's level-zero XY annotations into this session's physical scene. The
     /// browser editor keeps QuPath GeoJSON as the authority; the scene is the 3D display copy.
-    pub fn set_qupath_annotations(&mut self, items: &[QuPathAnnotation]) -> Result<(), SessionError> {
-        let existing = self.scene.annotations().iter().map(|item| item.id).collect::<Vec<_>>();
-        for id in existing { self.scene.remove_annotation(id); }
+    pub fn set_qupath_annotations(
+        &mut self,
+        items: &[QuPathAnnotation],
+    ) -> Result<(), SessionError> {
+        let existing = self
+            .scene
+            .annotations()
+            .iter()
+            .map(|item| item.id)
+            .collect::<Vec<_>>();
+        for id in existing {
+            self.scene.remove_annotation(id);
+        }
         let mut next_id = 0_u64;
         let shape_z = self.voxel_shape_xyz.map(|shape| shape[2]).unwrap_or(0);
         for item in items {
-            if item.plane.z < 0 || item.plane.z as u64 >= shape_z { continue; }
+            if item.plane.z < 0 || item.plane.z as u64 >= shape_z {
+                continue;
+            }
             let z = item.plane.z as f64 + 0.5;
             let end_plane = (item.plane.z as u64 + item.z_extent as u64).min(shape_z - 1);
             let end_z = end_plane as f64 + 0.5;
@@ -904,11 +1026,18 @@ impl LocalSession {
                 }
                 for geometry in display {
                     let converted = Annotation::new(
-                        AnnotationId(next_id), item.display_name(), geometry,
+                        AnnotationId(next_id),
+                        item.display_name(),
+                        geometry,
                         item.effective_color().unwrap_or([51, 230, 255]),
-                    ).map_err(|error| SessionError::Annotation(error.to_string()))?;
-                    self.scene.insert_annotation(converted).map_err(|error| SessionError::Annotation(error.to_string()))?;
-                    next_id = next_id.checked_add(1).ok_or_else(|| SessionError::Annotation("annotation IDs exhausted".into()))?;
+                    )
+                    .map_err(|error| SessionError::Annotation(error.to_string()))?;
+                    self.scene
+                        .insert_annotation(converted)
+                        .map_err(|error| SessionError::Annotation(error.to_string()))?;
+                    next_id = next_id.checked_add(1).ok_or_else(|| {
+                        SessionError::Annotation("annotation IDs exhausted".into())
+                    })?;
                 }
             }
         }
@@ -919,65 +1048,132 @@ impl LocalSession {
     /// A Z-spanning QuPath shape becomes two planar end caps and vertical edges in the 3D
     /// overlay. A long freehand path uses sampled vertical edges to keep the projected packet
     /// bounded independently of the number of Z slices it covers.
-    fn qupath_span_connectors(&self, geometry: &QuPathGeometry, z0: f64, z1: f64) -> Result<Vec<AnnotationGeometry>, SessionError> {
+    fn qupath_span_connectors(
+        &self,
+        geometry: &QuPathGeometry,
+        z0: f64,
+        z1: f64,
+    ) -> Result<Vec<AnnotationGeometry>, SessionError> {
         let mut points = geometry.markers();
         for path in geometry.outlines() {
-            let vertices = if path.len() > 1 && path.first() == path.last() { &path[..path.len()-1] } else { &path[..] };
-            if vertices.is_empty() { continue; }
+            let vertices = if path.len() > 1 && path.first() == path.last() {
+                &path[..path.len() - 1]
+            } else {
+                &path[..]
+            };
+            if vertices.is_empty() {
+                continue;
+            }
             let stride = vertices.len().div_ceil(64);
             points.extend(vertices.iter().step_by(stride).copied());
         }
-        points.into_iter().map(|point| {
-            Ok(AnnotationGeometry::Polyline(vec![
-                self.voxel_point_physical_f64([point[0], point[1], z0])?,
-                self.voxel_point_physical_f64([point[0], point[1], z1])?,
-            ]))
-        }).collect()
+        points
+            .into_iter()
+            .map(|point| {
+                Ok(AnnotationGeometry::Polyline(vec![
+                    self.voxel_point_physical_f64([point[0], point[1], z0])?,
+                    self.voxel_point_physical_f64([point[0], point[1], z1])?,
+                ]))
+            })
+            .collect()
     }
 
-    fn qupath_scene_geometry(&self, geometry: &QuPathGeometry, z: f64) -> Result<Vec<AnnotationGeometry>, SessionError> {
+    fn qupath_scene_geometry(
+        &self,
+        geometry: &QuPathGeometry,
+        z: f64,
+    ) -> Result<Vec<AnnotationGeometry>, SessionError> {
         let physical = |point: [f64; 2]| self.voxel_point_physical_f64([point[0], point[1], z]);
-        let line = |points: &[[f64; 2]]| points.iter().copied().map(physical).collect::<Result<Vec<_>, _>>();
+        let line = |points: &[[f64; 2]]| {
+            points
+                .iter()
+                .copied()
+                .map(physical)
+                .collect::<Result<Vec<_>, _>>()
+        };
         let mut out = Vec::new();
         match geometry {
             QuPathGeometry::Point(point) => out.push(AnnotationGeometry::Point(physical(*point)?)),
-            QuPathGeometry::MultiPoint(points) => for point in points { out.push(AnnotationGeometry::Point(physical(*point)?)); },
-            QuPathGeometry::LineString(points) => if points.len() >= 2 { out.push(AnnotationGeometry::Polyline(line(points)?)); },
-            QuPathGeometry::MultiLineString(lines) => for points in lines { if points.len() >= 2 { out.push(AnnotationGeometry::Polyline(line(points)?)); } },
+            QuPathGeometry::MultiPoint(points) => {
+                for point in points {
+                    out.push(AnnotationGeometry::Point(physical(*point)?));
+                }
+            }
+            QuPathGeometry::LineString(points) => {
+                if points.len() >= 2 {
+                    out.push(AnnotationGeometry::Polyline(line(points)?));
+                }
+            }
+            QuPathGeometry::MultiLineString(lines) => {
+                for points in lines {
+                    if points.len() >= 2 {
+                        out.push(AnnotationGeometry::Polyline(line(points)?));
+                    }
+                }
+            }
             QuPathGeometry::Polygon(rings) => {
                 for (index, ring) in rings.iter().enumerate() {
                     if ring.len() >= 3 {
                         let points = line(ring)?;
-                        out.push(if index == 0 { AnnotationGeometry::Polygon(points) } else { AnnotationGeometry::Polyline(points) });
+                        out.push(if index == 0 {
+                            AnnotationGeometry::Polygon(points)
+                        } else {
+                            AnnotationGeometry::Polyline(points)
+                        });
                     }
                 }
             }
-            QuPathGeometry::MultiPolygon(polygons) => for rings in polygons {
-                out.extend(self.qupath_scene_geometry(&QuPathGeometry::Polygon(rings.clone()), z)?);
-            },
+            QuPathGeometry::MultiPolygon(polygons) => {
+                for rings in polygons {
+                    out.extend(
+                        self.qupath_scene_geometry(&QuPathGeometry::Polygon(rings.clone()), z)?,
+                    );
+                }
+            }
         }
         Ok(out)
     }
 
     /// Map a continuous level-zero XYZ voxel coordinate through the declared NGFF transform.
     pub fn voxel_point_physical_f64(&self, voxel_xyz: [f64; 3]) -> Result<[f64; 3], SessionError> {
-        let metadata = self.metadata.as_ref().ok_or_else(|| SessionError::Annotation("open an OME-Zarr dataset first".into()))?;
-        let multiscale = metadata.multiscales.first().ok_or_else(|| SessionError::Annotation("dataset has no multiscale metadata".into()))?;
-        let axis = |name: &str| multiscale.axes.iter().position(|axis| axis.name.eq_ignore_ascii_case(name));
+        let metadata = self
+            .metadata
+            .as_ref()
+            .ok_or_else(|| SessionError::Annotation("open an OME-Zarr dataset first".into()))?;
+        let multiscale = metadata
+            .multiscales
+            .first()
+            .ok_or_else(|| SessionError::Annotation("dataset has no multiscale metadata".into()))?;
+        let axis = |name: &str| {
+            multiscale
+                .axes
+                .iter()
+                .position(|axis| axis.name.eq_ignore_ascii_case(name))
+        };
         let (x, y, z) = (
-            axis("x").ok_or_else(|| SessionError::Annotation("multiscale lacks an x axis".into()))?,
-            axis("y").ok_or_else(|| SessionError::Annotation("multiscale lacks a y axis".into()))?,
+            axis("x")
+                .ok_or_else(|| SessionError::Annotation("multiscale lacks an x axis".into()))?,
+            axis("y")
+                .ok_or_else(|| SessionError::Annotation("multiscale lacks a y axis".into()))?,
             axis("z"),
         );
         let mut point = vec![0.0; multiscale.axes.len()];
-        point[x] = voxel_xyz[0]; point[y] = voxel_xyz[1];
-        if let Some(z) = z { point[z] = voxel_xyz[2]; }
-        let transformed = level_transform(multiscale, 0).and_then(|transform| transform.apply(&point))
+        point[x] = voxel_xyz[0];
+        point[y] = voxel_xyz[1];
+        if let Some(z) = z {
+            point[z] = voxel_xyz[2];
+        }
+        let transformed = level_transform(multiscale, 0)
+            .and_then(|transform| transform.apply(&point))
             .map_err(|error| SessionError::Annotation(error.to_string()))?;
         let physical_z = match z {
             Some(z) => transformed[z],
-            None => voxel_xyz[2] * portable_axis_aligned_transform(multiscale, 0)
-                .map_err(|error| SessionError::Annotation(error.to_string()))?.scale[2],
+            None => {
+                voxel_xyz[2]
+                    * portable_axis_aligned_transform(multiscale, 0)
+                        .map_err(|error| SessionError::Annotation(error.to_string()))?
+                        .scale[2]
+            }
         };
         Ok([transformed[x], transformed[y], physical_z])
     }
@@ -1070,7 +1266,8 @@ impl LocalSession {
             .into_iter()
             .map(|request| {
                 let (root, metadata) = self.layer_dataset(request.layer.layer_id)?;
-                let source = LocalOmeZarrSource::for_level(root, metadata, level)?;
+                let mut source = LocalOmeZarrSource::for_level(root, metadata, level)?;
+                source.timepoint = request.source.timepoint;
                 let channel_count = source
                     .channel_axis
                     .map(|axis| source.shape[axis as usize])
@@ -1111,7 +1308,8 @@ impl LocalSession {
             .zip(levels)
             .map(|(request, &level)| {
                 let (root, metadata) = self.layer_dataset(request.layer.layer_id)?;
-                let source = LocalOmeZarrSource::for_level(root, metadata, level)?;
+                let mut source = LocalOmeZarrSource::for_level(root, metadata, level)?;
+                source.timepoint = request.source.timepoint;
                 let channel_count = source
                     .channel_axis
                     .map(|axis| source.shape[axis as usize])
@@ -1144,7 +1342,13 @@ impl LocalSession {
         let requests = self.local_layer_render_requests(limits)?;
         let levels = requests
             .iter()
-            .map(|request| if request.layer.layer_id == layer_id { level } else { 0 })
+            .map(|request| {
+                if request.layer.layer_id == layer_id {
+                    level
+                } else {
+                    0
+                }
+            })
             .collect::<Vec<_>>();
         let request = self
             .local_layer_render_requests_at_levels(limits, &levels)?
@@ -1153,7 +1357,8 @@ impl LocalSession {
             .ok_or_else(|| {
                 SessionError::LayerSource(format!("layer {} is not in the render plan", layer_id.0))
             })?;
-        let mut plans = self.chunk_plan_for_chunks(vec![request], chunks_xyz, max_chunk_addresses)?;
+        let mut plans =
+            self.chunk_plan_for_chunks(vec![request], chunks_xyz, max_chunk_addresses)?;
         plans.pop().ok_or_else(|| {
             SessionError::LayerSource("layer chunk planning produced no plan".into())
         })
@@ -1216,7 +1421,10 @@ impl LocalSession {
     }
 
     /// Shared physical unit of an image layer's X and Y axes, when both declare the same unit.
-    pub fn portable_layer_xy_unit(&self, layer_id: LayerId) -> Result<Option<String>, SessionError> {
+    pub fn portable_layer_xy_unit(
+        &self,
+        layer_id: LayerId,
+    ) -> Result<Option<String>, SessionError> {
         let (_, metadata) = self.layer_dataset(layer_id)?;
         let multiscale = metadata.multiscales.first().ok_or_else(|| {
             SessionError::LayerSource("dataset has no multiscale metadata".into())
@@ -1811,7 +2019,10 @@ impl LocalSession {
     /// would silently read a neighbour's scalars through the residency map.
     /// The chunk cache's `(hits, misses, chunks, words)`.
     pub fn chunk_cache_stats(&self) -> (u64, u64, usize, usize) {
-        self.chunk_words.lock().map(|cache| cache.stats()).unwrap_or((0, 0, 0, 0))
+        self.chunk_words
+            .lock()
+            .map(|cache| cache.stats())
+            .unwrap_or((0, 0, 0, 0))
     }
 
     pub fn packed_pages_for_plan(
@@ -1821,8 +2032,19 @@ impl LocalSession {
         channel: u32,
         plan: &palace_core::gpu::PortableChunkPlan,
     ) -> Result<Option<Vec<palace_core::gpu::PortableTensorPage>>, SessionError> {
-        let key = (self.layer_dataset(layer_id)?.0.to_path_buf(), layer_id.0, level, channel);
-        self.packed_pages.lock()
+        let timepoint = self
+            .layer_sources
+            .get(&layer_id)
+            .map_or(0, |source| source.timepoint);
+        let key = (
+            self.layer_dataset(layer_id)?.0.to_path_buf(),
+            layer_id.0,
+            level,
+            timepoint,
+            channel,
+        );
+        self.packed_pages
+            .lock()
             .map_err(|_| SessionError::LayerSource("page cache lock was poisoned".into()))
             .map(|mut cache| cache.get(&key, plan))
     }
@@ -1835,15 +2057,30 @@ impl LocalSession {
         plan: &palace_core::gpu::PortableChunkPlan,
         pages: &[palace_core::gpu::PortableTensorPage],
     ) -> Result<(), SessionError> {
-        let key = (self.layer_dataset(layer_id)?.0.to_path_buf(), layer_id.0, level, channel);
-        let mut cache = self.packed_pages.lock()
+        let timepoint = self
+            .layer_sources
+            .get(&layer_id)
+            .map_or(0, |source| source.timepoint);
+        let key = (
+            self.layer_dataset(layer_id)?.0.to_path_buf(),
+            layer_id.0,
+            level,
+            timepoint,
+            channel,
+        );
+        let mut cache = self
+            .packed_pages
+            .lock()
             .map_err(|_| SessionError::LayerSource("page cache lock was poisoned".into()))?;
         cache.insert(key, plan, pages);
         Ok(())
     }
 
     pub fn page_cache_stats(&self) -> (u64, u64, usize, usize) {
-        self.packed_pages.lock().map(|cache| cache.stats()).unwrap_or((0, 0, 0, 0))
+        self.packed_pages
+            .lock()
+            .map(|cache| cache.stats())
+            .unwrap_or((0, 0, 0, 0))
     }
 
     /// The words of the named chunks (grid indices, X fastest) of one layer, level and source
@@ -1857,7 +2094,11 @@ impl LocalSession {
         channel: u32,
         chunk_indices: &[u32],
     ) -> Result<Vec<Arc<Vec<u32>>>, SessionError> {
-        let key = |index: u32| (layer_id.0, level, channel, index);
+        let timepoint = self
+            .layer_sources
+            .get(&layer_id)
+            .map_or(0, |source| source.timepoint);
+        let key = |index: u32| (layer_id.0, level, timepoint, channel, index);
         let mut found: HashMap<u32, Arc<Vec<u32>>> = HashMap::new();
         let mut missing: Vec<u32> = Vec::new();
         {
@@ -1882,29 +2123,60 @@ impl LocalSession {
                 .local_layer_render_requests_at_level(limits, level)?
                 .into_iter()
                 .find(|request| request.layer.layer_id == layer_id)
-                .ok_or_else(|| SessionError::LayerSource(format!("layer {} is not in the render plan", layer_id.0)))?;
+                .ok_or_else(|| {
+                    SessionError::LayerSource(format!(
+                        "layer {} is not in the render plan",
+                        layer_id.0
+                    ))
+                })?;
             let source = &request.source;
             let counts: [u64; 3] = std::array::from_fn(|axis| {
-                source.spatial_shape(axis).div_ceil(source.spatial_chunk_shape(axis).max(1))
+                source
+                    .spatial_shape(axis)
+                    .div_ceil(source.spatial_chunk_shape(axis).max(1))
             });
             let coordinates: Vec<[u64; 3]> = missing
                 .iter()
                 .map(|&index| {
                     let index = u64::from(index);
-                    [index % counts[0], (index / counts[0]) % counts[1], index / (counts[0] * counts[1])]
+                    [
+                        index % counts[0],
+                        (index / counts[0]) % counts[1],
+                        index / (counts[0] * counts[1]),
+                    ]
                 })
                 .collect();
-            let plan = self.layer_chunk_plan_for_chunks_at_level(limits, layer_id, level, &coordinates, 4_096)?;
-            let loaded = self.read_local_layer_chunks(std::slice::from_ref(&plan), 16 * 1024 * 1024, 256 * 1024 * 1024)?;
+            let plan = self.layer_chunk_plan_for_chunks_at_level(
+                limits,
+                layer_id,
+                level,
+                &coordinates,
+                4_096,
+            )?;
+            let loaded = self.read_local_layer_chunks(
+                std::slice::from_ref(&plan),
+                16 * 1024 * 1024,
+                256 * 1024 * 1024,
+            )?;
             let [x_count, y_count, _] = counts.map(|count| count as u32);
             let mut cache = self
                 .chunk_words
                 .lock()
                 .map_err(|_| SessionError::LayerSource("chunk cache lock was poisoned".into()))?;
             for entry in &loaded {
-                let Some(index) = linear_chunk_index(entry.address.spatial_chunk_xyz, x_count, y_count) else { continue };
+                let Some(index) =
+                    linear_chunk_index(entry.address.spatial_chunk_xyz, x_count, y_count)
+                else {
+                    continue;
+                };
                 let words = Arc::new(portable_words_xyz(&entry.bytes, &entry.address, source)?);
-                let entry_key = (layer_id.0, level, entry.address.channel, index);
+                let entry_key = (
+                    layer_id.0,
+                    level,
+                    entry.address.timepoint,
+                    entry.address.channel,
+                    index,
+                );
                 cache.insert(entry_key, words.clone());
                 if entry.address.channel == channel {
                     found.insert(index, words);
@@ -1914,10 +2186,11 @@ impl LocalSession {
         chunk_indices
             .iter()
             .map(|index| {
-                found
-                    .get(index)
-                    .cloned()
-                    .ok_or_else(|| SessionError::LayerSource(format!("chunk {index} of channel {channel} was not read")))
+                found.get(index).cloned().ok_or_else(|| {
+                    SessionError::LayerSource(format!(
+                        "chunk {index} of channel {channel} was not read"
+                    ))
+                })
             })
             .collect()
     }
@@ -1941,7 +2214,8 @@ impl LocalSession {
     ) -> Result<Vec<Vec<u32>>, SessionError> {
         let source = &plan.request.source;
         let dimensions: [u32; 3] = std::array::from_fn(|axis| source.spatial_shape(axis) as u32);
-        let chunk_shape: [u32; 3] = std::array::from_fn(|axis| source.spatial_chunk_shape(axis) as u32);
+        let chunk_shape: [u32; 3] =
+            std::array::from_fn(|axis| source.spatial_chunk_shape(axis) as u32);
         if chunk_plan.grid().dimensions_xyz() != dimensions
             || chunk_plan.grid().chunk_shape_xyz() != chunk_shape
         {
@@ -1971,9 +2245,7 @@ impl LocalSession {
             let expected = planned
                 .logical_xyz
                 .iter()
-                .try_fold(1_usize, |count, extent| {
-                    count.checked_mul(*extent as usize)
-                })
+                .try_fold(1_usize, |count, extent| count.checked_mul(*extent as usize))
                 .ok_or_else(|| {
                     SessionError::LayerSource("planned chunk word count overflows usize".into())
                 })?;
@@ -2245,10 +2517,21 @@ impl LocalSession {
             .multiscales
             .first()
             .ok_or_else(|| SessionError::Annotation("dataset has no multiscale metadata".into()))?;
-        let axis = |name: &str| multiscale.axes.iter().position(|candidate| candidate.name.eq_ignore_ascii_case(name));
+        let axis = |name: &str| {
+            multiscale
+                .axes
+                .iter()
+                .position(|candidate| candidate.name.eq_ignore_ascii_case(name))
+        };
         let xyz = [
-            Some(axis("x").ok_or_else(|| SessionError::Annotation("multiscale lacks an x axis".into()))?),
-            Some(axis("y").ok_or_else(|| SessionError::Annotation("multiscale lacks a y axis".into()))?),
+            Some(
+                axis("x")
+                    .ok_or_else(|| SessionError::Annotation("multiscale lacks an x axis".into()))?,
+            ),
+            Some(
+                axis("y")
+                    .ok_or_else(|| SessionError::Annotation("multiscale lacks a y axis".into()))?,
+            ),
             axis("z"),
         ];
         let mut voxel_origin = vec![0.0; multiscale.axes.len()];
@@ -2268,7 +2551,8 @@ impl LocalSession {
             .apply(&voxel_endpoint)
             .map_err(|error| SessionError::Annotation(error.to_string()))?;
         let virtual_z_scale = portable_axis_aligned_transform(multiscale, 0)
-            .map_err(|error| SessionError::Annotation(error.to_string()))?.scale[2];
+            .map_err(|error| SessionError::Annotation(error.to_string()))?
+            .scale[2];
         let origin = std::array::from_fn(|component| match xyz[component] {
             Some(axis) => physical_origin[axis],
             None => origin_xyz[component] * virtual_z_scale,
@@ -2318,21 +2602,34 @@ impl LocalSession {
             .multiscales
             .first()
             .ok_or_else(|| SessionError::Annotation("dataset has no multiscale metadata".into()))?;
-        let axis_index = |name: &str| multiscale.axes.iter().position(|axis| axis.name.eq_ignore_ascii_case(name));
-        let x = axis_index("x").ok_or_else(|| SessionError::Annotation("multiscale lacks an x axis".into()))?;
-        let y = axis_index("y").ok_or_else(|| SessionError::Annotation("multiscale lacks a y axis".into()))?;
+        let axis_index = |name: &str| {
+            multiscale
+                .axes
+                .iter()
+                .position(|axis| axis.name.eq_ignore_ascii_case(name))
+        };
+        let x = axis_index("x")
+            .ok_or_else(|| SessionError::Annotation("multiscale lacks an x axis".into()))?;
+        let y = axis_index("y")
+            .ok_or_else(|| SessionError::Annotation("multiscale lacks a y axis".into()))?;
         let z = axis_index("z");
         let mut world = vec![0.0; multiscale.axes.len()];
         world[x] = physical[0];
         world[y] = physical[1];
-        if let Some(z) = z { world[z] = physical[2]; }
+        if let Some(z) = z {
+            world[z] = physical[2];
+        }
         let voxel = level_transform(multiscale, 0)
             .and_then(|transform| transform.inverse_apply(&world))
             .map_err(|error| SessionError::Annotation(error.to_string()))?;
         let voxel_z = match z {
             Some(z) => voxel[z],
-            None => physical[2] / portable_axis_aligned_transform(multiscale, 0)
-                .map_err(|error| SessionError::Annotation(error.to_string()))?.scale[2],
+            None => {
+                physical[2]
+                    / portable_axis_aligned_transform(multiscale, 0)
+                        .map_err(|error| SessionError::Annotation(error.to_string()))?
+                        .scale[2]
+            }
         };
         let xyz = [voxel[x], voxel[y], voxel_z];
         if xyz.iter().any(|value| !value.is_finite() || *value < 0.0) {
@@ -2634,21 +2931,34 @@ impl LocalSession {
                 "dataset has no level-zero array metadata".into(),
             ));
         }
-        let axis_index = |name: &str| multiscale.axes.iter().position(|axis| axis.name.eq_ignore_ascii_case(name));
-        let x = axis_index("x").ok_or_else(|| SessionError::Annotation("multiscale lacks an x axis".into()))?;
-        let y = axis_index("y").ok_or_else(|| SessionError::Annotation("multiscale lacks a y axis".into()))?;
+        let axis_index = |name: &str| {
+            multiscale
+                .axes
+                .iter()
+                .position(|axis| axis.name.eq_ignore_ascii_case(name))
+        };
+        let x = axis_index("x")
+            .ok_or_else(|| SessionError::Annotation("multiscale lacks an x axis".into()))?;
+        let y = axis_index("y")
+            .ok_or_else(|| SessionError::Annotation("multiscale lacks a y axis".into()))?;
         let z = axis_index("z");
         let mut point = vec![0.0; multiscale.axes.len()];
         point[x] = voxel_xyz[0] as f64;
         point[y] = voxel_xyz[1] as f64;
-        if let Some(z) = z { point[z] = voxel_xyz[2] as f64; }
+        if let Some(z) = z {
+            point[z] = voxel_xyz[2] as f64;
+        }
         let transformed = level_transform(multiscale, 0)
             .and_then(|transform| transform.apply(&point))
             .map_err(|error| SessionError::Annotation(error.to_string()))?;
         let physical_z = match z {
             Some(z) => transformed[z],
-            None => voxel_xyz[2] as f64 * portable_axis_aligned_transform(multiscale, 0)
-                .map_err(|error| SessionError::Annotation(error.to_string()))?.scale[2],
+            None => {
+                voxel_xyz[2] as f64
+                    * portable_axis_aligned_transform(multiscale, 0)
+                        .map_err(|error| SessionError::Annotation(error.to_string()))?
+                        .scale[2]
+            }
         };
         Ok([transformed[x], transformed[y], physical_z])
     }
@@ -2672,15 +2982,12 @@ impl LocalOmeZarrSource {
         let multiscale = metadata.multiscales.first().ok_or_else(|| {
             SessionError::LayerSource("dataset has no multiscale metadata".into())
         })?;
-        let dataset = multiscale
-            .datasets
-            .get(level as usize)
-            .ok_or_else(|| {
-                SessionError::LayerSource(format!(
-                    "dataset declares {} levels, so level {level} does not exist",
-                    multiscale.datasets.len()
-                ))
-            })?;
+        let dataset = multiscale.datasets.get(level as usize).ok_or_else(|| {
+            SessionError::LayerSource(format!(
+                "dataset declares {} levels, so level {level} does not exist",
+                multiscale.datasets.len()
+            ))
+        })?;
         let array = read_array_info(root, &dataset.path)?;
         let array_directory = root.join(&dataset.path);
         let chunk_key_encoding = if array_directory.join("zarr.json").is_file() {
@@ -2808,9 +3115,10 @@ fn image_layer_for_dataset(
     level: u32,
 ) -> Result<(Layer, LocalOmeZarrSource), SessionError> {
     let source = LocalOmeZarrSource::for_level(root, metadata, level)?;
-    let multiscale = metadata.multiscales.first().ok_or_else(|| {
-        SessionError::LayerSource("dataset has no multiscale metadata".into())
-    })?;
+    let multiscale = metadata
+        .multiscales
+        .first()
+        .ok_or_else(|| SessionError::LayerSource("dataset has no multiscale metadata".into()))?;
     let transform = portable_axis_aligned_transform(multiscale, level as usize)?;
     let channel_count = source
         .channel_axis
@@ -2892,11 +3200,15 @@ fn image_layer_for_dataset(
             let window = display
                 .and_then(|channel| channel.window)
                 .map(|window| [window.start, window.end])
+                .or_else(|| {
+                    estimate_channel_window(root, metadata, index)
+                        .ok()
+                        .flatten()
+                })
                 .unwrap_or([0.0, dtype_max]);
-            let selected_window =
-                ChannelWindow::new(window[0], window[1]).map_err(|error| {
-                    SessionError::LayerSource(format!("invalid OME display window: {error}"))
-                })?;
+            let selected_window = ChannelWindow::new(window[0], window[1]).map_err(|error| {
+                SessionError::LayerSource(format!("invalid OME display window: {error}"))
+            })?;
             ChannelState::new(
                 enabled,
                 color_srgb,
@@ -2913,16 +3225,107 @@ fn image_layer_for_dataset(
     Ok((Layer::image(layer_id, name, transform, channels), source))
 }
 
+/// Estimate a useful display window from a bounded region of the coarsest pyramid array.
+/// Coarsest-level sampling represents the whole image cheaply and avoids making initial dataset
+/// opening proportional to the finest array. The 0.5/99.5 percentiles reject isolated hot pixels;
+/// degenerate sparse or constant samples fall back to their actual range.
+fn estimate_channel_window(
+    root: &Path,
+    metadata: &DatasetMetadata,
+    channel: usize,
+) -> Result<Option<[f64; 2]>, SessionError> {
+    const MAX_SAMPLE_WORDS: u64 = 1_048_576;
+    let multiscale = metadata
+        .multiscales
+        .first()
+        .ok_or_else(|| SessionError::LayerSource("dataset has no multiscale metadata".into()))?;
+    let level = multiscale
+        .datasets
+        .len()
+        .checked_sub(1)
+        .ok_or_else(|| SessionError::LayerSource("multiscale has no dataset levels".into()))?;
+    let source = LocalOmeZarrSource::for_level(root, metadata, level as u32)?;
+    if source
+        .channel_axis
+        .is_some_and(|axis| channel as u64 >= source.shape[axis as usize])
+    {
+        return Ok(None);
+    }
+    let mut start = vec![0_u64; source.shape.len()];
+    let mut extent = source.shape.clone();
+    if let Some(axis) = source.channel_axis {
+        start[axis as usize] = channel as u64;
+        extent[axis as usize] = 1;
+    } else if channel != 0 {
+        return Ok(None);
+    }
+    if let Some(axis) = source.time_axis {
+        extent[axis as usize] = 1;
+    }
+    while extent
+        .iter()
+        .try_fold(1_u64, |n, value| n.checked_mul(*value))
+        .unwrap_or(u64::MAX)
+        > MAX_SAMPLE_WORDS
+    {
+        let Some(axis) = (0..extent.len())
+            .filter(|axis| {
+                Some(*axis as u32) != source.channel_axis && Some(*axis as u32) != source.time_axis
+            })
+            .max_by_key(|axis| extent[*axis])
+        else {
+            break;
+        };
+        let next = extent[axis].div_ceil(2).max(1);
+        start[axis] = (source.shape[axis] - next) / 2;
+        extent[axis] = next;
+    }
+    let bytes = read_array_region(root, &source.array_path, &start, &extent).map_err(|error| {
+        SessionError::LayerSource(format!("automatic contrast sample: {error}"))
+    })?;
+    let mut values = portable_words(&bytes, &source.dtype)?;
+    if values.is_empty() {
+        return Ok(None);
+    }
+    values.sort_unstable();
+    let last = values.len().saturating_sub(1);
+    let mut low = values[(last * 5) / 1000] as f64;
+    let mut high = values[(last * 995).div_ceil(1000)] as f64;
+    if high <= low {
+        low = values[0] as f64;
+        high = *values.last().unwrap_or(&values[0]) as f64;
+    }
+    if high <= low {
+        if high > 0.0 {
+            low = 0.0;
+        } else {
+            return Ok(None);
+        }
+    }
+    Ok((low.is_finite() && high.is_finite() && low < high).then_some([low, high]))
+}
+
 fn portable_axis_aligned_transform(
     multiscale: &Multiscale,
     level: usize,
 ) -> Result<LayerTransform, SessionError> {
     let transform = level_transform(multiscale, level)
         .map_err(|error| SessionError::LayerSource(error.to_string()))?;
-    let axis = |name: &str| multiscale.axes.iter().position(|candidate| candidate.name.eq_ignore_ascii_case(name));
+    let axis = |name: &str| {
+        multiscale
+            .axes
+            .iter()
+            .position(|candidate| candidate.name.eq_ignore_ascii_case(name))
+    };
     let xyz = [
-        Some(axis("x").ok_or_else(|| SessionError::LayerSource("multiscale lacks an x axis".into()))?),
-        Some(axis("y").ok_or_else(|| SessionError::LayerSource("multiscale lacks a y axis".into()))?),
+        Some(
+            axis("x")
+                .ok_or_else(|| SessionError::LayerSource("multiscale lacks an x axis".into()))?,
+        ),
+        Some(
+            axis("y")
+                .ok_or_else(|| SessionError::LayerSource("multiscale lacks a y axis".into()))?,
+        ),
         axis("z"),
     ];
     let matrix = transform.matrix();
@@ -2977,11 +3380,70 @@ fn default_channel_color(index: usize) -> [u8; 3] {
 fn color_from_channel_name(label: &str) -> Option<[u8; 3]> {
     let name = label.to_ascii_lowercase();
     const RULES: &[(&[&str], [u8; 3])] = &[
-        (&["dapi", "hoechst", "draq5", "draq 5", "to-pro-3", "topro3", "nucblue", "nuclear", "nuclei"], [25, 63, 255]),
-        (&["fitc", "gfp", "egfp", "yfp", "alexa 488", "alexa488", "af488", "fluor 488", "cy2"], [0, 255, 0]),
-        (&["cy3", "tritc", "alexa 555", "alexa555", "af555", "alexa 568", "alexa568", "af568", "fluor 555", "fluor 568"], [255, 114, 0]),
-        (&["rfp", "dsred", "mcherry", "tdtomato", "texas red", "alexa 594", "alexa594", "af594", "fluor 594"], [255, 0, 0]),
-        (&["cy5", "alexa 647", "alexa647", "af647", "fluor 647", "cy5.5", "alexa 660", "alexa660", "af660"], [255, 0, 255]),
+        (
+            &[
+                "dapi", "hoechst", "draq5", "draq 5", "to-pro-3", "topro3", "nucblue", "nuclear",
+                "nuclei",
+            ],
+            [25, 63, 255],
+        ),
+        (
+            &[
+                "fitc",
+                "gfp",
+                "egfp",
+                "yfp",
+                "alexa 488",
+                "alexa488",
+                "af488",
+                "fluor 488",
+                "cy2",
+            ],
+            [0, 255, 0],
+        ),
+        (
+            &[
+                "cy3",
+                "tritc",
+                "alexa 555",
+                "alexa555",
+                "af555",
+                "alexa 568",
+                "alexa568",
+                "af568",
+                "fluor 555",
+                "fluor 568",
+            ],
+            [255, 114, 0],
+        ),
+        (
+            &[
+                "rfp",
+                "dsred",
+                "mcherry",
+                "tdtomato",
+                "texas red",
+                "alexa 594",
+                "alexa594",
+                "af594",
+                "fluor 594",
+            ],
+            [255, 0, 0],
+        ),
+        (
+            &[
+                "cy5",
+                "alexa 647",
+                "alexa647",
+                "af647",
+                "fluor 647",
+                "cy5.5",
+                "alexa 660",
+                "alexa660",
+                "af660",
+            ],
+            [255, 0, 255],
+        ),
         (&["hematoxylin", "haematoxylin"], [63, 89, 255]),
         (&["eosin"], [255, 89, 140]),
     ];
@@ -3085,13 +3547,19 @@ fn portable_words_xyz(
             .checked_mul(address.logical_extent[axis + 1] as usize)
             .ok_or_else(|| SessionError::LayerSource("chunk stride overflows usize".into()))?;
     }
-    let axes = source.spatial_axes_xyz.map(|axis| (axis != VIRTUAL_SPATIAL_AXIS).then_some(axis as usize));
+    let axes = source
+        .spatial_axes_xyz
+        .map(|axis| (axis != VIRTUAL_SPATIAL_AXIS).then_some(axis as usize));
     let mut result = Vec::with_capacity(expected);
     for z in 0..dimensions[2] as usize {
         for y in 0..dimensions[1] as usize {
             for x in 0..dimensions[0] as usize {
                 let coordinate = [x, y, z];
-                let index: usize = axes.iter().enumerate().filter_map(|(xyz, axis)| axis.map(|axis| coordinate[xyz] * strides[axis])).sum();
+                let index: usize = axes
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(xyz, axis)| axis.map(|axis| coordinate[xyz] * strides[axis]))
+                    .sum();
                 result.push(source_words[index]);
             }
         }
@@ -3194,6 +3662,73 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn timepoints_have_distinct_cache_entries_and_missing_windows_use_coarsest_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("time-series.zarr");
+        fs::create_dir_all(root.join("0")).unwrap();
+        fs::create_dir_all(root.join("1")).unwrap();
+        fs::write(root.join(".zgroup"), r#"{"zarr_format":2}"#).unwrap();
+        fs::write(
+            root.join(".zattrs"),
+            r#"{"multiscales":[{"axes":[{"name":"t","type":"time"},{"name":"c","type":"channel"},{"name":"y","type":"space","unit":"micrometer"},{"name":"x","type":"space","unit":"micrometer"}],"datasets":[{"path":"0","coordinateTransformations":[{"type":"scale","scale":[1,1,0.25,0.5]}]},{"path":"1","coordinateTransformations":[{"type":"scale","scale":[1,1,0.5,1.0]}]}]}],"omero":{"channels":[{"active":true,"label":"signal"}]}}"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("0/.zarray"),
+            r#"{"zarr_format":2,"shape":[2,1,2,2],"chunks":[1,1,2,2],"dtype":"<u2","compressor":null,"fill_value":0,"order":"C","filters":null}"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("1/.zarray"),
+            r#"{"zarr_format":2,"shape":[2,1,2,2],"chunks":[1,1,2,2],"dtype":"<u2","compressor":null,"fill_value":0,"order":"C","filters":null}"#,
+        )
+        .unwrap();
+        let bytes = |values: [u16; 4]| {
+            values
+                .into_iter()
+                .flat_map(u16::to_le_bytes)
+                .collect::<Vec<_>>()
+        };
+        fs::write(root.join("0/0.0.0.0"), bytes([1000, 1010, 1020, 1030])).unwrap();
+        fs::write(root.join("0/1.0.0.0"), bytes([1100, 1110, 1120, 1130])).unwrap();
+        fs::write(root.join("1/0.0.0.0"), bytes([0, 10, 20, 30])).unwrap();
+        fs::write(root.join("1/1.0.0.0"), bytes([100, 110, 120, 130])).unwrap();
+
+        let mut session = LocalSession::default();
+        session.open_local_omezarr(&root).unwrap();
+        session.prepare_default_portable_image_layer().unwrap();
+        assert_eq!(session.timepoint_count(), 2);
+        assert_eq!(session.timepoint(), 0);
+        let channel = &session.layer_channels()[0].channels[0];
+        assert_eq!([channel.window_start, channel.window_end], [0.0, 30.0]);
+        assert_eq!(
+            session.spatial_calibration().unwrap(),
+            (
+                [0.5, 0.25, 1.0],
+                [Some("micrometer".into()), Some("micrometer".into()), None]
+            )
+        );
+
+        let limits = LayerRenderLimits::new(4, 4);
+        let first = session
+            .layer_chunk_words_cached(limits, LayerId(0), 0, 0, &[0])
+            .unwrap();
+        assert_eq!(&**first[0], &[1000, 1010, 1020, 1030]);
+        session.set_timepoint(1).unwrap();
+        let second = session
+            .layer_chunk_words_cached(limits, LayerId(0), 0, 0, &[0])
+            .unwrap();
+        assert_eq!(&**second[0], &[1100, 1110, 1120, 1130]);
+        assert_eq!(
+            session.chunk_cache_stats().1,
+            2,
+            "each timepoint is read once"
+        );
+        assert!(session.set_timepoint(2).is_err());
+        assert_eq!(session.timepoint(), 1);
+    }
+
     /// A Zarr v2 store in the IDR layout (`.zarray`, blosc lz4 with byte shuffle, `/` key
     /// separator, one chunk per z slice, `<u2`) is decoded through the same path. The chunk
     /// on disk is a blosc frame, not raw bytes.
@@ -3234,10 +3769,16 @@ mod tests {
         let store = Arc::new(FilesystemStore::new(&root).unwrap());
         let array = Array::new_with_metadata(store, "/0", metadata).unwrap();
         array
-            .store_array_subset_elements::<u16>(&ArraySubset::new_with_shape(shape.to_vec()), &values)
+            .store_array_subset_elements::<u16>(
+                &ArraySubset::new_with_shape(shape.to_vec()),
+                &values,
+            )
             .unwrap();
         std::fs::write(root.join("0/.zarray"), zarray).unwrap();
-        assert!(root.join("0/.zarray").is_file(), "v2 array metadata must be written");
+        assert!(
+            root.join("0/.zarray").is_file(),
+            "v2 array metadata must be written"
+        );
         let chunk_file = root.join("0/1/2/0/0");
         assert!(chunk_file.is_file(), "v2 slash-separated chunk key");
         assert_ne!(
@@ -3272,8 +3813,14 @@ mod tests {
         assert_eq!(profile.pixel_length, 6.0);
         assert_eq!(profile.physical_length, Some(2.16));
         assert_eq!(profile.physical_unit.as_deref(), Some("micrometer"));
-        assert_eq!(profile.channels[0].values, vec![120.0, 121.0, 122.0, 123.0, 124.0, 125.0, 126.0]);
-        assert_eq!(profile.channels[1].values, vec![1120.0, 1121.0, 1122.0, 1123.0, 1124.0, 1125.0, 1126.0]);
+        assert_eq!(
+            profile.channels[0].values,
+            vec![120.0, 121.0, 122.0, 123.0, 124.0, 125.0, 126.0]
+        );
+        assert_eq!(
+            profile.channels[1].values,
+            vec![1120.0, 1121.0, 1122.0, 1123.0, 1124.0, 1125.0, 1126.0]
+        );
         let limits = LayerRenderLimits::new(4, 4);
         let chunks = [[0_u64, 0, 0], [0, 0, 1], [0, 0, 2]];
         let plans = session
@@ -3283,20 +3830,34 @@ mod tests {
             .read_local_layer_chunks(&plans, 1 << 20, 1 << 24)
             .unwrap();
         assert_eq!(loaded.len(), chunks.len() * 2);
-        assert_eq!(plans[0].request.source.chunk_key_encoding, LocalChunkKeyEncoding::V2Slash);
+        assert_eq!(
+            plans[0].request.source.chunk_key_encoding,
+            LocalChunkKeyEncoding::V2Slash
+        );
         for chunk_read in &loaded {
             let address = &chunk_read.address;
             let (c, z) = (address.coordinates[0], address.coordinates[1]);
             assert_eq!(address.logical_extent, vec![1, 1, 5, 7]);
-            assert_eq!(address.asset_path, format!("0/{c}/{z}/0/0"), "v2 slash-separated key");
-            assert!(root.join(&address.asset_path).is_file(), "asset path names the chunk file");
+            assert_eq!(
+                address.asset_path,
+                format!("0/{c}/{z}/0/0"),
+                "v2 slash-separated key"
+            );
+            assert!(
+                root.join(&address.asset_path).is_file(),
+                "asset path names the chunk file"
+            );
             let mut expected = Vec::new();
             for y in 0..5 {
                 for x in 0..7 {
                     expected.extend_from_slice(&value(c, z, y, x).to_le_bytes());
                 }
             }
-            assert_eq!(chunk_read.bytes, expected, "chunk {:?}", address.coordinates);
+            assert_eq!(
+                chunk_read.bytes, expected,
+                "chunk {:?}",
+                address.coordinates
+            );
         }
     }
 
@@ -3377,7 +3938,10 @@ mod tests {
             let array = builder.build(store, "/scale0/image").unwrap();
             array.store_metadata().unwrap();
             array
-                .store_array_subset_elements::<u16>(&ArraySubset::new_with_shape(shape.to_vec()), &values)
+                .store_array_subset_elements::<u16>(
+                    &ArraySubset::new_with_shape(shape.to_vec()),
+                    &values,
+                )
                 .unwrap();
             // The stored chunks are not the raw bytes.
             let chunk_file = root.join("scale0/image/c/0/0/0/0");
@@ -3400,7 +3964,11 @@ mod tests {
             let loaded = session
                 .read_local_layer_chunks(&plans, 1 << 20, 1 << 24)
                 .unwrap();
-            assert_eq!(loaded.len(), chunks.len() * 2, "{name}: one read per chunk per channel");
+            assert_eq!(
+                loaded.len(),
+                chunks.len() * 2,
+                "{name}: one read per chunk per channel"
+            );
             for chunk_read in &loaded {
                 let address = &chunk_read.address;
                 let c = address.coordinates[0];
@@ -3438,26 +4006,55 @@ mod tests {
         let gradient = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../test-data/two-channel-gradient.ome.zarr");
         let mut session = LocalSession::default();
-        assert!(session.add_portable_image_layer(&gradient).is_err(), "open first");
+        assert!(
+            session.add_portable_image_layer(&gradient).is_err(),
+            "open first"
+        );
         session.open_local_omezarr(&cells).unwrap();
         session.prepare_default_portable_image_layer().unwrap();
         let second = session.add_portable_image_layer(&gradient).unwrap();
         assert_eq!(second, LayerId(1));
         let limits = LayerRenderLimits::new(4, 4);
-        let requests = session.local_layer_render_requests_at_levels(limits, &[0, 1]).unwrap();
+        let requests = session
+            .local_layer_render_requests_at_levels(limits, &[0, 1])
+            .unwrap();
         assert_eq!(requests.len(), 2);
-        assert!(requests[0].source.root.ends_with("cells3d-anisotropic.ome.zarr"));
-        assert!(requests[1].source.root.ends_with("two-channel-gradient.ome.zarr"));
+        assert!(requests[0]
+            .source
+            .root
+            .ends_with("cells3d-anisotropic.ome.zarr"));
+        assert!(requests[1]
+            .source
+            .root
+            .ends_with("two-channel-gradient.ome.zarr"));
         assert_eq!(requests[1].source.level, 1);
-        assert_eq!(requests[1].layer.channels.len(), 2, "both gradient channels are active");
-        assert!(session.local_layer_render_requests_at_levels(limits, &[0]).is_err());
+        assert_eq!(
+            requests[1].layer.channels.len(),
+            2,
+            "both gradient channels are active"
+        );
+        assert!(session
+            .local_layer_render_requests_at_levels(limits, &[0])
+            .is_err());
         // Per-layer geometry comes from the layer's dataset.
         assert_eq!(
-            session.portable_layer_level_transform(second, 0).unwrap().scale,
+            session
+                .portable_layer_level_transform(second, 0)
+                .unwrap()
+                .scale,
             [0.25, 0.25, 0.5]
         );
-        assert_eq!(session.portable_layer_level_spacings(second).unwrap().len(), 2);
-        assert_eq!(session.portable_layer_level_spacings(LayerId(0)).unwrap().len(), 3);
+        assert_eq!(
+            session.portable_layer_level_spacings(second).unwrap().len(),
+            2
+        );
+        assert_eq!(
+            session
+                .portable_layer_level_spacings(LayerId(0))
+                .unwrap()
+                .len(),
+            3
+        );
         // A chunk plan and read for the second layer alone, at its own level.
         let plan = session
             .layer_chunk_plan_for_chunks_at_level(limits, second, 0, &[[0, 0, 0]], 8)
@@ -3487,7 +4084,10 @@ mod tests {
         let layer = LayerId(before[0].layer_id);
         assert_eq!(before[0].channels.len(), 1);
         assert_eq!(
-            (before[0].channels[0].window_start, before[0].channels[0].window_end),
+            (
+                before[0].channels[0].window_start,
+                before[0].channels[0].window_end
+            ),
             (0.0, 65535.0)
         );
 
@@ -3501,29 +4101,42 @@ mod tests {
         let after = session.layer_channels();
         assert_eq!(after[0].channels[0].color_srgb, [10, 200, 30]);
         assert_eq!(
-            (after[0].channels[0].window_start, after[0].channels[0].window_end),
+            (
+                after[0].channels[0].window_start,
+                after[0].channels[0].window_end
+            ),
             (1000.0, 4000.0)
         );
         assert_eq!(after[0].channels[0].opacity, 0.25);
         // The render plan is derived from the scene, so the edit is what every route renders.
-        let plan = session.layer_render_plan(LayerRenderLimits::new(4, 4)).unwrap();
+        let plan = session
+            .layer_render_plan(LayerRenderLimits::new(4, 4))
+            .unwrap();
         assert_eq!(plan.image_layers[0].channels[0].state, state);
 
         // Invalid states and addresses are refused without touching the scene.
         let mut bad_window = state.clone();
-        bad_window.window = ChannelWindow { start: 5.0, end: 1.0 };
+        bad_window.window = ChannelWindow {
+            start: 5.0,
+            end: 1.0,
+        };
         assert!(session.set_channel_state(layer, 0, bad_window).is_err());
         let mut bad_opacity = state.clone();
         bad_opacity.opacity = 1.5;
         assert!(session.set_channel_state(layer, 0, bad_opacity).is_err());
         assert!(session.set_channel_state(layer, 1, state.clone()).is_err());
-        assert!(session.set_channel_state(LayerId(999), 0, state.clone()).is_err());
+        assert!(session
+            .set_channel_state(LayerId(999), 0, state.clone())
+            .is_err());
         // The only enabled channel cannot be switched off.
         let mut disabled = state.clone();
         disabled.enabled = false;
         assert!(session.set_channel_state(layer, 0, disabled).is_err());
         assert_eq!(
-            session.layer_render_plan(LayerRenderLimits::new(4, 4)).unwrap().image_layers[0]
+            session
+                .layer_render_plan(LayerRenderLimits::new(4, 4))
+                .unwrap()
+                .image_layers[0]
                 .channels[0]
                 .state,
             state
@@ -3587,9 +4200,26 @@ mod tests {
         assert_eq!(summary.voxel_shape_xyz, Some([129, 307, 1]));
         let source = session.prepare_default_portable_image_layer().unwrap();
         assert_eq!(source.spatial_axes_xyz, [2, 1, VIRTUAL_SPATIAL_AXIS]);
-        assert_eq!([source.spatial_shape(0), source.spatial_shape(1), source.spatial_shape(2)], [129, 307, 1]);
-        assert_eq!([source.spatial_chunk_shape(0), source.spatial_chunk_shape(1), source.spatial_chunk_shape(2)], [129, 307, 1]);
-        assert_eq!(session.scene.layers()[0].transform.scale, [0.325, 0.325, 0.325]);
+        assert_eq!(
+            [
+                source.spatial_shape(0),
+                source.spatial_shape(1),
+                source.spatial_shape(2)
+            ],
+            [129, 307, 1]
+        );
+        assert_eq!(
+            [
+                source.spatial_chunk_shape(0),
+                source.spatial_chunk_shape(1),
+                source.spatial_chunk_shape(2)
+            ],
+            [129, 307, 1]
+        );
+        assert_eq!(
+            session.scene.layers()[0].transform.scale,
+            [0.325, 0.325, 0.325]
+        );
         assert_eq!(session.layer_channels()[0].channels[0].window_end, 255.0);
         assert_eq!(
             session.layer_channels()[0]
@@ -4071,21 +4701,38 @@ mod tests {
         let point = QuPathAnnotation::point(8.0, 6.0, newvolim_scene::qupath::Plane::at(2, 0));
         session.set_qupath_annotations(&[point]).unwrap();
         assert_eq!(session.annotations().len(), 1);
-        let AnnotationGeometry::Point(actual) = session.annotations()[0].geometry else { panic!("point") };
+        let AnnotationGeometry::Point(actual) = session.annotations()[0].geometry else {
+            panic!("point")
+        };
         for (value, expected) in actual.into_iter().zip([2.08, 1.56, 0.725]) {
             assert!((value - expected).abs() < 1e-10, "{value} vs {expected}");
         }
         let polygon = QuPathAnnotation {
             geometry: QuPathGeometry::Polygon(vec![
-                vec![[0.0,0.0],[10.0,0.0],[10.0,10.0],[0.0,10.0],[0.0,0.0]],
-                vec![[2.0,2.0],[2.0,4.0],[4.0,4.0],[2.0,2.0]],
+                vec![
+                    [0.0, 0.0],
+                    [10.0, 0.0],
+                    [10.0, 10.0],
+                    [0.0, 10.0],
+                    [0.0, 0.0],
+                ],
+                vec![[2.0, 2.0], [2.0, 4.0], [4.0, 4.0], [2.0, 2.0]],
             ]),
             plane: newvolim_scene::qupath::Plane::at(2, 0),
             ..QuPathAnnotation::default()
         };
         session.set_qupath_annotations(&[polygon]).unwrap();
-        assert!(matches!(session.annotations()[0].geometry, AnnotationGeometry::Polygon(_)));
-        assert!(matches!(session.annotations()[1].geometry, AnnotationGeometry::Polyline(_)), "a hole keeps its outline in 3D");
+        assert!(matches!(
+            session.annotations()[0].geometry,
+            AnnotationGeometry::Polygon(_)
+        ));
+        assert!(
+            matches!(
+                session.annotations()[1].geometry,
+                AnnotationGeometry::Polyline(_)
+            ),
+            "a hole keeps its outline in 3D"
+        );
 
         let span = QuPathAnnotation {
             geometry: QuPathGeometry::Point([8.0, 6.0]),
@@ -4094,10 +4741,18 @@ mod tests {
             ..QuPathAnnotation::default()
         };
         session.set_qupath_annotations(&[span]).unwrap();
-        assert_eq!(session.annotations().len(), 3, "start, end and depth connector");
-        let AnnotationGeometry::Point(end) = session.annotations()[1].geometry else { panic!("end point") };
+        assert_eq!(
+            session.annotations().len(),
+            3,
+            "start, end and depth connector"
+        );
+        let AnnotationGeometry::Point(end) = session.annotations()[1].geometry else {
+            panic!("end point")
+        };
         assert!((end[2] - 1.595).abs() < 1e-10);
-        let AnnotationGeometry::Polyline(ref connector) = session.annotations()[2].geometry else { panic!("span connector") };
+        let AnnotationGeometry::Polyline(ref connector) = session.annotations()[2].geometry else {
+            panic!("span connector")
+        };
         assert_eq!(connector.len(), 2);
         assert!((connector[0][2] - 0.725).abs() < 1e-10);
         assert!((connector[1][2] - 1.595).abs() < 1e-10);
@@ -4276,7 +4931,10 @@ mod tests {
         // assume a planner can reuse the finest level's grid.
         assert_eq!(fine.chunk_shape, coarse.chunk_shape);
         // Level zero still goes through the same path.
-        assert_eq!(LocalOmeZarrSource::level_zero(&root, metadata).unwrap(), fine);
+        assert_eq!(
+            LocalOmeZarrSource::level_zero(&root, metadata).unwrap(),
+            fine
+        );
         // A level the dataset does not declare is refused rather than clamped.
         assert!(LocalOmeZarrSource::for_level(&root, metadata, 99).is_err());
     }
@@ -4400,11 +5058,9 @@ mod tests {
         else {
             panic!("one chunk must plan");
         };
-        assert!(
-            session
-                .portable_chunk_plan_pages(plan, &loaded, &mismatched, channel)
-                .is_err()
-        );
+        assert!(session
+            .portable_chunk_plan_pages(plan, &loaded, &mismatched, channel)
+            .is_err());
 
         // A plan demanding a chunk that was never read must be refused, not silently short.
         let grid = palace_core::gpu::PortableChunkGrid::new(dimensions, chunk_shape).unwrap();
@@ -4422,11 +5078,9 @@ mod tests {
         else {
             panic!("two chunks must plan");
         };
-        assert!(
-            session
-                .portable_chunk_plan_pages(plan, &loaded, &unread, channel)
-                .is_err()
-        );
+        assert!(session
+            .portable_chunk_plan_pages(plan, &loaded, &unread, channel)
+            .is_err());
     }
 
     /// Demand-driven planning produces whatever set the renderer missed, which is generally not
@@ -4472,22 +5126,16 @@ mod tests {
             .unwrap();
         assert_eq!(ascending, shuffled);
         // A chunk outside the source grid is rejected rather than clamped.
-        assert!(
-            session
-                .local_layer_chunk_plan_for_chunks(limits, &[[9_999, 0, 0]], 64)
-                .is_err()
-        );
+        assert!(session
+            .local_layer_chunk_plan_for_chunks(limits, &[[9_999, 0, 0]], 64)
+            .is_err());
         // The address bound is enforced, and an empty demand is not a plan.
-        assert!(
-            session
-                .local_layer_chunk_plan_for_chunks(limits, &[[0, 0, 0], [1, 0, 0]], 1)
-                .is_err()
-        );
-        assert!(
-            session
-                .local_layer_chunk_plan_for_chunks(limits, &[], 64)
-                .is_err()
-        );
+        assert!(session
+            .local_layer_chunk_plan_for_chunks(limits, &[[0, 0, 0], [1, 0, 0]], 1)
+            .is_err());
+        assert!(session
+            .local_layer_chunk_plan_for_chunks(limits, &[], 64)
+            .is_err());
     }
 
     #[test]

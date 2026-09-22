@@ -92,7 +92,11 @@ fn set_channel_state(
         .lock()
         .map_err(|_| "desktop session lock was poisoned".to_owned())?;
     session
-        .set_channel_state(newvolim_scene::LayerId(layer_id), channel, state.into_state()?)
+        .set_channel_state(
+            newvolim_scene::LayerId(layer_id),
+            channel,
+            state.into_state()?,
+        )
         .map_err(|error| error.to_string())?;
     Ok(session.layer_channels())
 }
@@ -1028,12 +1032,26 @@ mod tests {
         let api = std::fs::read_to_string(ui.join("src/api.rs")).unwrap();
         let shell = std::fs::read_to_string(ui.join("index.html")).unwrap();
         let webgpu = std::fs::read_to_string(ui.join("scene-webgpu.js")).unwrap();
-        for (name, source) in [("app.rs", &app), ("api.rs", &api), ("index.html", &shell), ("scene-webgpu.js", &webgpu)] {
-            assert!(!source.contains("__TAURI__") && !source.contains("invoke("), "{name} invokes a desktop command");
+        for (name, source) in [
+            ("app.rs", &app),
+            ("api.rs", &api),
+            ("index.html", &shell),
+            ("scene-webgpu.js", &webgpu),
+        ] {
+            assert!(
+                !source.contains("__TAURI__") && !source.contains("invoke("),
+                "{name} invokes a desktop command"
+            );
         }
         assert!(api.contains("/v1/frames") && api.contains("/channels") && api.contains("/layers"));
-        assert!(api.contains("/portable/plan?") && api.contains("/portable/chunks"), "the page runs client-side residency against the server's routes");
-        assert!(app.contains("scene_webgpu_dispatch(") && app.contains("ClientResidency::new("), "the page dispatches the scene itself");
+        assert!(
+            api.contains("/portable/plan?") && api.contains("/portable/chunks"),
+            "the page runs client-side residency against the server's routes"
+        );
+        assert!(
+            app.contains("scene_webgpu_dispatch(") && app.contains("ClientResidency::new("),
+            "the page dispatches the scene itself"
+        );
         assert!(webgpu.contains("async function dispatch("));
         // The desktop still registers the scene render, pick and channel commands.
         let desktop = include_str!("main.rs");
@@ -1046,7 +1064,10 @@ mod tests {
             "set_channel_state,",
             "add_portable_image_layer,",
         ] {
-            assert!(handler.contains(command), "desktop no longer registers {command}");
+            assert!(
+                handler.contains(command),
+                "desktop no longer registers {command}"
+            );
         }
     }
 

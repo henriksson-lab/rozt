@@ -49,8 +49,12 @@ pub fn class_color(class: &str) -> [u8; 3] {
     let f = h * 6.0 - i;
     let (p, q, t) = (v * (1.0 - s), v * (1.0 - f * s), v * (1.0 - (1.0 - f) * s));
     let rgb = match (i as i32).rem_euclid(6) {
-        0 => [v,t,p], 1 => [q,v,p], 2 => [p,v,t],
-        3 => [p,q,v], 4 => [t,p,v], _ => [v,p,q],
+        0 => [v, t, p],
+        1 => [q, v, p],
+        2 => [p, v, t],
+        3 => [p, q, v],
+        4 => [t, p, v],
+        _ => [v, p, q],
     };
     rgb.map(|channel| (channel * 255.0).round() as u8)
 }

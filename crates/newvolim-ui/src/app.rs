@@ -160,7 +160,6 @@ impl AnnotationTool {
             Self::Profile => "Line profile",
         }
     }
-
 }
 
 fn annotation_tool_icon(tool: AnnotationTool) -> AnyView {
@@ -228,6 +227,39 @@ pub struct LineProfileView {
     pub error: Option<String>,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct LabelUiState {
+    pub summary: LabelSummary,
+    pub visible: bool,
+    pub opacity: f64,
+    pub outline: bool,
+    pub isolate: bool,
+    pub selected: Option<LabelInspection>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ObjectUiState {
+    pub summary: ObjectSummary,
+    pub visible: bool,
+    pub color: [u8; 3],
+    pub opacity: f64,
+    pub size: f64,
+    pub hollow: bool,
+    pub slab: f64,
+    pub color_by: Option<usize>,
+    pub filters: Vec<Option<[f64; 2]>>,
+    pub points: Vec<ObjectPoint>,
+    pub total_in_view: usize,
+    pub selected: Option<serde_json::Value>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct MeasurementUiState {
+    pub summary: MeasurementSummary,
+    pub color_by: Option<usize>,
+    pub filter: Option<[f64; 2]>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct OrthogonalCapture {
     pub focus_xyz: [f64; 3],
@@ -247,6 +279,14 @@ struct SliceTilePlacement {
 #[derive(Clone, Debug, PartialEq)]
 struct SliceTileSet {
     level: usize,
+    tiles: Vec<SliceTilePlacement>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct LabelTileSet {
+    key: String,
+    level: usize,
+    level_shape: [u32; 3],
     tiles: Vec<SliceTilePlacement>,
 }
 
@@ -291,6 +331,11 @@ pub struct Session {
     pub dataset: RwSignal<Option<String>>,
     pub layers: RwSignal<Vec<LayerChannelSummary>>,
     pub annotation_layers: RwSignal<Vec<AnnotationLayer>>,
+    pub label_layers: RwSignal<Vec<LabelUiState>>,
+    pub object_layers: RwSignal<Vec<ObjectUiState>>,
+    pub measurement_tables: RwSignal<Vec<MeasurementUiState>>,
+    pub region_counts: RwSignal<Vec<RegionCount>>,
+    pub feature_generation: RwSignal<u64>,
     pub annotation_roi_tables: RwSignal<Vec<RoiTableSummary>>,
     pub annotation_layer: RwSignal<Option<u64>>,
     pub annotation_tool: RwSignal<AnnotationTool>,
@@ -317,6 +362,10 @@ pub struct Session {
     annotation_undo: StoredValue<Vec<(u64, Vec<Annotation>)>>,
     annotation_styles: StoredValue<HashMap<u64, AnnotationViewStyle>>,
     pub voxel_shape: RwSignal<Option<[u32; 3]>>,
+    pub voxel_spacing: RwSignal<[f64; 3]>,
+    pub spatial_units: RwSignal<[Option<String>; 3]>,
+    pub timepoint: RwSignal<u32>,
+    pub timepoint_count: RwSignal<u32>,
     /// The voxel at the centre of every slice pane: the integer crosshair the slices are cut
     /// at, derived from `focus`.
     pub crosshair: RwSignal<[u32; 3]>,
@@ -364,7 +413,7 @@ pub struct Session {
     /// latest-only.
     pub depth_scale: RwSignal<f32>,
     settings_inflight: StoredValue<bool>,
-    settings_dirty: StoredValue<Option<f32>>,
+    settings_dirty: StoredValue<Option<SceneSettings>>,
     /// The browser renderer's chunk cache, kept across frames (taken during a frame).
     chunk_cache: StoredValue<Option<newvolim_residency::ChunkCache>>,
     volume_canvas: NodeRef<leptos::html::Canvas>,
@@ -389,6 +438,11 @@ impl Session {
             dataset: RwSignal::new(None),
             layers: RwSignal::new(Vec::new()),
             annotation_layers: RwSignal::new(Vec::new()),
+            label_layers: RwSignal::new(Vec::new()),
+            object_layers: RwSignal::new(Vec::new()),
+            measurement_tables: RwSignal::new(Vec::new()),
+            region_counts: RwSignal::new(Vec::new()),
+            feature_generation: RwSignal::new(0),
             annotation_roi_tables: RwSignal::new(Vec::new()),
             annotation_layer: RwSignal::new(None),
             annotation_tool: RwSignal::new(AnnotationTool::Pan),
@@ -415,6 +469,10 @@ impl Session {
             annotation_undo: StoredValue::new(Vec::new()),
             annotation_styles: StoredValue::new(HashMap::new()),
             voxel_shape: RwSignal::new(None),
+            voxel_spacing: RwSignal::new([1.0; 3]),
+            spatial_units: RwSignal::new([None, None, None]),
+            timepoint: RwSignal::new(0),
+            timepoint_count: RwSignal::new(1),
             crosshair: RwSignal::new([0; 3]),
             focus: RwSignal::new([0.0; 3]),
             zoom_2d: RwSignal::new([1.0; 3]),
@@ -515,6 +573,7 @@ impl Session {
         self.error.set(None);
         self.status.set(format!("Opening {name}…"));
         self.refresh_layers();
+        self.refresh_features();
         self.refresh_annotations();
         self.refresh_settings();
         self.open_socket();
@@ -549,6 +608,10 @@ impl Session {
         self.select_annotation_layer(None);
         self.annotation_styles.set_value(HashMap::new());
         self.annotation_layers.set(Vec::new());
+        self.label_layers.set(Vec::new());
+        self.object_layers.set(Vec::new());
+        self.measurement_tables.set(Vec::new());
+        self.region_counts.set(Vec::new());
         self.annotation_roi_tables.set(Vec::new());
         self.selected_annotation.set(None);
         self.annotation_tool.set(AnnotationTool::Pan);
@@ -560,6 +623,10 @@ impl Session {
         self.queued_annotations.set_value(Vec::new());
         self.annotation_undo.set_value(Vec::new());
         self.voxel_shape.set(None);
+        self.voxel_spacing.set([1.0; 3]);
+        self.spatial_units.set([None, None, None]);
+        self.timepoint.set(0);
+        self.timepoint_count.set(1);
         self.pyramid_shapes_xyz.set(Vec::new());
         self.slice_windows.set(HashMap::new());
         self.dataset_layout_ready.set(false);
@@ -601,6 +668,166 @@ impl Session {
                 Err(message) => self.fail(message),
             }
         });
+    }
+
+    fn refresh_features(self) {
+        let Some(dataset) = self.dataset.get_untracked() else {
+            return;
+        };
+        let url = features_url(&self.origin.get_untracked(), &dataset);
+        spawn_local(async move {
+            match get_json::<FeatureManifest>(&url).await {
+                Ok(manifest) => {
+                    self.label_layers.set(
+                        manifest
+                            .labels
+                            .into_iter()
+                            .map(|summary| LabelUiState {
+                                summary,
+                                visible: true,
+                                opacity: 0.65,
+                                outline: false,
+                                isolate: false,
+                                selected: None,
+                            })
+                            .collect(),
+                    );
+                    self.object_layers.set(
+                        manifest
+                            .objects
+                            .into_iter()
+                            .map(|summary| {
+                                let filters = vec![None; summary.columns.len()];
+                                ObjectUiState {
+                                    summary,
+                                    visible: true,
+                                    color: [255, 190, 45],
+                                    opacity: 0.9,
+                                    size: 7.0,
+                                    hollow: false,
+                                    slab: 8.0,
+                                    color_by: None,
+                                    filters,
+                                    points: Vec::new(),
+                                    total_in_view: 0,
+                                    selected: None,
+                                }
+                            })
+                            .collect(),
+                    );
+                    self.measurement_tables.set(
+                        manifest
+                            .tables
+                            .into_iter()
+                            .map(|summary| MeasurementUiState {
+                                summary,
+                                color_by: None,
+                                filter: None,
+                            })
+                            .collect(),
+                    );
+                    self.feature_generation
+                        .update(|value| *value = value.wrapping_add(1));
+                }
+                Err(message) => self.fail(format!("feature layers: {message}")),
+            }
+        });
+    }
+
+    fn load_objects(self, bounds: [f64; 6]) {
+        let (Some(dataset), origin) = (self.dataset.get_untracked(), self.origin.get_untracked())
+        else {
+            return;
+        };
+        let layers = self.object_layers.get_untracked();
+        for layer in layers.into_iter().filter(|v| v.visible) {
+            let name = layer.summary.name.clone();
+            let url = objects_url(&origin, &dataset, &name, bounds);
+            spawn_local(async move {
+                match get_json::<ObjectQueryResult>(&url).await {
+                    Ok(result) => self.object_layers.update(|layers| {
+                        if let Some(layer) = layers.iter_mut().find(|v| v.summary.name == name) {
+                            layer.points = result.points;
+                            layer.total_in_view = result.total
+                        }
+                    }),
+                    Err(message) => self.fail(format!("objects {name}: {message}")),
+                }
+            });
+        }
+    }
+
+    fn inspect_features(self, x: u32, y: u32, z: u32, world_per_screen: f64) {
+        let (Some(dataset), origin) = (self.dataset.get_untracked(), self.origin.get_untracked())
+        else {
+            return;
+        };
+        for layer in self
+            .label_layers
+            .get_untracked()
+            .into_iter()
+            .filter(|v| v.visible)
+        {
+            let name = layer.summary.name.clone();
+            let url = label_value_url(&origin, &dataset, &name, x, y, z);
+            spawn_local(async move {
+                match get_json::<LabelInspection>(&url).await {
+                    Ok(value) => {
+                        self.label_layers.update(|layers| {
+                            if let Some(layer) = layers.iter_mut().find(|v| v.summary.name == name)
+                            {
+                                layer.selected = Some(value)
+                            }
+                        });
+                        self.feature_generation.update(|v| *v = v.wrapping_add(1));
+                    }
+                    Err(message) => self.fail(format!("label inspection: {message}")),
+                }
+            });
+        }
+        let mut nearest = None::<(f64, String, usize)>;
+        for layer in self
+            .object_layers
+            .get_untracked()
+            .into_iter()
+            .filter(|v| v.visible)
+        {
+            for point in &layer.points {
+                let distance = (point.x - x as f64).hypot(point.y - y as f64);
+                if distance <= layer.size * world_per_screen
+                    && nearest.as_ref().is_none_or(|v| distance < v.0)
+                {
+                    nearest = Some((distance, layer.summary.name.clone(), point.row));
+                }
+            }
+        }
+        if let Some((_, name, row)) = nearest {
+            let url = object_row_url(&origin, &dataset, &name, row);
+            spawn_local(async move {
+                match get_json::<serde_json::Value>(&url).await {
+                    Ok(value) => self.object_layers.update(|layers| {
+                        if let Some(layer) = layers.iter_mut().find(|v| v.summary.name == name) {
+                            layer.selected = Some(value)
+                        }
+                    }),
+                    Err(message) => self.fail(format!("object inspection: {message}")),
+                }
+            })
+        }
+    }
+
+    fn count_regions(self, label: String, objects: String) {
+        let (Some(dataset), origin) = (self.dataset.get_untracked(), self.origin.get_untracked())
+        else {
+            return;
+        };
+        let url = regions_url(&origin, &dataset, &label, &objects);
+        spawn_local(async move {
+            match get_json::<Vec<RegionCount>>(&url).await {
+                Ok(rows) => self.region_counts.set(rows),
+                Err(message) => self.fail(format!("region counts: {message}")),
+            }
+        })
     }
 
     fn refresh_annotations(self) {
@@ -1208,7 +1435,11 @@ impl Session {
         let url = settings_url(&self.origin.get(), &dataset);
         spawn_local(async move {
             match get_json::<SceneSettings>(&url).await {
-                Ok(settings) => self.depth_scale.set(settings.depth_scale),
+                Ok(settings) => {
+                    self.depth_scale.set(settings.depth_scale);
+                    self.timepoint.set(settings.timepoint);
+                    self.timepoint_count.set(settings.timepoint_count.max(1));
+                }
                 Err(message) => self.fail(message),
             }
         });
@@ -1217,14 +1448,42 @@ impl Session {
     /// The see-through depth: shown at once, sent latest-only, then the volume follows.
     pub fn set_depth_scale(self, scale: f32) {
         self.depth_scale.set(scale);
-        if self.settings_inflight.get_value() {
-            self.settings_dirty.set_value(Some(scale));
-            return;
-        }
-        self.post_depth_scale(scale);
+        self.queue_settings();
     }
 
-    fn post_depth_scale(self, scale: f32) {
+    pub fn set_timepoint(self, timepoint: u32) {
+        let timepoint = timepoint.min(self.timepoint_count.get_untracked().saturating_sub(1));
+        if timepoint == self.timepoint.get_untracked() {
+            return;
+        }
+        self.timepoint.set(timepoint);
+        self.tile_generation
+            .update(|generation| *generation = generation.wrapping_add(1));
+        self.chunk_cache.set_value(None);
+        self.line_profile.set(None);
+        self.profile_generation
+            .update_value(|generation| *generation = generation.wrapping_add(1));
+        self.queue_settings();
+    }
+
+    fn current_settings(self) -> SceneSettings {
+        SceneSettings {
+            depth_scale: self.depth_scale.get_untracked(),
+            timepoint: self.timepoint.get_untracked(),
+            timepoint_count: self.timepoint_count.get_untracked(),
+        }
+    }
+
+    fn queue_settings(self) {
+        let settings = self.current_settings();
+        if self.settings_inflight.get_value() {
+            self.settings_dirty.set_value(Some(settings));
+            return;
+        }
+        self.post_settings(settings);
+    }
+
+    fn post_settings(self, wanted: SceneSettings) {
         let Some(dataset) = self.dataset.get_untracked() else {
             return;
         };
@@ -1232,10 +1491,12 @@ impl Session {
         self.settings_inflight.set_value(true);
         self.update_busy();
         spawn_local(async move {
-            match post_json::<SceneSettings, _>(&url, &SceneSettings { depth_scale: scale }).await {
+            match post_json::<SceneSettings, _>(&url, &wanted).await {
                 Ok(settings) => {
                     if self.settings_dirty.get_value().is_none() {
                         self.depth_scale.set(settings.depth_scale);
+                        self.timepoint.set(settings.timepoint);
+                        self.timepoint_count.set(settings.timepoint_count.max(1));
                     }
                     self.error.set(None);
                 }
@@ -1245,8 +1506,10 @@ impl Session {
             self.update_busy();
             if let Some(next) = self.settings_dirty.get_value() {
                 self.settings_dirty.set_value(None);
-                self.post_depth_scale(next);
+                self.post_settings(next);
             } else {
+                self.ortho_dirty.set_value(false);
+                self.request_orthogonal();
                 self.request_volume();
             }
         });
@@ -1695,6 +1958,10 @@ impl Session {
                 pyramid_levels,
                 viewport,
                 pyramid_shapes_xyz,
+                voxel_spacing_xyz,
+                spatial_units_xyz,
+                timepoint,
+                timepoint_count,
                 ..
             } => {
                 if self.ortho_inflight.get_value() == Some(request_id) {
@@ -1702,6 +1969,10 @@ impl Session {
                     let first = self.voxel_shape.get_untracked().is_none();
                     self.voxel_shape.set(Some(voxel_shape_xyz));
                     self.pyramid_shapes_xyz.set(pyramid_shapes_xyz);
+                    self.voxel_spacing.set(voxel_spacing_xyz);
+                    self.spatial_units.set(spatial_units_xyz);
+                    self.timepoint.set(timepoint);
+                    self.timepoint_count.set(timepoint_count.max(1));
                     let mut capture =
                         self.ortho_request_capture
                             .get_value()
@@ -2524,7 +2795,22 @@ fn profile_polyline(
             format!("{x:.2},{y:.2}")
         })
         .collect::<Vec<_>>()
-    .join(" ")
+        .join(" ")
+}
+
+fn measurement_color(value: f64) -> [u8; 3] {
+    let t = value.clamp(0.0, 1.0);
+    let stops = [
+        [68.0, 1.0, 84.0],
+        [59.0, 82.0, 139.0],
+        [33.0, 145.0, 140.0],
+        [94.0, 201.0, 98.0],
+        [253.0, 231.0, 37.0],
+    ];
+    let scaled = t * 4.0;
+    let i = (scaled.floor() as usize).min(3);
+    let f = scaled - i as f64;
+    [0, 1, 2].map(|axis| (stops[i][axis] * (1.0 - f) + stops[i + 1][axis] * f).round() as u8)
 }
 
 fn profile_length_label(response: &LineProfileResponse) -> String {
@@ -2887,6 +3173,13 @@ fn OrthoPane(plane: Plane) -> impl IntoView {
             shape[v_axis] as f64 * scale,
         ))
     };
+    let scale_bar = move || {
+        let (_, _, fit) = geometry()?;
+        let pixels_per_voxel = fit * session.zoom_2d.get()[pane_index];
+        let spacing = session.voxel_spacing.get()[h_axis];
+        let units = session.spatial_units.get();
+        scale_bar_spec(pixels_per_voxel, spacing, units[h_axis].as_deref())
+    };
     // A completed viewport remains a correctly registered fallback while focus and zoom move.
     // Reproject it immediately; source-aligned tiles below progressively replace it.
     let cached_view_placement = move || -> Option<(f64, f64, f64, f64)> {
@@ -3028,6 +3321,144 @@ fn OrthoPane(plane: Plane) -> impl IntoView {
         let translate_y = height * 0.5 - focus[1] * scale;
         format!("matrix({scale_x},0,0,{scale_y},{translate_x},{translate_y})")
     };
+    let label_tile_sets = move || -> Vec<LabelTileSet> {
+        if plane != Plane::Xy {
+            return Vec::new();
+        }
+        let Some(base_shape) = session.voxel_shape.get() else {
+            return Vec::new();
+        };
+        let Some((width, height, fit)) = geometry() else {
+            return Vec::new();
+        };
+        let Some(dataset) = session.dataset.get() else {
+            return Vec::new();
+        };
+        let zoom = session.zoom_2d.get()[pane_index];
+        let scale = fit * zoom;
+        let focus = session.focus.get();
+        let bounds = [
+            (focus[0] - width * 0.5 / scale).max(0.0),
+            (focus[1] - height * 0.5 / scale).max(0.0),
+            (focus[0] + width * 0.5 / scale).min(base_shape[0] as f64),
+            (focus[1] + height * 0.5 / scale).min(base_shape[1] as f64),
+        ];
+        let origin = session.origin.get();
+        let generation = session.feature_generation.get();
+        let z = session.crosshair.get()[2];
+        session
+            .label_layers
+            .get()
+            .into_iter()
+            .filter(|layer| layer.visible)
+            .filter_map(|layer| {
+                let pane: web_sys::Element = node_ref.get()?.into();
+                let physical = physical_size(&pane);
+                let level = xy_tile_level(
+                    layer.summary.shape_xyz,
+                    &layer.summary.levels,
+                    [physical.0, physical.1],
+                    zoom,
+                );
+                let level_shape = *layer.summary.levels.get(level)?;
+                let source = [
+                    (bounds[0] * level_shape[0] as f64 / base_shape[0].max(1) as f64).floor()
+                        as u32,
+                    (bounds[1] * level_shape[1] as f64 / base_shape[1].max(1) as f64).floor()
+                        as u32,
+                    (bounds[2] * level_shape[0] as f64 / base_shape[0].max(1) as f64)
+                        .ceil()
+                        .min(level_shape[0] as f64) as u32,
+                    (bounds[3] * level_shape[1] as f64 / base_shape[1].max(1) as f64)
+                        .ceil()
+                        .min(level_shape[1] as f64) as u32,
+                ];
+                if source[2] <= source[0] || source[3] <= source[1] {
+                    return None;
+                }
+                const TILE: u32 = 512;
+                let min = [source[0] / TILE, source[1] / TILE];
+                let max = [
+                    source[2].saturating_sub(1) / TILE,
+                    source[3].saturating_sub(1) / TILE,
+                ];
+                let selected = layer
+                    .isolate
+                    .then_some(layer.selected.as_ref().map(|v| v.id).unwrap_or(0));
+                let measurement = session
+                    .measurement_tables
+                    .get()
+                    .into_iter()
+                    .find(|table| {
+                        table.color_by.is_some()
+                            && table
+                                .summary
+                                .region
+                                .as_deref()
+                                .is_none_or(|region| region == layer.summary.name)
+                    })
+                    .and_then(|table| {
+                        let column = table.color_by?;
+                        let range = table
+                            .filter
+                            .or_else(|| table.summary.columns.get(column)?.range)?;
+                        Some((table.summary.name, column, range))
+                    });
+                let mut tiles = Vec::new();
+                for ty in min[1]..=max[1] {
+                    for tx in min[0]..=max[0] {
+                        let sx = tx * TILE;
+                        let sy = ty * TILE;
+                        tiles.push(SliceTilePlacement {
+                            src: label_tile_url(
+                                &origin,
+                                &dataset,
+                                &layer.summary.name,
+                                level as u32,
+                                tx,
+                                ty,
+                                generation,
+                                layer.outline,
+                                selected,
+                                layer.opacity,
+                                z,
+                                measurement
+                                    .as_ref()
+                                    .map(|(name, column, range)| (name.as_str(), *column, *range)),
+                            ),
+                            source_x: sx,
+                            source_y: sy,
+                            source_width: TILE.min(level_shape[0] - sx),
+                            source_height: TILE.min(level_shape[1] - sy),
+                        })
+                    }
+                }
+                Some(LabelTileSet {
+                    key: format!("{}:{level}:{generation}", layer.summary.name),
+                    level,
+                    level_shape,
+                    tiles,
+                })
+            })
+            .collect()
+    };
+    let label_transform = move |level_shape: [u32; 3]| -> String {
+        let Some(shape0) = session.voxel_shape.get() else {
+            return String::new();
+        };
+        let Some((width, height, fit)) = geometry() else {
+            return String::new();
+        };
+        let scale = fit * session.zoom_2d.get()[pane_index];
+        let focus = session.focus.get();
+        format!(
+            "matrix({},0,0,{},{},{})",
+            scale * shape0[0] as f64 / level_shape[0].max(1) as f64,
+            scale * shape0[1] as f64 / level_shape[1].max(1) as f64,
+            width * 0.5 - focus[0] * scale,
+            height * 0.5 - focus[1] * scale
+        )
+    };
     let active_tiles = RwSignal::new(None::<SliceTileSet>);
     let previous_tiles = RwSignal::new(None::<SliceTileSet>);
     let last_complete_tiles = StoredValue::new(None::<SliceTileSet>);
@@ -3051,6 +3482,43 @@ fn OrthoPane(plane: Plane) -> impl IntoView {
             last_complete_tiles.set_value(desired);
             previous_tiles.set(None);
         }
+    });
+    Effect::new(move |_| {
+        let _ = session.feature_generation.get();
+        if plane != Plane::Xy
+            || session
+                .object_layers
+                .get_untracked()
+                .iter()
+                .all(|v| !v.visible)
+        {
+            return;
+        }
+        let Some(shape) = session.voxel_shape.get() else {
+            return;
+        };
+        let Some((width, height, fit)) = geometry() else {
+            return;
+        };
+        let zoom = session.zoom_2d.get()[pane_index];
+        let scale = fit * zoom;
+        let focus = session.focus.get();
+        let z = session.crosshair.get()[2] as f64;
+        let slab = session
+            .object_layers
+            .get_untracked()
+            .iter()
+            .filter(|v| v.visible && v.summary.has_z)
+            .map(|v| v.slab)
+            .fold(0.0, f64::max);
+        session.load_objects([
+            (focus[0] - width * 0.5 / scale).max(0.0),
+            (focus[0] + width * 0.5 / scale).min(shape[0] as f64),
+            (focus[1] - height * 0.5 / scale).max(0.0),
+            (focus[1] + height * 0.5 / scale).min(shape[1] as f64),
+            z - slab,
+            z + slab,
+        ]);
     });
     let last = StoredValue::new(None::<(i32, i32)>);
     let annotation_drag = StoredValue::new(None::<AnnotationDrag>);
@@ -3107,6 +3575,13 @@ fn OrthoPane(plane: Plane) -> impl IntoView {
                     session
                         .selected_annotation
                         .set(chosen.as_ref().map(|item| item.id));
+                    let z = session.crosshair.get_untracked()[2];
+                    session.inspect_features(
+                        at[0].max(0.0).floor() as u32,
+                        at[1].max(0.0).floor() as u32,
+                        z,
+                        1.0 / scale,
+                    );
                     if let Some(item) = chosen.filter(|item| !item.locked) {
                         let handle = selected_handle(&item, at, 8.0 / scale);
                         if ev.alt_key() {
@@ -3400,6 +3875,11 @@ fn OrthoPane(plane: Plane) -> impl IntoView {
                     }
                 />
             </div>
+            {move||label_tile_sets().into_iter().map(|set|view!{
+                <div class="slice-tile-layer label-tiles" data-layer=set.key style:transform=label_transform(set.level_shape)>
+                    {set.tiles.into_iter().map(|tile|view!{<img class="slice-tile loaded" src=tile.src draggable="false" style:left=format!("{}px",tile.source_x) style:top=format!("{}px",tile.source_y) style:width=format!("{}px",tile.source_width) style:height=format!("{}px",tile.source_height)/>}).collect_view()}
+                </div>
+            }).collect_view()}
             {move || {
                 let (Some(shape), Some((left, top, width, height))) = (session.voxel_shape.get(), placement()) else { return view! { <span></span> }.into_any() };
                 if plane != Plane::Xy { return view! { <span></span> }.into_any(); }
@@ -3450,10 +3930,20 @@ fn OrthoPane(plane: Plane) -> impl IntoView {
                 let profile_path = profile_display.as_ref().map(|display| display.0.clone()).unwrap_or_default();
                 let profile_midpoint = profile_display.as_ref().map(|display| display.1).unwrap_or_default();
                 let profile_label = profile_display.map(|display| display.2).unwrap_or_default();
+                let object_points=session.object_layers.get().into_iter().filter(|layer|layer.visible).flat_map(|layer|{
+                    let selected_row=layer.selected.as_ref().and_then(|v|v.get("row")).and_then(|v|v.as_u64()).map(|v|v as usize);
+                    layer.points.into_iter().filter_map(move|point|{
+                        let passes=layer.filters.iter().enumerate().all(|(i,filter)|filter.is_none_or(|[lo,hi]|point.values.get(i).copied().flatten().is_some_and(|v|v>=lo&&v<=hi)));
+                        if !passes{return None} let fade=if layer.summary.has_z&&layer.slab>0.0{(1.0-(point.z-z as f64).abs()/layer.slab).clamp(0.0,1.0)}else{1.0};if fade<=0.0{return None}
+                        let color=layer.color_by.and_then(|i|layer.summary.columns.get(i).and_then(|c|c.range).zip(point.values.get(i).copied().flatten())).map(|([lo,hi],value)|measurement_color(if hi>lo{(value-lo)/(hi-lo)}else{0.5})).unwrap_or(layer.color);
+                        Some((point.x,point.y,layer.size*0.5/scale,color,layer.opacity*fade,layer.hollow,selected_row==Some(point.row)))
+                    }).collect::<Vec<_>>()
+                }).collect::<Vec<_>>();
                 view! {
                     <svg class="annotation-overlay" style:left=format!("{left}px") style:top=format!("{top}px")
                         style:width=format!("{width}px") style:height=format!("{height}px")
                         viewBox=format!("0 0 {} {}", shape[0], shape[1]) preserveAspectRatio="none">
+                        {object_points.into_iter().map(|(x,y,r,color,opacity,hollow,selected)|{let paint=format!("rgb({},{},{})",color[0],color[1],color[2]);view!{<circle class="object-point" class:selected=selected cx=x cy=y r=r stroke=paint.clone() stroke-width=(if selected{3.0}else{1.5}/scale).to_string() fill=if hollow{"none".into()}else{paint} opacity=opacity.to_string()/>}}).collect_view()}
                         {visible.into_iter().map(|(active, item, style)| {
                             let is_selected = active && selected == Some(item.id) && item.at_plane(z, 0);
                             let color = item.effective_color().unwrap_or_else(|| if style.color_by_class && !item.label.is_empty() { qupath::class_color(&item.label) } else { style.class_color });
@@ -3490,6 +3980,11 @@ fn OrthoPane(plane: Plane) -> impl IntoView {
                     </svg>
                 }.into_any()
             }}
+            {move || scale_bar().map(|(width, label)| view! {
+                <div class="scale-bar" style:width=format!("{width}px")>
+                    <span>{label}</span>
+                </div>
+            })}
             <span class="pane-label">{plane.label()}</span>
             <span class="pane-zoom">{move || format!("{:.2}×", session.zoom_2d.get()[pane_index])}</span>
         </div>
@@ -3748,6 +4243,7 @@ fn draw_cube(
 #[component]
 fn AxisSliders() -> impl IntoView {
     let session = expect_context::<Session>();
+    let has_time = move || session.timepoint_count.get() > 1;
     let slider = move |axis: usize, label: &'static str, class: &'static str, show_value: bool| {
         let max = move || {
             session
@@ -3781,6 +4277,25 @@ fn AxisSliders() -> impl IntoView {
     };
     view! {
         <div class="axis-sliders">
+            <Show when=has_time>
+                <div class="slider-row time-axis">
+                    <span>"T"</span>
+                    <input
+                        aria-label="Timepoint"
+                        type="range"
+                        min="0"
+                        max=move || session.timepoint_count.get().saturating_sub(1).to_string()
+                        step="1"
+                        prop:value=move || session.timepoint.get().to_string()
+                        on:input=move |ev| {
+                            if let Ok(value) = event_target_value(&ev).parse::<u32>() {
+                                session.set_timepoint(value);
+                            }
+                        }
+                    />
+                    <span class="slider-value">{move || format!("{} / {}", session.timepoint.get(), session.timepoint_count.get().saturating_sub(1))}</span>
+                </div>
+            </Show>
             {slider(0, "X", "x-axis", false)}
             <Show when=move || session.voxel_shape.get().is_none_or(|shape| shape[2] > 1)>
                 {slider(2, "Z", "z-axis", true)}
@@ -3833,6 +4348,7 @@ fn Sidebar() -> impl IntoView {
                     <div class="hint">"Each channel's window start is its transparency cutoff and its opacity scales alpha; depth changes how far the ray sees before it saturates."</div>
                 </div>
             </Show>
+            <FeatureControls/>
             <div class="layer-block add-layer">
                 <AnnotationControls/>
             </div>
@@ -3848,6 +4364,52 @@ fn Sidebar() -> impl IntoView {
                 <div class="hint">"Another configured OME-Zarr rendered in its own box over this one; its levels are chosen per layer."</div>
             </div>
         </aside>
+    }
+}
+
+#[component]
+fn FeatureControls() -> impl IntoView {
+    let session = expect_context::<Session>();
+    view! {
+        <Show when=move||!session.label_layers.get().is_empty()>
+            <div class="layer-block"><h3>"Labels"</h3>
+            {move||session.label_layers.get().into_iter().map(|label|{let name=label.summary.name.clone();let edit_name=name.clone();let opacity_name=name.clone();let outline_name=name.clone();let isolate_name=name.clone();view!{
+                <div class="feature-card">
+                    <div class="channel-header"><label><input type="checkbox" prop:checked=label.visible on:change=move|ev|{let checked=event_target_checked(&ev);session.label_layers.update(|layers|if let Some(v)=layers.iter_mut().find(|v|v.summary.name==edit_name){v.visible=checked});session.feature_generation.update(|v|*v=v.wrapping_add(1));}/>{name.clone()}</label><span class="layer-meta">{if label.summary.has_color_table{"image-label colors"}else{"hashed IDs"}}</span></div>
+                    <label class="compact-control">"Opacity" <input type="range" min="0" max="1" step="0.05" prop:value=label.opacity.to_string() on:input=move|ev|if let Ok(value)=event_target_value(&ev).parse(){session.label_layers.update(|layers|if let Some(v)=layers.iter_mut().find(|v|v.summary.name==opacity_name){v.opacity=value});session.feature_generation.update(|v|*v=v.wrapping_add(1));}/></label>
+                    <div class="row"><label><input type="checkbox" prop:checked=label.outline on:change=move|ev|{let checked=event_target_checked(&ev);session.label_layers.update(|layers|if let Some(v)=layers.iter_mut().find(|v|v.summary.name==outline_name){v.outline=checked});session.feature_generation.update(|v|*v=v.wrapping_add(1));}/>" Outlines"</label><label><input type="checkbox" prop:checked=label.isolate on:change=move|ev|{let checked=event_target_checked(&ev);session.label_layers.update(|layers|if let Some(v)=layers.iter_mut().find(|v|v.summary.name==isolate_name){v.isolate=checked});session.feature_generation.update(|v|*v=v.wrapping_add(1));}/>" Isolate selected"</label></div>
+                    <div class="feature-inspection">{label.selected.map(|v|format!("ID {}{}",v.id,v.name.map(|name|format!(" · {}{}",v.acronym.map(|a|format!("{a} — ")).unwrap_or_default(),name)).unwrap_or_default())).unwrap_or_else(||"Click the image to inspect an ID".into())}</div>
+                </div>
+            }}).collect_view()}</div>
+        </Show>
+        <Show when=move||!session.measurement_tables.get().is_empty()>
+            <div class="layer-block"><h3>"Measurement tables"</h3>
+            {move||session.measurement_tables.get().into_iter().map(|table|{let name=table.summary.name.clone();let color_name=name.clone();view!{
+                <div class="feature-card"><div class="channel-header"><span>{name.clone()}</span><span class="layer-meta">{format!("{} rows{}",table.summary.count,table.summary.region.as_ref().map(|v|format!(" · {v}")).unwrap_or_default())}</span></div>
+                <label class="compact-control">"Paint labels"<select on:change=move|ev|{let selected=event_target_value(&ev).parse::<usize>().ok();session.measurement_tables.update(|tables|if let Some(v)=tables.iter_mut().find(|v|v.summary.name==color_name){v.color_by=selected;v.filter=selected.and_then(|i|v.summary.columns.get(i).and_then(|c|c.range))});session.feature_generation.update(|v|*v=v.wrapping_add(1));}><option value="">"off"</option>{table.summary.columns.iter().enumerate().map(|(i,column)|view!{<option value=i.to_string() prop:selected=table.color_by==Some(i)>{column.name.clone()}</option>}).collect_view()}</select></label>
+                {table.color_by.and_then(|column|table.summary.columns.get(column).and_then(|c|c.range).map(|full|(column,full))).map(|(_column,full)|{let range=table.filter.unwrap_or(full);let low=name.clone();let high=name.clone();view!{<div class="measurement-filter"><span>"visible"</span><input type="number" step="any" prop:value=range[0].to_string() on:change=move|ev|{if let Ok(value)=event_target_value(&ev).parse::<f64>(){session.measurement_tables.update(|tables|if let Some(v)=tables.iter_mut().find(|v|v.summary.name==low){let mut range=v.filter.unwrap_or(full);range[0]=value.min(range[1]);v.filter=Some(range)});session.feature_generation.update(|v|*v=v.wrapping_add(1));}}/><span>"–"</span><input type="number" step="any" prop:value=range[1].to_string() on:change=move|ev|{if let Ok(value)=event_target_value(&ev).parse::<f64>(){session.measurement_tables.update(|tables|if let Some(v)=tables.iter_mut().find(|v|v.summary.name==high){let mut range=v.filter.unwrap_or(full);range[1]=value.max(range[0]);v.filter=Some(range)});session.feature_generation.update(|v|*v=v.wrapping_add(1));}}/></div>}})}
+                </div>
+            }}).collect_view()}</div>
+        </Show>
+        <Show when=move||!session.object_layers.get().is_empty()>
+            <div class="layer-block"><h3>"Objects & measurements"</h3>
+            {move||session.object_layers.get().into_iter().map(|layer|{let name=layer.summary.name.clone();let visible_name=name.clone();let color_name=name.clone();let size_name=name.clone();let opacity_name=name.clone();let hollow_name=name.clone();let slab_name=name.clone();let color_by_name=name.clone();view!{
+                <div class="feature-card">
+                    <div class="channel-header"><label><input type="checkbox" prop:checked=layer.visible on:change=move|ev|{let checked=event_target_checked(&ev);session.object_layers.update(|layers|if let Some(v)=layers.iter_mut().find(|v|v.summary.name==visible_name){v.visible=checked});session.feature_generation.update(|v|*v=v.wrapping_add(1));}/>{name.clone()}</label><span class="layer-meta">{format!("{} rows",layer.summary.count)}</span></div>
+                    <div class="row"><label>"Color "<input type="color" prop:value=color_hex(layer.color) on:input=move|ev|if let Some(value)=parse_color_hex(&event_target_value(&ev)){session.object_layers.update(|layers|if let Some(v)=layers.iter_mut().find(|v|v.summary.name==color_name){v.color=value})}/></label><label><input type="checkbox" prop:checked=layer.hollow on:change=move|ev|{let value=event_target_checked(&ev);session.object_layers.update(|layers|if let Some(v)=layers.iter_mut().find(|v|v.summary.name==hollow_name){v.hollow=value})}/>" Rings"</label></div>
+                    <label class="compact-control">"Size"<input type="range" min="2" max="40" step="1" prop:value=layer.size.to_string() on:input=move|ev|if let Ok(value)=event_target_value(&ev).parse(){session.object_layers.update(|layers|if let Some(v)=layers.iter_mut().find(|v|v.summary.name==size_name){v.size=value})}/></label>
+                    <label class="compact-control">"Opacity"<input type="range" min="0" max="1" step="0.05" prop:value=layer.opacity.to_string() on:input=move|ev|if let Ok(value)=event_target_value(&ev).parse(){session.object_layers.update(|layers|if let Some(v)=layers.iter_mut().find(|v|v.summary.name==opacity_name){v.opacity=value})}/></label>
+                    {layer.summary.has_z.then(||view!{<label class="compact-control">"Z slab"<input type="range" min="0" max="64" step="1" prop:value=layer.slab.to_string() on:input=move|ev|if let Ok(value)=event_target_value(&ev).parse(){session.object_layers.update(|layers|if let Some(v)=layers.iter_mut().find(|v|v.summary.name==slab_name){v.slab=value});session.feature_generation.update(|v|*v=v.wrapping_add(1));}/></label>})}
+                    <label class="compact-control">"Color by"<select on:change=move|ev|{let value=event_target_value(&ev).parse().ok();session.object_layers.update(|layers|if let Some(v)=layers.iter_mut().find(|v|v.summary.name==color_by_name){v.color_by=value})}><option value="">"fixed"</option>{layer.summary.columns.iter().enumerate().filter(|(_,v)|v.numeric).map(|(i,v)|view!{<option value=i.to_string() prop:selected=layer.color_by==Some(i)>{v.name.clone()}</option>}).collect_view()}</select></label>
+                    {layer.summary.columns.iter().enumerate().filter_map(|(column,meta)|meta.range.map(|range|{let filter=layer.filters[column].unwrap_or(range);let low_name=name.clone();let high_name=name.clone();view!{<div class="measurement-filter"><span>{meta.name.clone()}</span><input type="number" step="any" prop:value=filter[0].to_string() on:change=move|ev|{if let Ok(value)=event_target_value(&ev).parse::<f64>(){session.object_layers.update(|layers|if let Some(v)=layers.iter_mut().find(|v|v.summary.name==low_name){let mut f=v.filters[column].unwrap_or(range);f[0]=value.min(f[1]);v.filters[column]=Some(f)})}}/><span>"–"</span><input type="number" step="any" prop:value=filter[1].to_string() on:change=move|ev|{if let Ok(value)=event_target_value(&ev).parse::<f64>(){session.object_layers.update(|layers|if let Some(v)=layers.iter_mut().find(|v|v.summary.name==high_name){let mut f=v.filters[column].unwrap_or(range);f[1]=value.max(f[0]);v.filters[column]=Some(f)})}}/></div>}})).collect_view()}
+                    <div class="feature-inspection">{format!("{} of {} in view",layer.points.len(),layer.total_in_view)}</div>
+                    {layer.selected.as_ref().map(|selected|view!{<pre class="object-inspection">{serde_json::to_string_pretty(selected).unwrap_or_default()}</pre>})}
+                </div>
+            }}).collect_view()}
+            <Show when=move||!session.label_layers.get().is_empty()><button class="plain-button" on:click=move|_|{let labels=session.label_layers.get_untracked();let objects=session.object_layers.get_untracked();if let(Some(label),Some(object))=(labels.first(),objects.first()){session.count_regions(label.summary.name.clone(),object.summary.name.clone())}}>"Count objects by atlas region"</button></Show>
+            <Show when=move||!session.region_counts.get().is_empty()><div class="region-counts">{move||session.region_counts.get().into_iter().take(100).map(|row|view!{<div><span>{row.acronym.or(row.name).unwrap_or_else(||format!("ID {}",row.id))}</span><strong>{row.count}</strong></div>}).collect_view()}</div></Show>
+            </div>
+        </Show>
     }
 }
 

@@ -6,8 +6,8 @@
 //! live beside the module rather than here: they are a claim about read *and*
 //! write together, and this half cannot make it alone.
 
-use anyhow::{bail, Context, Result};
 use crate::qupath::{Annotation, Geometry, ObjectType, Plane};
+use anyhow::{bail, Context, Result};
 use serde_json::{Map, Value};
 
 use super::{DENSE_REGION, STROKE_WIDTH, T_EXTENT, Z_EXTENT};
@@ -248,4 +248,3 @@ fn read_measurements(value: &Value) -> std::collections::BTreeMap<String, f64> {
     }
     out
 }
-

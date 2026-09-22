@@ -57,15 +57,20 @@ button { cursor: pointer; }
 .pane.ortho:active { cursor: grabbing; }
 .pane .slice-image { position: absolute; display: block; image-rendering: auto; user-select: none; -webkit-user-drag: none; pointer-events: none; }
 .pane .slice-tile-layer { position: absolute; left: 0; top: 0; transform-origin: 0 0; pointer-events: none; }
+.pane .label-tiles { z-index: 2; }
 .pane .slice-tile { position: absolute; display: block; opacity: 0; image-rendering: auto; user-select: none; -webkit-user-drag: none; pointer-events: none; }
 .pane .slice-tile.loaded { opacity: 1; background: var(--bg-deep); }
 .pane .annotation-overlay { position: absolute; overflow: visible; pointer-events: none; }
+.pane .object-point { vector-effect: non-scaling-stroke; }
+.pane .object-point.selected { filter: drop-shadow(0 0 3px white); }
 .pane .annotation-overlay .annotation-shape { vector-effect: non-scaling-stroke; fill-rule: evenodd; }
 .pane .annotation-overlay .annotation-shape.selected { stroke: #fff; stroke-width: 3; }
 .pane .annotation-overlay .annotation-handle { fill: #fff; stroke: #18213e; stroke-width: 1; vector-effect: non-scaling-stroke; }
 .pane .annotation-overlay .profile-measurement { vector-effect: non-scaling-stroke; }
 .pane .annotation-overlay .profile-measurement-label { fill: #ffd848; stroke: #000; stroke-width: 3px; paint-order: stroke; stroke-linejoin: round; font-weight: 600; }
 .pane .pane-zoom { position: absolute; right: 8px; bottom: 6px; font-size: 11px; color: var(--muted); pointer-events: none; text-shadow: 0 0 3px #000; }
+.pane .scale-bar { position: absolute; left: 8px; bottom: 25px; height: 7px; min-width: 1px; border-left: 1px solid #fff; border-right: 1px solid #fff; border-bottom: 2px solid #fff; color: #fff; pointer-events: none; filter: drop-shadow(0 1px 2px #000); }
+.pane .scale-bar span { position: absolute; left: 50%; bottom: 7px; transform: translateX(-50%); white-space: nowrap; font-size: 10px; font-weight: 600; }
 .pane.volume { cursor: grab; }
 .pane.volume:active { cursor: grabbing; }
 .pane.cube canvas { cursor: default; }
@@ -173,6 +178,15 @@ button { cursor: pointer; }
 .dual-range input[type="range"].min::-moz-range-track { background: #333; border-radius: 2px; }
 .dual-range input[type="range"]::-webkit-slider-thumb { -webkit-appearance: none; appearance: none; width: 14px; height: 14px; margin-top: -5px; border-radius: 50%; background: var(--accent); border: 0; pointer-events: none; }
 .dual-range input[type="range"]::-moz-range-thumb { width: 14px; height: 14px; border-radius: 50%; background: var(--accent); border: 0; pointer-events: none; }
+.feature-card { margin: 8px 0; padding: 8px; border: 1px solid var(--border); border-radius: 5px; background: rgba(255,255,255,.025); }
+.compact-control { display: grid; grid-template-columns: 70px 1fr; align-items: center; gap: 6px; margin: 5px 0; font-size: 12px; }
+.compact-control input[type="range"], .compact-control select { width: 100%; min-width: 0; }
+.feature-inspection { margin-top: 6px; color: var(--muted-light); font-size: 11px; overflow-wrap: anywhere; }
+.measurement-filter { display: grid; grid-template-columns: minmax(55px,1fr) 64px auto 64px; gap: 3px; align-items: center; margin: 3px 0; font-size: 11px; }
+.measurement-filter input { width: 64px; min-width: 0; }
+.object-inspection { max-height: 150px; overflow: auto; white-space: pre-wrap; font-size: 10px; color: var(--muted-light); }
+.region-counts { max-height: 220px; overflow: auto; margin-top: 6px; font-size: 11px; }
+.region-counts div { display: flex; justify-content: space-between; gap: 8px; padding: 2px 0; }
 
 .add-layer { display: flex; flex-direction: column; gap: 6px; }
 .add-layer select, .add-layer input, .front-page input { background: var(--bg-deep); border: 1px solid var(--border-soft); border-radius: 4px; padding: 4px 6px; color: var(--text); font-size: 12px; }

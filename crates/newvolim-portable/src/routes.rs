@@ -2628,8 +2628,7 @@ pub fn portable_xy_line_profile(
     let source_from = source_point(from);
     let source_to = source_point(to);
     let source_length = (source_to[0] - source_from[0]).hypot(source_to[1] - source_from[1]);
-    let count = ((source_length.ceil() as usize).saturating_add(1))
-        .clamp(2, maximum_samples);
+    let count = ((source_length.ceil() as usize).saturating_add(1)).clamp(2, maximum_samples);
     let source_z = (z * shape[2] as f64 / shape0[2] as f64)
         .floor()
         .clamp(0.0, shape[2].saturating_sub(1) as f64) as u64;
@@ -2648,8 +2647,7 @@ pub fn portable_xy_line_profile(
     let chunk_counts: [u64; 3] =
         std::array::from_fn(|axis| shape[axis].div_ceil(chunk_shape[axis]));
     let chunk_index = |coordinate: [u64; 3]| {
-        let chunk: [u64; 3] =
-            std::array::from_fn(|axis| coordinate[axis] / chunk_shape[axis]);
+        let chunk: [u64; 3] = std::array::from_fn(|axis| coordinate[axis] / chunk_shape[axis]);
         u32::try_from(chunk[0] + chunk_counts[0] * (chunk[1] + chunk_counts[1] * chunk[2]))
             .map_err(|_| "profile chunk index exceeds u32".to_owned())
     };

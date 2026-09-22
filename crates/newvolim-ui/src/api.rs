@@ -162,6 +162,149 @@ pub struct DatasetList {
     pub datasets: Vec<String>,
 }
 
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct FeatureManifest {
+    pub labels: Vec<LabelSummary>,
+    pub objects: Vec<ObjectSummary>,
+    pub tables: Vec<MeasurementSummary>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct LabelSummary {
+    pub name: String,
+    pub shape_xyz: [u32; 3],
+    pub levels: Vec<[u32; 3]>,
+    pub has_color_table: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ObjectSummary {
+    pub name: String,
+    pub count: usize,
+    pub has_z: bool,
+    pub columns: Vec<ObjectColumn>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ObjectColumn {
+    pub name: String,
+    pub numeric: bool,
+    pub range: Option<[f64; 2]>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct MeasurementSummary {
+    pub name: String,
+    pub count: usize,
+    pub region: Option<String>,
+    pub columns: Vec<ObjectColumn>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ObjectPoint {
+    pub row: usize,
+    pub x: f64,
+    pub y: f64,
+    pub z: f64,
+    pub values: Vec<Option<f64>>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ObjectQueryResult {
+    pub points: Vec<ObjectPoint>,
+    pub total: usize,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct LabelInspection {
+    pub id: u64,
+    pub name: Option<String>,
+    pub acronym: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct RegionCount {
+    pub id: u64,
+    pub name: Option<String>,
+    pub acronym: Option<String>,
+    pub count: usize,
+}
+
+pub fn features_url(origin: &str, dataset: &str) -> String {
+    format!("{origin}/v1/datasets/{}/features", encode_path(dataset))
+}
+pub fn label_tile_url(
+    origin: &str,
+    dataset: &str,
+    label: &str,
+    level: u32,
+    tile_x: u32,
+    tile_y: u32,
+    generation: u64,
+    outline: bool,
+    selected: Option<u64>,
+    opacity: f64,
+    z: u32,
+    measurement: Option<(&str, usize, [f64; 2])>,
+) -> String {
+    let selected = selected
+        .map(|v| format!("&selected={v}"))
+        .unwrap_or_default();
+    let measurement = measurement
+        .map(|(table, column, [min, max])| {
+            format!(
+                "&table={}&column={column}&min={min}&max={max}",
+                encode_path(table)
+            )
+        })
+        .unwrap_or_default();
+    format!("{origin}/v1/datasets/{}/labels/{}/tiles/xy/{level}/{tile_x}/{tile_y}?v={generation}&outline={outline}&opacity={opacity}&z={z}{selected}{measurement}",encode_path(dataset),encode_path(label))
+}
+pub fn label_value_url(origin: &str, dataset: &str, label: &str, x: u32, y: u32, z: u32) -> String {
+    format!(
+        "{origin}/v1/datasets/{}/labels/{}/value?x={x}&y={y}&z={z}",
+        encode_path(dataset),
+        encode_path(label)
+    )
+}
+pub fn objects_url(origin: &str, dataset: &str, objects: &str, b: [f64; 6]) -> String {
+    format!(
+        "{origin}/v1/datasets/{}/objects/{}?x0={}&x1={}&y0={}&y1={}&z0={}&z1={}&max=200000",
+        encode_path(dataset),
+        encode_path(objects),
+        b[0],
+        b[1],
+        b[2],
+        b[3],
+        b[4],
+        b[5]
+    )
+}
+pub fn object_row_url(origin: &str, dataset: &str, objects: &str, row: usize) -> String {
+    format!(
+        "{origin}/v1/datasets/{}/objects/{}/rows/{row}",
+        encode_path(dataset),
+        encode_path(objects)
+    )
+}
+pub fn regions_url(origin: &str, dataset: &str, label: &str, objects: &str) -> String {
+    format!(
+        "{origin}/v1/datasets/{}/regions?label={}&objects={}",
+        encode_path(dataset),
+        encode_path(label),
+        encode_path(objects)
+    )
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum RenderView {
@@ -239,6 +382,14 @@ pub enum SocketReply {
         viewport: bool,
         #[serde(default)]
         pyramid_shapes_xyz: Vec<[u32; 3]>,
+        #[serde(default = "unit_spacing")]
+        voxel_spacing_xyz: [f64; 3],
+        #[serde(default)]
+        spatial_units_xyz: [Option<String>; 3],
+        #[serde(default)]
+        timepoint: u32,
+        #[serde(default = "one_timepoint")]
+        timepoint_count: u32,
     },
     #[serde(rename_all = "camelCase")]
     Channels {
@@ -253,6 +404,13 @@ pub enum SocketReply {
         status: u16,
         message: String,
     },
+}
+
+fn unit_spacing() -> [f64; 3] {
+    [1.0; 3]
+}
+fn one_timepoint() -> u32 {
+    1
 }
 
 /// Where the API is. An empty box means the page's own origin (the server's `--page-dir`
@@ -402,6 +560,8 @@ pub fn layers_url(origin: &str, dataset: &str) -> String {
 pub struct SceneSettings {
     /// See-through depth: a multiplier on the opacity reference, 1 by default, 0.05..=100.
     pub depth_scale: f32,
+    pub timepoint: u32,
+    pub timepoint_count: u32,
 }
 
 pub fn settings_url(origin: &str, dataset: &str) -> String {
@@ -415,6 +575,48 @@ pub fn depth_scale_from_slider(position: f32) -> f32 {
 
 pub fn slider_from_depth_scale(scale: f32) -> f32 {
     scale.max(1e-6).log10().clamp(0.05_f32.log10(), 2.0)
+}
+
+/// A readable 1/2/5 scale-bar length near 100 screen pixels.
+pub fn scale_bar_spec(
+    pixels_per_voxel: f64,
+    physical_per_voxel: f64,
+    unit: Option<&str>,
+) -> Option<(f64, String)> {
+    if !pixels_per_voxel.is_finite()
+        || pixels_per_voxel <= 0.0
+        || !physical_per_voxel.is_finite()
+        || physical_per_voxel <= 0.0
+    {
+        return None;
+    }
+    let target = 100.0 / pixels_per_voxel * physical_per_voxel;
+    let power = 10_f64.powf(target.log10().floor());
+    let normalized = target / power;
+    let step = if normalized >= 5.0 {
+        5.0
+    } else if normalized >= 2.0 {
+        2.0
+    } else {
+        1.0
+    };
+    let distance = step * power;
+    let width = distance / physical_per_voxel * pixels_per_voxel;
+    let normalized_unit = unit.unwrap_or("px").to_ascii_lowercase();
+    let unit = match normalized_unit.as_str() {
+        "micrometer" | "micrometre" | "um" | "µm" => "µm".to_owned(),
+        "millimeter" | "millimetre" | "mm" => "mm".to_owned(),
+        "nanometer" | "nanometre" | "nm" => "nm".to_owned(),
+        other => other.to_owned(),
+    };
+    let value = if distance >= 100.0 {
+        format!("{distance:.0}")
+    } else if distance >= 10.0 {
+        format!("{distance:.1}")
+    } else {
+        format!("{distance:.2}")
+    };
+    Some((width, format!("{value} {unit}")))
 }
 
 /// The client residency routes: the plan (including the fitted camera) and chunk words.
@@ -912,8 +1114,13 @@ mod tests {
             "http://h/v1/datasets/d/settings"
         );
         assert_eq!(
-            serde_json::to_value(SceneSettings { depth_scale: 2.5 }).unwrap(),
-            serde_json::json!({"depthScale": 2.5})
+            serde_json::to_value(SceneSettings {
+                depth_scale: 2.5,
+                timepoint: 3,
+                timepoint_count: 8,
+            })
+            .unwrap(),
+            serde_json::json!({"depthScale": 2.5, "timepoint": 3, "timepointCount": 8})
         );
         assert!((depth_scale_from_slider(0.0) - 1.0).abs() < 1e-6);
         assert!((depth_scale_from_slider(1.0) - 10.0).abs() < 1e-5);
@@ -928,6 +1135,19 @@ mod tests {
             2.0,
             "clamped into the slider"
         );
+    }
+
+    #[test]
+    fn scale_bar_uses_calibrated_nice_lengths() {
+        assert_eq!(
+            scale_bar_spec(2.0, 0.5, Some("micrometer")),
+            Some((80.0, "20.0 µm".into()))
+        );
+        assert_eq!(
+            scale_bar_spec(1.0, 1.0, None),
+            Some((100.0, "100 px".into()))
+        );
+        assert_eq!(scale_bar_spec(0.0, 1.0, Some("mm")), None);
     }
 
     #[test]

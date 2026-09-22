@@ -158,7 +158,9 @@ impl ChunkCache {
         self.total_words += self.words[&key].len();
         self.order.push_back(key);
         while self.total_words > self.budget_words && self.order.len() > 1 {
-            let Some(oldest) = self.order.pop_front() else { break };
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
             if let Some(evicted) = self.words.remove(&oldest) {
                 self.total_words -= evicted.len();
             }
@@ -199,7 +201,12 @@ impl ClientResidency {
         let rays = rays_from_words(ray_words)?;
         let pixels = plan.width as usize * plan.height as usize;
         if rays.len() != pixels {
-            return Err(format!("plan is {}×{} but {} rays were given", plan.width, plan.height, rays.len()));
+            return Err(format!(
+                "plan is {}×{} but {} rays were given",
+                plan.width,
+                plan.height,
+                rays.len()
+            ));
         }
         if plan.levels.len() != plan.layers.len() || plan.level_counts.len() != plan.layers.len() {
             return Err("plan levels do not match its layers".into());
@@ -209,8 +216,12 @@ impl ClientResidency {
             let grid = PortableChunkGrid::new(layer.dimensions_xyz, layer.chunk_shape_xyz)
                 .ok_or_else(|| format!("layer {} has an empty extent or chunk", layer.layer_id))?;
             for (channel_index, channel) in layer.channels.iter().enumerate() {
-                if PortableResidencyTag::compose(channel.ordinal, layer.level) != Some(channel.tag) {
-                    return Err(format!("channel ordinal {} at level {} does not give tag {}", channel.ordinal, layer.level, channel.tag));
+                if PortableResidencyTag::compose(channel.ordinal, layer.level) != Some(channel.tag)
+                {
+                    return Err(format!(
+                        "channel ordinal {} at level {} does not give tag {}",
+                        channel.ordinal, layer.level, channel.tag
+                    ));
                 }
                 let residency = PortableResidencyLoop::new(
                     channel.tag,
@@ -221,13 +232,22 @@ impl ClientResidency {
                     MAX_ITERATIONS,
                 )
                 .ok_or_else(|| "residency loop could not be started".to_owned())?;
-                loops.push(ChannelLoop { layer: layer_index, channel: channel_index, residency });
+                loops.push(ChannelLoop {
+                    layer: layer_index,
+                    channel: channel_index,
+                    residency,
+                });
             }
         }
         if loops.is_empty() {
             return Err("plan has no channels".into());
         }
-        Ok(Self { plan, rays, loops, cache })
+        Ok(Self {
+            plan,
+            rays,
+            loops,
+            cache,
+        })
     }
 
     pub fn plan(&self) -> &ScenePlan {
@@ -312,7 +332,11 @@ impl ClientResidency {
                 other => return Err(format!("residency loop stopped: {other:?}")),
             }
         }
-        Ok(if complete { StepOutcome::Complete } else { StepOutcome::Planned })
+        Ok(if complete {
+            StepOutcome::Complete
+        } else {
+            StepOutcome::Planned
+        })
     }
 
     /// The pages of one channel from the cache, in the plan's placement: the server's
@@ -335,7 +359,10 @@ impl ClientResidency {
         pages
             .into_iter()
             .zip(plan.page_owners())
-            .map(|(words, &owner)| PortableTensorPage::new(owner, words).ok_or_else(|| "assembled page is invalid".to_owned()))
+            .map(|(words, &owner)| {
+                PortableTensorPage::new(owner, words)
+                    .ok_or_else(|| "assembled page is invalid".to_owned())
+            })
             .collect()
     }
 
@@ -360,20 +387,33 @@ impl ClientResidency {
                 let pages = self.channel_pages(channel_loop)?;
                 bound_pages += pages.len();
                 if bound_pages > PortableDvrPageFrameInput::MAX_PAGES {
-                    return Err(format!("the scene needs {bound_pages} static pages, beyond the portable bound"));
+                    return Err(format!(
+                        "the scene needs {bound_pages} static pages, beyond the portable bound"
+                    ));
                 }
-                let volume = PortableDvrVolumeLevel::new_demand_resident(layer.dimensions_xyz, layer.minimum, layer.maximum, pages)
-                    .ok_or("scene volume is invalid")?;
-                let transfer = PortableTransferFunction::new(channel.transfer_min, channel.transfer_max, channel.transfer_entries.clone())
-                    .ok_or("transfer function is invalid")?;
+                let volume = PortableDvrVolumeLevel::new_demand_resident(
+                    layer.dimensions_xyz,
+                    layer.minimum,
+                    layer.maximum,
+                    pages,
+                )
+                .ok_or("scene volume is invalid")?;
+                let transfer = PortableTransferFunction::new(
+                    channel.transfer_min,
+                    channel.transfer_max,
+                    channel.transfer_entries.clone(),
+                )
+                .ok_or("transfer function is invalid")?;
                 scene_channels.push(PortableDvrSceneChannel::with_residency(
                     volume,
                     transfer,
-                    PortableDvrSceneResidency::new(layer.chunk_shape_xyz, channel.tag).ok_or("residency tag is outside the portable key")?,
+                    PortableDvrSceneResidency::new(layer.chunk_shape_xyz, channel.tag)
+                        .ok_or("residency tag is outside the portable key")?,
                 ));
                 loop_index += 1;
             }
-            scene_layers.push(PortableDvrSceneLayer::new(scene_channels).ok_or("scene layer is invalid")?);
+            scene_layers
+                .push(PortableDvrSceneLayer::new(scene_channels).ok_or("scene layer is invalid")?);
         }
         let input = PortableDvrSceneFrameInput::new(
             self.plan.width,
@@ -403,24 +443,48 @@ pub fn assemble_pages<'a>(
     plan: &palace_core::gpu::PortableChunkPlan,
     words_for: impl Fn(u32) -> Option<&'a [u32]>,
 ) -> Result<Vec<Vec<u32>>, String> {
-    let mut pages: Vec<Vec<u32>> = plan.page_words().iter().map(|words| Vec::with_capacity(*words as usize)).collect();
+    let mut pages: Vec<Vec<u32>> = plan
+        .page_words()
+        .iter()
+        .map(|words| Vec::with_capacity(*words as usize))
+        .collect();
     for chunk in plan.chunks() {
-        let words = words_for(chunk.chunk_index).ok_or_else(|| format!("chunk {} is planned but not available", chunk.chunk_index))?;
-        let expected = chunk.logical_xyz.iter().map(|&extent| extent as usize).product::<usize>();
+        let words = words_for(chunk.chunk_index)
+            .ok_or_else(|| format!("chunk {} is planned but not available", chunk.chunk_index))?;
+        let expected = chunk
+            .logical_xyz
+            .iter()
+            .map(|&extent| extent as usize)
+            .product::<usize>();
         if words.len() != expected {
-            return Err(format!("chunk {} has {} words, its logical extent needs {expected}", chunk.chunk_index, words.len()));
+            return Err(format!(
+                "chunk {} has {} words, its logical extent needs {expected}",
+                chunk.chunk_index,
+                words.len()
+            ));
         }
-        let page = pages
-            .get_mut(chunk.page as usize)
-            .ok_or_else(|| format!("chunk {} is planned into page {}, beyond the plan", chunk.chunk_index, chunk.page))?;
+        let page = pages.get_mut(chunk.page as usize).ok_or_else(|| {
+            format!(
+                "chunk {} is planned into page {}, beyond the plan",
+                chunk.chunk_index, chunk.page
+            )
+        })?;
         if page.len() != chunk.first_word as usize {
-            return Err(format!("chunk {} is placed at word {} but the page holds {}", chunk.chunk_index, chunk.first_word, page.len()));
+            return Err(format!(
+                "chunk {} is placed at word {} but the page holds {}",
+                chunk.chunk_index,
+                chunk.first_word,
+                page.len()
+            ));
         }
         page.extend_from_slice(words);
     }
     for (page, &planned) in pages.iter().zip(plan.page_words()) {
         if page.len() != planned as usize {
-            return Err(format!("page holds {} words, the plan says {planned}", page.len()));
+            return Err(format!(
+                "page holds {} words, the plan says {planned}",
+                page.len()
+            ));
         }
     }
     Ok(pages)
@@ -449,16 +513,32 @@ pub fn ray_words(rays: &[PortableRayInterval]) -> Vec<u32> {
 /// Expand the plan's fitted camera into the same clipped world rays as the server's demand route.
 pub fn ray_words_for_plan(plan: &ScenePlan) -> Result<Vec<u32>, String> {
     let camera = &plan.camera;
-    if plan.width == 0 || plan.height == 0 || !camera.focal_scale.is_finite()
-        || camera.origin_zyx.iter().chain(&camera.forward_zyx).chain(&camera.right_zyx)
-            .chain(&camera.up_zyx).chain(&camera.minimum).chain(&camera.maximum)
+    if plan.width == 0
+        || plan.height == 0
+        || !camera.focal_scale.is_finite()
+        || camera
+            .origin_zyx
+            .iter()
+            .chain(&camera.forward_zyx)
+            .chain(&camera.right_zyx)
+            .chain(&camera.up_zyx)
+            .chain(&camera.minimum)
+            .chain(&camera.maximum)
             .any(|value| !value.is_finite())
-        || camera.translation_xyz.iter().any(|value| !value.is_finite())
-        || camera.minimum.iter().zip(camera.maximum).any(|(min, max)| *min >= max)
+        || camera
+            .translation_xyz
+            .iter()
+            .any(|value| !value.is_finite())
+        || camera
+            .minimum
+            .iter()
+            .zip(camera.maximum)
+            .any(|(min, max)| *min >= max)
     {
         return Err("plan has an invalid ray camera".into());
     }
-    let count = (plan.width as usize).checked_mul(plan.height as usize)
+    let count = (plan.width as usize)
+        .checked_mul(plan.height as usize)
         .and_then(|pixels| pixels.checked_mul(RAY_WORDS))
         .ok_or("plan ray count overflows usize")?;
     let forward: Vector<D3, f32> = camera.forward_zyx.into();
@@ -476,11 +556,12 @@ pub fn ray_words_for_plan(plan: &ScenePlan) -> Result<Vec<u32>, String> {
             let direction = (forward
                 + right.scale(horizontal * aspect * camera.focal_scale)
                 + up.scale(vertical * camera.focal_scale))
-                .normalized();
+            .normalized();
             let direction_xyz = [direction[2], direction[1], direction[0]];
             let ray = PortableRayInterval::new(origin, direction_xyz, 0.0, f32::MAX)
                 .ok_or("plan generated an invalid ray")?;
-            let ray = ray.clipped_to_aabb(camera.minimum, camera.maximum)
+            let ray = ray
+                .clipped_to_aabb(camera.minimum, camera.maximum)
                 .or_else(|| PortableRayInterval::new(origin, direction_xyz, 0.0, 0.0))
                 .ok_or("plan generated an invalid transparent ray")?;
             words.extend_from_slice(&ray.words());
@@ -551,42 +632,82 @@ mod tests {
 
     fn rays(count: usize) -> Vec<u32> {
         (0..count)
-            .flat_map(|_| PortableRayInterval::new([3.0, 2.0, -1.0], [0.0, 0.0, 1.0], 0.0, 4.0).unwrap().words())
+            .flat_map(|_| {
+                PortableRayInterval::new([3.0, 2.0, -1.0], [0.0, 0.0, 1.0], 0.0, 4.0)
+                    .unwrap()
+                    .words()
+            })
             .collect()
     }
 
     #[test]
     fn a_frame_starts_empty_plans_more_on_misses_and_completes_when_nothing_is_missed() {
-        let mut client = ClientResidency::new(plan(2, 1), &rays(2), ChunkCache::new(1 << 20)).unwrap();
-        assert!(client.missing_chunks().is_empty(), "nothing is planned before the first dispatch");
+        let mut client =
+            ClientResidency::new(plan(2, 1), &rays(2), ChunkCache::new(1 << 20)).unwrap();
+        assert!(
+            client.missing_chunks().is_empty(),
+            "nothing is planned before the first dispatch"
+        );
         // The bootstrap dispatch carries a placeholder page and an empty residency map.
         let dispatch = client.dispatch().unwrap();
         assert_eq!(dispatch.pages[0], vec![0]);
         assert_eq!(dispatch.request_capacity, PAGE_TABLE_CAPACITY);
         // The shader missed chunks 0 and 3 (the grid is 2×1×2 chunks).
-        let key = |chunk: u32| PortableFeedbackKey::new(chunk, PortableResidencyTag::compose(0, 0).unwrap()).unwrap().packed();
+        let key = |chunk: u32| {
+            PortableFeedbackKey::new(chunk, PortableResidencyTag::compose(0, 0).unwrap())
+                .unwrap()
+                .packed()
+        };
         let mut requests = vec![u32::MAX; PAGE_TABLE_CAPACITY];
         requests[5] = key(3);
         requests[9] = key(0);
         requests[11] = key(3);
-        assert_eq!(client.absorb_requests(&requests).unwrap(), StepOutcome::Planned);
+        assert_eq!(
+            client.absorb_requests(&requests).unwrap(),
+            StepOutcome::Planned
+        );
         let missing = client.missing_chunks();
         assert_eq!(
-            missing.iter().map(|m| (m.layer_id, m.level, m.source_index, m.ordinal, m.chunk_index, m.chunk_xyz)).collect::<Vec<_>>(),
+            missing
+                .iter()
+                .map(|m| (
+                    m.layer_id,
+                    m.level,
+                    m.source_index,
+                    m.ordinal,
+                    m.chunk_index,
+                    m.chunk_xyz
+                ))
+                .collect::<Vec<_>>(),
             vec![(7, 0, 1, 0, 0, [0, 0, 0]), (7, 0, 1, 0, 3, [1, 0, 1])],
             "planned in ascending chunk order, once each"
         );
-        assert!(client.dispatch().is_err(), "planned chunks must be fetched before dispatching");
+        assert!(
+            client.dispatch().is_err(),
+            "planned chunks must be fetched before dispatching"
+        );
         // Chunk 0 is a full 4×4×1 chunk; chunk 3 is the x-edge chunk, 2×4×1.
         client.insert_chunk(&missing[0], (0..16).collect());
         client.insert_chunk(&missing[1], (100..108).collect());
         let dispatch = client.dispatch().unwrap();
-        assert_eq!(dispatch.pages[0].len(), 24, "both chunks in page 0, back to back");
+        assert_eq!(
+            dispatch.pages[0].len(),
+            24,
+            "both chunks in page 0, back to back"
+        );
         assert_eq!(&dispatch.pages[0][..16], &(0..16).collect::<Vec<u32>>()[..]);
-        assert_eq!(&dispatch.pages[0][16..], &(100..108).collect::<Vec<u32>>()[..]);
+        assert_eq!(
+            &dispatch.pages[0][16..],
+            &(100..108).collect::<Vec<u32>>()[..]
+        );
         assert!(dispatch.pages[1].is_empty());
         // Nothing missed: complete. Absorbing the same keys again would be a desynchronization.
-        assert_eq!(client.absorb_requests(&vec![u32::MAX; PAGE_TABLE_CAPACITY]).unwrap(), StepOutcome::Complete);
+        assert_eq!(
+            client
+                .absorb_requests(&vec![u32::MAX; PAGE_TABLE_CAPACITY])
+                .unwrap(),
+            StepOutcome::Complete
+        );
         let cache = client.into_cache();
         assert_eq!((cache.len(), cache.total_words()), (2, 24));
     }
@@ -594,28 +715,49 @@ mod tests {
     #[test]
     fn a_request_for_a_channel_the_frame_lacks_is_an_error_and_a_bound_is_reported() {
         let mut client = ClientResidency::new(plan(1, 1), &rays(1), ChunkCache::default()).unwrap();
-        let foreign = PortableFeedbackKey::new(0, PortableResidencyTag::compose(3, 0).unwrap()).unwrap().packed();
+        let foreign = PortableFeedbackKey::new(0, PortableResidencyTag::compose(3, 0).unwrap())
+            .unwrap()
+            .packed();
         assert!(client.absorb_requests(&[foreign]).is_err());
         // A chunk larger than a page cannot be planned: the loop reports the bound.
         let mut huge = plan(1, 1);
         huge.layers[0].dimensions_xyz = [2048, 2048, 1];
         huge.layers[0].chunk_shape_xyz = [2048, 2048, 1];
         let mut client = ClientResidency::new(huge, &rays(1), ChunkCache::default()).unwrap();
-        let key = PortableFeedbackKey::new(0, PortableResidencyTag::compose(0, 0).unwrap()).unwrap().packed();
-        assert!(matches!(client.absorb_requests(&[key]).unwrap(), StepOutcome::ExceedsPortableBound { required_pages: 4 }));
+        let key = PortableFeedbackKey::new(0, PortableResidencyTag::compose(0, 0).unwrap())
+            .unwrap()
+            .packed();
+        assert!(matches!(
+            client.absorb_requests(&[key]).unwrap(),
+            StepOutcome::ExceedsPortableBound { required_pages: 4 }
+        ));
     }
 
     #[test]
     fn the_cache_evicts_oldest_first_within_its_budget_and_never_starves_the_newest() {
         let mut cache = ChunkCache::new(10);
-        let request = |chunk_index: u32| ChunkRequest { layer_id: 1, level: 0, source_index: 0, ordinal: 0, chunk_index, chunk_xyz: [0; 3] };
+        let request = |chunk_index: u32| ChunkRequest {
+            layer_id: 1,
+            level: 0,
+            source_index: 0,
+            ordinal: 0,
+            chunk_index,
+            chunk_xyz: [0; 3],
+        };
         cache.insert(&request(1), vec![0; 4]);
         cache.insert(&request(2), vec![0; 4]);
         cache.insert(&request(3), vec![0; 4]);
-        assert!(!cache.contains(&request(1)) && cache.contains(&request(2)) && cache.contains(&request(3)));
+        assert!(
+            !cache.contains(&request(1))
+                && cache.contains(&request(2))
+                && cache.contains(&request(3))
+        );
         assert_eq!(cache.total_words(), 8);
         cache.insert(&request(4), vec![0; 40]);
-        assert!(cache.contains(&request(4)) && cache.len() == 1, "an over-budget chunk still lands, alone");
+        assert!(
+            cache.contains(&request(4)) && cache.len() == 1,
+            "an over-budget chunk still lands, alone"
+        );
         // Re-inserting refreshes, not duplicates.
         let mut cache = ChunkCache::new(100);
         cache.insert(&request(1), vec![0; 4]);
