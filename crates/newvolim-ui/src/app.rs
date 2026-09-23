@@ -250,6 +250,7 @@ pub struct ObjectUiState {
     pub filters: Vec<Option<[f64; 2]>>,
     pub points: Vec<ObjectPoint>,
     pub total_in_view: usize,
+    pub too_dense: bool,
     pub selected: Option<serde_json::Value>,
 }
 
@@ -284,6 +285,7 @@ struct SliceTileSet {
 
 #[derive(Clone, Debug, PartialEq)]
 struct LabelTileSet {
+    name: String,
     key: String,
     level: usize,
     level_shape: [u32; 3],
@@ -336,6 +338,7 @@ pub struct Session {
     pub measurement_tables: RwSignal<Vec<MeasurementUiState>>,
     pub region_counts: RwSignal<Vec<RegionCount>>,
     pub feature_generation: RwSignal<u64>,
+    object_query_generation: StoredValue<u64>,
     pub annotation_roi_tables: RwSignal<Vec<RoiTableSummary>>,
     pub annotation_layer: RwSignal<Option<u64>>,
     pub annotation_tool: RwSignal<AnnotationTool>,
@@ -443,6 +446,7 @@ impl Session {
             measurement_tables: RwSignal::new(Vec::new()),
             region_counts: RwSignal::new(Vec::new()),
             feature_generation: RwSignal::new(0),
+            object_query_generation: StoredValue::new(0),
             annotation_roi_tables: RwSignal::new(Vec::new()),
             annotation_layer: RwSignal::new(None),
             annotation_tool: RwSignal::new(AnnotationTool::Pan),
@@ -610,6 +614,8 @@ impl Session {
         self.annotation_layers.set(Vec::new());
         self.label_layers.set(Vec::new());
         self.object_layers.set(Vec::new());
+        self.object_query_generation
+            .update_value(|v| *v = v.wrapping_add(1));
         self.measurement_tables.set(Vec::new());
         self.region_counts.set(Vec::new());
         self.annotation_roi_tables.set(Vec::new());
@@ -700,7 +706,7 @@ impl Session {
                                 let filters = vec![None; summary.columns.len()];
                                 ObjectUiState {
                                     summary,
-                                    visible: true,
+                                    visible: false,
                                     color: [255, 190, 45],
                                     opacity: 0.9,
                                     size: 7.0,
@@ -710,6 +716,7 @@ impl Session {
                                     filters,
                                     points: Vec::new(),
                                     total_in_view: 0,
+                                    too_dense: false,
                                     selected: None,
                                 }
                             })
@@ -739,19 +746,33 @@ impl Session {
         else {
             return;
         };
+        let generation = self.object_query_generation.get_value().wrapping_add(1);
+        self.object_query_generation.set_value(generation);
         let layers = self.object_layers.get_untracked();
         for layer in layers.into_iter().filter(|v| v.visible) {
             let name = layer.summary.name.clone();
             let url = objects_url(&origin, &dataset, &name, bounds);
             spawn_local(async move {
+                gloo_timers::future::TimeoutFuture::new(140).await;
+                if self.object_query_generation.get_value() != generation {
+                    return;
+                }
                 match get_json::<ObjectQueryResult>(&url).await {
-                    Ok(result) => self.object_layers.update(|layers| {
-                        if let Some(layer) = layers.iter_mut().find(|v| v.summary.name == name) {
-                            layer.points = result.points;
-                            layer.total_in_view = result.total
-                        }
-                    }),
-                    Err(message) => self.fail(format!("objects {name}: {message}")),
+                    Ok(result) if self.object_query_generation.get_value() == generation => {
+                        self.object_layers.update(|layers| {
+                            if let Some(layer) = layers.iter_mut().find(|v| v.summary.name == name)
+                            {
+                                layer.points = result.points;
+                                layer.total_in_view = result.total;
+                                layer.too_dense = result.too_dense;
+                            }
+                        })
+                    }
+                    Ok(_) => {}
+                    Err(message) if self.object_query_generation.get_value() == generation => {
+                        self.fail(format!("objects {name}: {message}"))
+                    }
+                    Err(_) => {}
                 }
             });
         }
@@ -3420,7 +3441,7 @@ fn OrthoPane(plane: Plane) -> impl IntoView {
                                 generation,
                                 layer.outline,
                                 selected,
-                                layer.opacity,
+                                1.0,
                                 z,
                                 measurement
                                     .as_ref()
@@ -3434,6 +3455,7 @@ fn OrthoPane(plane: Plane) -> impl IntoView {
                     }
                 }
                 Some(LabelTileSet {
+                    name: layer.summary.name.clone(),
                     key: format!("{}:{level}:{generation}", layer.summary.name),
                     level,
                     level_shape,
@@ -3459,6 +3481,32 @@ fn OrthoPane(plane: Plane) -> impl IntoView {
             height * 0.5 - focus[1] * scale
         )
     };
+    let active_label_tiles = RwSignal::new(Vec::<LabelTileSet>::new());
+    let previous_label_tiles = RwSignal::new(Vec::<LabelTileSet>::new());
+    let last_complete_label_tiles = StoredValue::new(Vec::<LabelTileSet>::new());
+    let pending_label_tiles = StoredValue::new(HashSet::<String>::new());
+    let label_tile_transition = RwSignal::new(0_u64);
+    let label_tiles_ready = RwSignal::new(true);
+    Effect::new(move |_| {
+        let desired = label_tile_sets();
+        if active_label_tiles.get_untracked() == desired {
+            return;
+        }
+        previous_label_tiles.set(last_complete_label_tiles.get_value());
+        pending_label_tiles.set_value(
+            desired
+                .iter()
+                .flat_map(|set| set.tiles.iter().map(|tile| tile.src.clone()))
+                .collect(),
+        );
+        label_tile_transition.update(|transition| *transition = transition.wrapping_add(1));
+        label_tiles_ready.set(pending_label_tiles.get_value().is_empty());
+        active_label_tiles.set(desired.clone());
+        if pending_label_tiles.get_value().is_empty() {
+            last_complete_label_tiles.set_value(desired);
+            previous_label_tiles.set(Vec::new());
+        }
+    });
     let active_tiles = RwSignal::new(None::<SliceTileSet>);
     let previous_tiles = RwSignal::new(None::<SliceTileSet>);
     let last_complete_tiles = StoredValue::new(None::<SliceTileSet>);
@@ -3875,11 +3923,38 @@ fn OrthoPane(plane: Plane) -> impl IntoView {
                     }
                 />
             </div>
-            {move||label_tile_sets().into_iter().map(|set|view!{
-                <div class="slice-tile-layer label-tiles" data-layer=set.key style:transform=label_transform(set.level_shape)>
+            {move||previous_label_tiles.get().into_iter().map(|set|{
+                let opacity_name=set.name.clone();
+                view!{
+                <div class="slice-tile-layer label-tiles" data-layer=set.key style:transform=label_transform(set.level_shape)
+                    style:opacity=move || session.label_layers.get().iter().find(|layer|layer.summary.name==opacity_name).map(|layer|layer.opacity).unwrap_or(0.0).to_string()>
                     {set.tiles.into_iter().map(|tile|view!{<img class="slice-tile loaded" src=tile.src draggable="false" style:left=format!("{}px",tile.source_x) style:top=format!("{}px",tile.source_y) style:width=format!("{}px",tile.source_width) style:height=format!("{}px",tile.source_height)/>}).collect_view()}
                 </div>
-            }).collect_view()}
+            }}).collect_view()}
+            {move||active_label_tiles.get().into_iter().map(|set|{
+                let opacity_name=set.name.clone();
+                view!{
+                <div class="slice-tile-layer label-tiles" data-layer=set.key
+                    style:transform=label_transform(set.level_shape)
+                    style:opacity=move || if label_tiles_ready.get() {session.label_layers.get().iter().find(|layer|layer.summary.name==opacity_name).map(|layer|layer.opacity).unwrap_or(0.0).to_string()}else{"0".into()}>
+                    {set.tiles.into_iter().map(|tile|{
+                        let src=tile.src.clone();
+                        let transition=label_tile_transition.get_untracked();
+                        view!{<img class="slice-tile loaded" src=tile.src draggable="false"
+                            on:load=move |_| {
+                                if label_tile_transition.get_untracked()!=transition{return;}
+                                pending_label_tiles.update_value(|pending|{pending.remove(&src);});
+                                if pending_label_tiles.get_value().is_empty(){
+                                    last_complete_label_tiles.set_value(active_label_tiles.get_untracked());
+                                    previous_label_tiles.set(Vec::new());
+                                    label_tiles_ready.set(true);
+                                }
+                            }
+                            style:left=format!("{}px",tile.source_x) style:top=format!("{}px",tile.source_y)
+                            style:width=format!("{}px",tile.source_width) style:height=format!("{}px",tile.source_height)/>}
+                    }).collect_view()}
+                </div>
+            }}).collect_view()}
             {move || {
                 let (Some(shape), Some((left, top, width, height))) = (session.voxel_shape.get(), placement()) else { return view! { <span></span> }.into_any() };
                 if plane != Plane::Xy { return view! { <span></span> }.into_any(); }
@@ -4376,7 +4451,7 @@ fn FeatureControls() -> impl IntoView {
             {move||session.label_layers.get().into_iter().map(|label|{let name=label.summary.name.clone();let edit_name=name.clone();let opacity_name=name.clone();let outline_name=name.clone();let isolate_name=name.clone();view!{
                 <div class="feature-card">
                     <div class="channel-header"><label><input type="checkbox" prop:checked=label.visible on:change=move|ev|{let checked=event_target_checked(&ev);session.label_layers.update(|layers|if let Some(v)=layers.iter_mut().find(|v|v.summary.name==edit_name){v.visible=checked});session.feature_generation.update(|v|*v=v.wrapping_add(1));}/>{name.clone()}</label><span class="layer-meta">{if label.summary.has_color_table{"image-label colors"}else{"hashed IDs"}}</span></div>
-                    <label class="compact-control">"Opacity" <input type="range" min="0" max="1" step="0.05" prop:value=label.opacity.to_string() on:input=move|ev|if let Ok(value)=event_target_value(&ev).parse(){session.label_layers.update(|layers|if let Some(v)=layers.iter_mut().find(|v|v.summary.name==opacity_name){v.opacity=value});session.feature_generation.update(|v|*v=v.wrapping_add(1));}/></label>
+                    <label class="compact-control">"Opacity" <input type="range" min="0" max="1" step="0.05" prop:value=label.opacity.to_string() on:input=move|ev|if let Ok(value)=event_target_value(&ev).parse(){session.label_layers.update(|layers|if let Some(v)=layers.iter_mut().find(|v|v.summary.name==opacity_name){v.opacity=value});}/></label>
                     <div class="row"><label><input type="checkbox" prop:checked=label.outline on:change=move|ev|{let checked=event_target_checked(&ev);session.label_layers.update(|layers|if let Some(v)=layers.iter_mut().find(|v|v.summary.name==outline_name){v.outline=checked});session.feature_generation.update(|v|*v=v.wrapping_add(1));}/>" Outlines"</label><label><input type="checkbox" prop:checked=label.isolate on:change=move|ev|{let checked=event_target_checked(&ev);session.label_layers.update(|layers|if let Some(v)=layers.iter_mut().find(|v|v.summary.name==isolate_name){v.isolate=checked});session.feature_generation.update(|v|*v=v.wrapping_add(1));}/>" Isolate selected"</label></div>
                     <div class="feature-inspection">{label.selected.map(|v|format!("ID {}{}",v.id,v.name.map(|name|format!(" · {}{}",v.acronym.map(|a|format!("{a} — ")).unwrap_or_default(),name)).unwrap_or_default())).unwrap_or_else(||"Click the image to inspect an ID".into())}</div>
                 </div>
@@ -4395,14 +4470,14 @@ fn FeatureControls() -> impl IntoView {
             <div class="layer-block"><h3>"Objects & measurements"</h3>
             {move||session.object_layers.get().into_iter().map(|layer|{let name=layer.summary.name.clone();let visible_name=name.clone();let color_name=name.clone();let size_name=name.clone();let opacity_name=name.clone();let hollow_name=name.clone();let slab_name=name.clone();let color_by_name=name.clone();view!{
                 <div class="feature-card">
-                    <div class="channel-header"><label><input type="checkbox" prop:checked=layer.visible on:change=move|ev|{let checked=event_target_checked(&ev);session.object_layers.update(|layers|if let Some(v)=layers.iter_mut().find(|v|v.summary.name==visible_name){v.visible=checked});session.feature_generation.update(|v|*v=v.wrapping_add(1));}/>{name.clone()}</label><span class="layer-meta">{format!("{} rows",layer.summary.count)}</span></div>
+                    <div class="channel-header"><label><input type="checkbox" prop:checked=layer.visible on:change=move|ev|{let checked=event_target_checked(&ev);session.object_layers.update(|layers|if let Some(v)=layers.iter_mut().find(|v|v.summary.name==visible_name){v.visible=checked;if !checked{v.points.clear();v.total_in_view=0;v.too_dense=false}});session.feature_generation.update(|v|*v=v.wrapping_add(1));}/>{name.clone()}</label><span class="layer-meta">{format!("{} rows",layer.summary.count)}</span></div>
                     <div class="row"><label>"Color "<input type="color" prop:value=color_hex(layer.color) on:input=move|ev|if let Some(value)=parse_color_hex(&event_target_value(&ev)){session.object_layers.update(|layers|if let Some(v)=layers.iter_mut().find(|v|v.summary.name==color_name){v.color=value})}/></label><label><input type="checkbox" prop:checked=layer.hollow on:change=move|ev|{let value=event_target_checked(&ev);session.object_layers.update(|layers|if let Some(v)=layers.iter_mut().find(|v|v.summary.name==hollow_name){v.hollow=value})}/>" Rings"</label></div>
                     <label class="compact-control">"Size"<input type="range" min="2" max="40" step="1" prop:value=layer.size.to_string() on:input=move|ev|if let Ok(value)=event_target_value(&ev).parse(){session.object_layers.update(|layers|if let Some(v)=layers.iter_mut().find(|v|v.summary.name==size_name){v.size=value})}/></label>
                     <label class="compact-control">"Opacity"<input type="range" min="0" max="1" step="0.05" prop:value=layer.opacity.to_string() on:input=move|ev|if let Ok(value)=event_target_value(&ev).parse(){session.object_layers.update(|layers|if let Some(v)=layers.iter_mut().find(|v|v.summary.name==opacity_name){v.opacity=value})}/></label>
                     {layer.summary.has_z.then(||view!{<label class="compact-control">"Z slab"<input type="range" min="0" max="64" step="1" prop:value=layer.slab.to_string() on:input=move|ev|if let Ok(value)=event_target_value(&ev).parse(){session.object_layers.update(|layers|if let Some(v)=layers.iter_mut().find(|v|v.summary.name==slab_name){v.slab=value});session.feature_generation.update(|v|*v=v.wrapping_add(1));}/></label>})}
                     <label class="compact-control">"Color by"<select on:change=move|ev|{let value=event_target_value(&ev).parse().ok();session.object_layers.update(|layers|if let Some(v)=layers.iter_mut().find(|v|v.summary.name==color_by_name){v.color_by=value})}><option value="">"fixed"</option>{layer.summary.columns.iter().enumerate().filter(|(_,v)|v.numeric).map(|(i,v)|view!{<option value=i.to_string() prop:selected=layer.color_by==Some(i)>{v.name.clone()}</option>}).collect_view()}</select></label>
                     {layer.summary.columns.iter().enumerate().filter_map(|(column,meta)|meta.range.map(|range|{let filter=layer.filters[column].unwrap_or(range);let low_name=name.clone();let high_name=name.clone();view!{<div class="measurement-filter"><span>{meta.name.clone()}</span><input type="number" step="any" prop:value=filter[0].to_string() on:change=move|ev|{if let Ok(value)=event_target_value(&ev).parse::<f64>(){session.object_layers.update(|layers|if let Some(v)=layers.iter_mut().find(|v|v.summary.name==low_name){let mut f=v.filters[column].unwrap_or(range);f[0]=value.min(f[1]);v.filters[column]=Some(f)})}}/><span>"–"</span><input type="number" step="any" prop:value=filter[1].to_string() on:change=move|ev|{if let Ok(value)=event_target_value(&ev).parse::<f64>(){session.object_layers.update(|layers|if let Some(v)=layers.iter_mut().find(|v|v.summary.name==high_name){let mut f=v.filters[column].unwrap_or(range);f[1]=value.max(f[0]);v.filters[column]=Some(f)})}}/></div>}})).collect_view()}
-                    <div class="feature-inspection">{format!("{} of {} in view",layer.points.len(),layer.total_in_view)}</div>
+                    <div class="feature-inspection" class:error=layer.too_dense>{if layer.too_dense{format!("{} objects in view · zoom in to show them (limit 5,000)",layer.total_in_view)}else if layer.visible{format!("{} objects in view",layer.points.len())}else{"Hidden · enable when zoomed into the area you want".into()}}</div>
                     {layer.selected.as_ref().map(|selected|view!{<pre class="object-inspection">{serde_json::to_string_pretty(selected).unwrap_or_default()}</pre>})}
                 </div>
             }}).collect_view()}

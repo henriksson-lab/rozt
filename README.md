@@ -20,7 +20,8 @@ remain internal implementation identifiers.
 - Calibrated scale bars from NGFF voxel spacing and spatial units
 - Editable point, rectangle, ellipse, polygon, freehand, and line annotations
 - Exact integer label overlays with hashed or NGFF colors, outlines, isolation, and ID inspection
-- Object and measurement table overlays with column coloring, numeric filters, and row inspection
+- Spatially indexed object and measurement overlays with dense-view protection, column coloring,
+  numeric filters, and row inspection
 - Atlas region names and per-region object counts
 - Line profiles with distance in pixels and physical units
 - Quaternion-based 3D camera controls linked to the 2D view center

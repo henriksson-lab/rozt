@@ -220,6 +220,7 @@ pub struct ObjectPoint {
 pub struct ObjectQueryResult {
     pub points: Vec<ObjectPoint>,
     pub total: usize,
+    pub too_dense: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
@@ -278,7 +279,7 @@ pub fn label_value_url(origin: &str, dataset: &str, label: &str, x: u32, y: u32,
 }
 pub fn objects_url(origin: &str, dataset: &str, objects: &str, b: [f64; 6]) -> String {
     format!(
-        "{origin}/v1/datasets/{}/objects/{}?x0={}&x1={}&y0={}&y1={}&z0={}&z1={}&max=200000",
+        "{origin}/v1/datasets/{}/objects/{}?x0={}&x1={}&y0={}&y1={}&z0={}&z1={}&max=5000",
         encode_path(dataset),
         encode_path(objects),
         b[0],

@@ -1600,7 +1600,7 @@ struct ObjectsQuery {
     max: usize,
 }
 fn default_object_limit() -> usize {
-    200_000
+    5_000
 }
 
 async fn dataset_objects(
@@ -1619,7 +1619,7 @@ async fn dataset_objects(
         query.z1.unwrap_or(f64::INFINITY),
     ];
     tokio::task::spawn_blocking(move || {
-        features.query_objects(&root, &objects, bounds, query.max.min(200_000))
+        features.query_objects(&root, &objects, bounds, query.max.clamp(1, 5_000))
     })
     .await
     .map_err(|_| {

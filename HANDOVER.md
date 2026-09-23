@@ -132,6 +132,20 @@ filters, column coloring, and exact row inspection. Label-ID CSV/Parquet feature
 and filter their matching label image. `image-label.properties` and dataset-local
 `atlas.jsonl`, `ontology.jsonl`, or `ABA_annotation_last.jsonl` supply region names, and the
 Regions action counts an object table by label ID using a tiled label-read cache.
+Object layers now start hidden. A viewport above 5,000 objects returns no points and asks the
+user to zoom in; the server never retains more than the requested number while counting a dense
+view. Navigation requests wait 140 ms and stale requests cannot replace a newer result. Numeric
+CSV object tables are imported once into a validated `.rozt-object-cache` sidecar with contiguous columns and
+a persisted flat spatial grid; read-only datasets retain the CSV fallback. On the merged Teresa
+dataset, first import of Cellpose (490,379 rows) plus StarDist (404,695 rows) took 5.2 s in debug;
+a clean cache-backed restart took 0.66 s. A full Cellpose extent was rejected with zero returned
+points in 40 ms, while a 1,000×1,000 viewport returned 584 objects in 19 ms.
+After the user explicitly approved unauthenticated network exposure of these datasets, the rebuilt
+release server and page were started on `0.0.0.0:9876`.
+Label tiles now retain the last completely decoded set while a new pyramid level loads, then swap
+the complete level at once. Their transparent pixels no longer inherit the generic tile's dark
+CSS background. Layer opacity is applied by browser compositing, so the slider changes alpha
+immediately without regenerating label PNGs; label ID zero remains RGBA zero.
 Time-series datasets now expose a T slider; the selected timepoint reaches every server and
 browser render path, and decoded-chunk and packed-page cache keys include T. Orthogonal panes
 show scale bars from the finest NGFF spatial calibration. Channels without an OMERO display

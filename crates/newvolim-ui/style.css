@@ -60,6 +60,7 @@ button { cursor: pointer; }
 .pane .label-tiles { z-index: 2; }
 .pane .slice-tile { position: absolute; display: block; opacity: 0; image-rendering: auto; user-select: none; -webkit-user-drag: none; pointer-events: none; }
 .pane .slice-tile.loaded { opacity: 1; background: var(--bg-deep); }
+.pane .label-tiles .slice-tile.loaded { background: transparent; }
 .pane .annotation-overlay { position: absolute; overflow: visible; pointer-events: none; }
 .pane .object-point { vector-effect: non-scaling-stroke; }
 .pane .object-point.selected { filter: drop-shadow(0 0 3px white); }

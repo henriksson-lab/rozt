@@ -5,7 +5,8 @@
 
 use std::{
     collections::HashMap,
-    fs,
+    fs::{self, File, OpenOptions},
+    io::{BufReader, BufWriter, Read, Write},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
@@ -72,6 +73,7 @@ pub struct ObjectPoint {
 pub struct ObjectQueryResult {
     pub points: Vec<ObjectPoint>,
     pub total: usize,
+    pub too_dense: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -108,7 +110,7 @@ struct LabelLayer {
 
 #[derive(Clone, Debug)]
 enum ColumnValues {
-    Number(Vec<Option<f64>>),
+    Number(Vec<f64>),
     Text(Vec<String>),
 }
 
@@ -118,6 +120,87 @@ struct ObjectTable {
     positions: Vec<[f64; 3]>,
     has_z: bool,
     columns: Vec<(String, ColumnValues)>,
+    grid: ObjectGrid,
+}
+
+#[derive(Clone, Debug)]
+struct ObjectGrid {
+    origin: [f64; 2],
+    cell: [f64; 2],
+    shape: [usize; 2],
+    offsets: Vec<u32>,
+    rows: Vec<u32>,
+}
+
+impl ObjectGrid {
+    fn build(positions: &[[f64; 3]]) -> Self {
+        let mut lo = [f64::INFINITY; 2];
+        let mut hi = [f64::NEG_INFINITY; 2];
+        for p in positions {
+            lo[0] = lo[0].min(p[1]);
+            lo[1] = lo[1].min(p[2]);
+            hi[0] = hi[0].max(p[1]);
+            hi[1] = hi[1].max(p[2]);
+        }
+        if !lo[0].is_finite() {
+            lo = [0.0; 2];
+            hi = [1.0; 2]
+        }
+        let target = ((positions.len() as f64 / 64.0).sqrt().ceil() as usize).clamp(1, 512);
+        let cell = [
+            ((hi[0] - lo[0]).max(1.0)) / target as f64,
+            ((hi[1] - lo[1]).max(1.0)) / target as f64,
+        ];
+        let shape = [target, target];
+        let bucket_count = target * target;
+        let mut offsets = vec![0u32; bucket_count + 1];
+        for p in positions {
+            let (by, bx) = Self::bucket(lo, cell, shape, p[1], p[2]);
+            offsets[by * target + bx + 1] += 1;
+        }
+        for bucket in 0..bucket_count {
+            offsets[bucket + 1] += offsets[bucket];
+        }
+        let mut cursor = offsets[..bucket_count].to_vec();
+        let mut rows = vec![0u32; positions.len()];
+        for (row, p) in positions.iter().enumerate() {
+            let (by, bx) = Self::bucket(lo, cell, shape, p[1], p[2]);
+            let bucket = by * target + bx;
+            rows[cursor[bucket] as usize] = row as u32;
+            cursor[bucket] += 1;
+        }
+        Self {
+            origin: lo,
+            cell,
+            shape,
+            offsets,
+            rows,
+        }
+    }
+    fn bucket(
+        origin: [f64; 2],
+        cell: [f64; 2],
+        shape: [usize; 2],
+        y: f64,
+        x: f64,
+    ) -> (usize, usize) {
+        (
+            (((y - origin[0]) / cell[0]).floor().max(0.0) as usize).min(shape[0] - 1),
+            (((x - origin[1]) / cell[1]).floor().max(0.0) as usize).min(shape[1] - 1),
+        )
+    }
+    fn candidates(&self, y0: f64, y1: f64, x0: f64, x1: f64) -> impl Iterator<Item = u32> + '_ {
+        let (by0, bx0) = Self::bucket(self.origin, self.cell, self.shape, y0, x0);
+        let (by1, bx1) = Self::bucket(self.origin, self.cell, self.shape, y1, x1);
+        (by0..=by1).flat_map(move |by| {
+            (bx0..=bx1).flat_map(move |bx| {
+                let bucket = by * self.shape[1] + bx;
+                self.rows[self.offsets[bucket] as usize..self.offsets[bucket + 1] as usize]
+                    .iter()
+                    .copied()
+            })
+        })
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -328,26 +411,35 @@ impl FeatureStore {
             .iter()
             .find(|item| item.name == name)
             .ok_or("unknown object table")?;
-        let mut matches = Vec::new();
-        for (row, p) in table.positions.iter().enumerate() {
+        let mut matches = Vec::with_capacity(max.min(5_000));
+        let mut total = 0usize;
+        for row in table
+            .grid
+            .candidates(bounds[2], bounds[3], bounds[0], bounds[1])
+            .map(|v| v as usize)
+        {
+            let p = &table.positions[row];
             if p[2] >= bounds[0]
                 && p[2] <= bounds[1]
                 && p[1] >= bounds[2]
                 && p[1] <= bounds[3]
                 && (!table.has_z || (p[0] >= bounds[4] && p[0] <= bounds[5]))
             {
-                matches.push(row);
+                total += 1;
+                if matches.len() < max {
+                    matches.push(row);
+                }
             }
         }
-        let total = matches.len();
-        let stride = if max > 0 {
-            total.div_ceil(max).max(1)
-        } else {
-            1
-        };
+        if total > max {
+            return Ok(ObjectQueryResult {
+                points: Vec::new(),
+                total,
+                too_dense: true,
+            });
+        }
         let points = matches
             .into_iter()
-            .step_by(stride)
             .map(|row| ObjectPoint {
                 row,
                 x: table.positions[row][2],
@@ -357,13 +449,17 @@ impl FeatureStore {
                     .columns
                     .iter()
                     .map(|(_, values)| match values {
-                        ColumnValues::Number(v) => v[row],
+                        ColumnValues::Number(v) => v[row].is_finite().then_some(v[row]),
                         ColumnValues::Text(_) => None,
                     })
                     .collect(),
             })
             .collect();
-        Ok(ObjectQueryResult { points, total })
+        Ok(ObjectQueryResult {
+            points,
+            total,
+            too_dense: false,
+        })
     }
 
     pub fn inspect_object(
@@ -386,7 +482,11 @@ impl FeatureStore {
         for (name, values) in &table.columns {
             let value = match values {
                 ColumnValues::Number(v) => {
-                    v[row].map_or(serde_json::Value::Null, |n| serde_json::json!(n))
+                    if v[row].is_finite() {
+                        serde_json::json!(v[row])
+                    } else {
+                        serde_json::Value::Null
+                    }
                 }
                 ColumnValues::Text(v) => serde_json::json!(v[row]),
             };
@@ -473,7 +573,7 @@ impl ObjectTable {
                     ColumnValues::Number(values) => {
                         let mut lo = f64::INFINITY;
                         let mut hi = f64::NEG_INFINITY;
-                        for n in values.iter().flatten().filter(|v| v.is_finite()) {
+                        for n in values.iter().filter(|v| v.is_finite()) {
                             lo = lo.min(*n);
                             hi = hi.max(*n)
                         }
@@ -844,7 +944,209 @@ fn read_label_properties(root: &Path) -> HashMap<u64, AtlasEntry> {
 }
 
 fn read_csv_table(path: &Path, name: String) -> Result<ObjectTable, String> {
-    read_csv_bytes(&fs::read(path).map_err(|e| e.to_string())?, name)
+    let cache = path.with_extension("rozt-object-cache");
+    if let Ok(table) = read_object_cache(&cache, path, name.clone()) {
+        return Ok(table);
+    }
+    let table = read_csv_bytes(&fs::read(path).map_err(|e| e.to_string())?, name)?;
+    // A read-only dataset is valid; it merely misses the startup optimization.
+    let _ = write_object_cache(&cache, path, &table);
+    Ok(table)
+}
+
+const OBJECT_CACHE_MAGIC: &[u8; 8] = b"ROZTOBJ1";
+
+fn source_stamp(path: &Path) -> Result<(u64, u64, u32), String> {
+    let metadata = fs::metadata(path).map_err(|e| e.to_string())?;
+    let modified = metadata
+        .modified()
+        .map_err(|e| e.to_string())?
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| e.to_string())?;
+    Ok((metadata.len(), modified.as_secs(), modified.subsec_nanos()))
+}
+
+fn write_object_cache(path: &Path, source: &Path, table: &ObjectTable) -> Result<(), String> {
+    if table.positions.len() > u32::MAX as usize
+        || table
+            .columns
+            .iter()
+            .any(|(_, values)| !matches!(values, ColumnValues::Number(_)))
+    {
+        return Err(
+            "binary object cache currently requires numeric columns and at most 2^32 rows".into(),
+        );
+    }
+    let (source_len, source_secs, source_nanos) = source_stamp(source)?;
+    let temporary = path.with_extension(format!("rozt-object-cache.{}.tmp", std::process::id()));
+    let file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)
+        .map_err(|e| e.to_string())?;
+    let mut out = BufWriter::new(file);
+    out.write_all(OBJECT_CACHE_MAGIC)
+        .map_err(|e| e.to_string())?;
+    write_u64(&mut out, source_len)?;
+    write_u64(&mut out, source_secs)?;
+    write_u32(&mut out, source_nanos)?;
+    write_u64(&mut out, table.positions.len() as u64)?;
+    out.write_all(&[u8::from(table.has_z)])
+        .map_err(|e| e.to_string())?;
+    write_u32(&mut out, table.columns.len() as u32)?;
+    for (name, _) in &table.columns {
+        write_u32(&mut out, name.len() as u32)?;
+        out.write_all(name.as_bytes()).map_err(|e| e.to_string())?;
+    }
+    for position in &table.positions {
+        for value in position {
+            write_f64(&mut out, *value)?;
+        }
+    }
+    for (_, values) in &table.columns {
+        let ColumnValues::Number(values) = values else {
+            unreachable!()
+        };
+        for value in values {
+            write_f64(&mut out, *value)?;
+        }
+    }
+    for value in table.grid.origin.into_iter().chain(table.grid.cell) {
+        write_f64(&mut out, value)?;
+    }
+    write_u32(&mut out, table.grid.shape[0] as u32)?;
+    write_u32(&mut out, table.grid.shape[1] as u32)?;
+    write_u32(&mut out, table.grid.offsets.len() as u32)?;
+    for value in &table.grid.offsets {
+        write_u32(&mut out, *value)?;
+    }
+    for value in &table.grid.rows {
+        write_u32(&mut out, *value)?;
+    }
+    out.flush().map_err(|e| e.to_string())?;
+    out.get_ref().sync_all().map_err(|e| e.to_string())?;
+    fs::rename(&temporary, path).map_err(|e| e.to_string())
+}
+
+fn read_object_cache(path: &Path, source: &Path, name: String) -> Result<ObjectTable, String> {
+    let mut input = BufReader::new(File::open(path).map_err(|e| e.to_string())?);
+    let mut magic = [0u8; 8];
+    input.read_exact(&mut magic).map_err(|e| e.to_string())?;
+    if &magic != OBJECT_CACHE_MAGIC {
+        return Err("unrecognized object cache".into());
+    }
+    let expected = source_stamp(source)?;
+    let actual = (
+        read_u64(&mut input)?,
+        read_u64(&mut input)?,
+        read_u32(&mut input)?,
+    );
+    if actual != expected {
+        return Err("stale object cache".into());
+    }
+    let rows = usize::try_from(read_u64(&mut input)?).map_err(|_| "object count is too large")?;
+    if rows > u32::MAX as usize {
+        return Err("object cache has too many rows".into());
+    }
+    let mut flag = [0u8; 1];
+    input.read_exact(&mut flag).map_err(|e| e.to_string())?;
+    let has_z = flag[0] != 0;
+    let column_count = read_u32(&mut input)? as usize;
+    if column_count > 4096 {
+        return Err("object cache has too many columns".into());
+    }
+    let mut names = Vec::with_capacity(column_count);
+    for _ in 0..column_count {
+        let len = read_u32(&mut input)? as usize;
+        if len > 1_048_576 {
+            return Err("object cache column name is too long".into());
+        }
+        let mut bytes = vec![0; len];
+        input.read_exact(&mut bytes).map_err(|e| e.to_string())?;
+        names.push(String::from_utf8(bytes).map_err(|e| e.to_string())?);
+    }
+    let mut positions = Vec::with_capacity(rows);
+    for _ in 0..rows {
+        positions.push([
+            read_f64(&mut input)?,
+            read_f64(&mut input)?,
+            read_f64(&mut input)?,
+        ]);
+    }
+    let mut columns = Vec::with_capacity(column_count);
+    for column_name in names {
+        let mut values = Vec::with_capacity(rows);
+        for _ in 0..rows {
+            values.push(read_f64(&mut input)?);
+        }
+        columns.push((column_name, ColumnValues::Number(values)));
+    }
+    let origin = [read_f64(&mut input)?, read_f64(&mut input)?];
+    let cell = [read_f64(&mut input)?, read_f64(&mut input)?];
+    let shape = [
+        read_u32(&mut input)? as usize,
+        read_u32(&mut input)? as usize,
+    ];
+    let expected_offsets = shape[0]
+        .checked_mul(shape[1])
+        .and_then(|v| v.checked_add(1))
+        .ok_or("object cache grid is too large")?;
+    let offset_count = read_u32(&mut input)? as usize;
+    if offset_count != expected_offsets || shape.contains(&0) {
+        return Err("object cache grid shape is invalid".into());
+    }
+    let mut offsets = Vec::with_capacity(offset_count);
+    for _ in 0..offset_count {
+        offsets.push(read_u32(&mut input)?);
+    }
+    let mut indexed_rows = Vec::with_capacity(rows);
+    for _ in 0..rows {
+        indexed_rows.push(read_u32(&mut input)?);
+    }
+    if offsets.last().copied() != Some(rows as u32)
+        || indexed_rows.iter().any(|row| *row as usize >= rows)
+    {
+        return Err("object cache index is invalid".into());
+    }
+    Ok(ObjectTable {
+        name,
+        positions,
+        has_z,
+        columns,
+        grid: ObjectGrid {
+            origin,
+            cell,
+            shape,
+            offsets,
+            rows: indexed_rows,
+        },
+    })
+}
+
+fn write_u32(out: &mut impl Write, value: u32) -> Result<(), String> {
+    out.write_all(&value.to_le_bytes())
+        .map_err(|e| e.to_string())
+}
+fn write_u64(out: &mut impl Write, value: u64) -> Result<(), String> {
+    out.write_all(&value.to_le_bytes())
+        .map_err(|e| e.to_string())
+}
+fn write_f64(out: &mut impl Write, value: f64) -> Result<(), String> {
+    out.write_all(&value.to_le_bytes())
+        .map_err(|e| e.to_string())
+}
+fn read_u32(input: &mut impl Read) -> Result<u32, String> {
+    let mut bytes = [0; 4];
+    input.read_exact(&mut bytes).map_err(|e| e.to_string())?;
+    Ok(u32::from_le_bytes(bytes))
+}
+fn read_u64(input: &mut impl Read) -> Result<u64, String> {
+    let mut bytes = [0; 8];
+    input.read_exact(&mut bytes).map_err(|e| e.to_string())?;
+    Ok(u64::from_le_bytes(bytes))
+}
+fn read_f64(input: &mut impl Read) -> Result<f64, String> {
+    Ok(f64::from_bits(read_u64(input)?))
 }
 
 fn read_measurement_csv(
@@ -1003,7 +1305,13 @@ fn read_csv_bytes(bytes: &[u8], name: String) -> Result<ObjectTable, String> {
     {
         return Err("table has no x/y positions".into());
     }
-    let mut rows = Vec::<Vec<String>>::new();
+    enum Builder {
+        Number(Vec<f64>),
+        Text(Vec<String>),
+    }
+    let mut builders = (0..headers.len())
+        .map(|_| Builder::Number(Vec::new()))
+        .collect::<Vec<_>>();
     let mut positions = Vec::new();
     for record in reader.records() {
         let r = record.map_err(|e| e.to_string())?;
@@ -1016,7 +1324,30 @@ fn read_csv_bytes(bytes: &[u8], name: String) -> Result<ObjectTable, String> {
             .or_else(|| Some((num(ymin?)? + num(ymax?)?) * 0.5));
         if let (Some(x), Some(y)) = (x, y) {
             positions.push([zi.and_then(num).unwrap_or(0.), y, x]);
-            rows.push(r.iter().map(str::to_owned).collect())
+            for (index, builder) in builders.iter_mut().enumerate() {
+                let text = r.get(index).unwrap_or("").trim();
+                match builder {
+                    Builder::Number(values) => match text.parse::<f64>() {
+                        Ok(value) => values.push(value),
+                        Err(_) if text.is_empty() => values.push(f64::NAN),
+                        Err(_) => {
+                            let mut strings = values
+                                .iter()
+                                .map(|v| {
+                                    if v.is_finite() {
+                                        v.to_string()
+                                    } else {
+                                        String::new()
+                                    }
+                                })
+                                .collect::<Vec<_>>();
+                            strings.push(text.to_owned());
+                            *builder = Builder::Text(strings)
+                        }
+                    },
+                    Builder::Text(values) => values.push(text.to_owned()),
+                }
+            }
         }
     }
     let skip = [xi, yi, zi, xmin, xmax, ymin, ymax];
@@ -1025,27 +1356,20 @@ fn read_csv_bytes(bytes: &[u8], name: String) -> Result<ObjectTable, String> {
         .enumerate()
         .filter(|(i, _)| !skip.contains(&Some(*i)))
         .map(|(i, h)| {
-            let parsed = rows
-                .iter()
-                .map(|r| r.get(i).and_then(|v| v.trim().parse::<f64>().ok()))
-                .collect::<Vec<_>>();
-            let values = if parsed.iter().any(Option::is_some) {
-                ColumnValues::Number(parsed)
-            } else {
-                ColumnValues::Text(
-                    rows.iter()
-                        .map(|r| r.get(i).cloned().unwrap_or_default())
-                        .collect(),
-                )
+            let values = match std::mem::replace(&mut builders[i], Builder::Number(Vec::new())) {
+                Builder::Number(values) => ColumnValues::Number(values),
+                Builder::Text(values) => ColumnValues::Text(values),
             };
             (h.clone(), values)
         })
         .collect();
+    let grid = ObjectGrid::build(&positions);
     Ok(ObjectTable {
         name,
         positions,
         has_z: zi.is_some(),
         columns,
+        grid,
     })
 }
 fn read_atlas(path: &Path, out: &mut HashMap<u64, AtlasEntry>) -> Result<(), String> {
@@ -1133,6 +1457,11 @@ mod tests {
             .query_objects(root.path(), "cells", [0.5, 2.5, -0.5, 1.5, -1.0, 1.0], 10)
             .unwrap();
         assert_eq!(queried.total, 2);
+        let dense = store
+            .query_objects(root.path(), "cells", [0.5, 2.5, -0.5, 1.5, -1.0, 1.0], 1)
+            .unwrap();
+        assert!(dense.too_dense);
+        assert!(dense.points.is_empty());
         assert_eq!(queried.points[0].values[1], Some(0.25));
         let row = store.inspect_object(root.path(), "cells", 0).unwrap();
         assert_eq!(
@@ -1161,5 +1490,34 @@ mod tests {
             )
             .unwrap();
         assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
+    }
+
+    #[test]
+    fn numeric_csv_uses_a_validated_columnar_cache() {
+        let root = tempfile::tempdir().unwrap();
+        let csv = root.path().join("table.csv");
+        fs::write(
+            &csv,
+            "label_id,centroid_y,centroid_x,area\n1,10,20,4.5\n2,11,21,8.5\n",
+        )
+        .unwrap();
+        let first = read_csv_table(&csv, "cells".into()).unwrap();
+        let cache = csv.with_extension("rozt-object-cache");
+        assert!(cache.is_file());
+        let cached = read_object_cache(&cache, &csv, "cells".into()).unwrap();
+        assert_eq!(cached.positions, first.positions);
+        assert_eq!(cached.grid.offsets, first.grid.offsets);
+        assert_eq!(cached.grid.rows, first.grid.rows);
+        assert_eq!(cached.summary().columns[1].range, Some([4.5, 8.5]));
+
+        fs::write(&csv, "label_id,centroid_y,centroid_x,area\n1,10,20,4.5\n").unwrap();
+        assert!(read_object_cache(&cache, &csv, "cells".into()).is_err());
+        assert_eq!(
+            read_csv_table(&csv, "cells".into())
+                .unwrap()
+                .positions
+                .len(),
+            1
+        );
     }
 }
